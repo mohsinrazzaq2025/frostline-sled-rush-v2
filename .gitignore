@@ -1,0 +1,17 @@
+# Roblox place/model binaries
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+# Rojo-generated files
+sourcemap.json
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local captures and builds
+captures/
+build/

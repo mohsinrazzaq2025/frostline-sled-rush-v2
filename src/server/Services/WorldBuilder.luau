@@ -1,0 +1,459 @@
+--!strict
+
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+
+local WORLD = GameConfig.World
+local PALETTE = GameConfig.Palette
+
+local WorldBuilder = {}
+
+local function createPart(
+	parent: Instance,
+	name: string,
+	size: Vector3,
+	cframe: CFrame,
+	color: Color3,
+	material: Enum.Material,
+	canCollide: boolean
+): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Anchored = true
+	part.CanCollide = canCollide
+	part.CanTouch = true
+	part.CanQuery = true
+	part.CastShadow = true
+	part.Color = color
+	part.Material = material
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Parent = parent
+	return part
+end
+
+local function catmullRom(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, t: number): Vector3
+	local t2 = t * t
+	local t3 = t2 * t
+
+	return 0.5
+		* (
+			(2 * p1)
+			+ ((-p0 + p2) * t)
+			+ ((2 * p0 - 5 * p1 + 4 * p2 - p3) * t2)
+			+ ((-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+		)
+end
+
+local function samplePath(controlPoints: { Vector3 }, samplesPerCurve: number): { Vector3 }
+	local sampled = {}
+
+	for index = 1, #controlPoints - 1 do
+		local p0 = controlPoints[math.max(1, index - 1)]
+		local p1 = controlPoints[index]
+		local p2 = controlPoints[index + 1]
+		local p3 = controlPoints[math.min(#controlPoints, index + 2)]
+
+		for sampleIndex = 0, samplesPerCurve - 1 do
+			local alpha = sampleIndex / samplesPerCurve
+			table.insert(sampled, catmullRom(p0, p1, p2, p3, alpha))
+		end
+	end
+
+	table.insert(sampled, controlPoints[#controlPoints])
+	return sampled
+end
+
+local function segmentSurfaceFrame(pointA: Vector3, pointB: Vector3): (CFrame, number)
+	local direction = pointB - pointA
+	local midpoint = (pointA + pointB) * 0.5
+	local surfaceFrame = CFrame.lookAt(midpoint, midpoint + direction.Unit, Vector3.yAxis)
+	return surfaceFrame, direction.Magnitude
+end
+
+local function configureLighting()
+	Lighting.ClockTime = 17.2
+	Lighting.Brightness = 2.4
+	Lighting.Ambient = Color3.fromRGB(105, 122, 150)
+	Lighting.OutdoorAmbient = Color3.fromRGB(128, 148, 174)
+	Lighting.EnvironmentDiffuseScale = 0.35
+	Lighting.EnvironmentSpecularScale = 0.55
+	Lighting.GlobalShadows = true
+	Lighting.ShadowSoftness = 0.28
+
+	local atmosphere = Lighting:FindFirstChild("FrostlineAtmosphere") :: Atmosphere?
+	if not atmosphere then
+		atmosphere = Instance.new("Atmosphere")
+		atmosphere.Name = "FrostlineAtmosphere"
+		atmosphere.Parent = Lighting
+	end
+	atmosphere.Color = Color3.fromRGB(205, 225, 244)
+	atmosphere.Decay = Color3.fromRGB(90, 111, 145)
+	atmosphere.Density = 0.24
+	atmosphere.Glare = 0.08
+	atmosphere.Haze = 1.4
+
+	local bloom = Lighting:FindFirstChild("FrostlineBloom") :: BloomEffect?
+	if not bloom then
+		bloom = Instance.new("BloomEffect")
+		bloom.Name = "FrostlineBloom"
+		bloom.Parent = Lighting
+	end
+	bloom.Intensity = 0.22
+	bloom.Size = 24
+	bloom.Threshold = 1.1
+end
+
+local function createPine(parent: Instance, basePosition: Vector3, scale: number, alternate: boolean)
+	local tree = Instance.new("Model")
+	tree.Name = "Pine"
+	tree.Parent = parent
+
+	local trunk = createPart(
+		tree,
+		"Trunk",
+		Vector3.new(1.8, 7, 1.8) * scale,
+		CFrame.new(basePosition + Vector3.new(0, 3.5 * scale, 0)),
+		PALETTE.Wood,
+		Enum.Material.Wood,
+		false
+	)
+	trunk.CanTouch = false
+
+	local foliageColor = if alternate then PALETTE.PineLight else PALETTE.PineDark
+	local layerSizes = {
+		Vector3.new(12, 8, 12),
+		Vector3.new(9, 7, 9),
+		Vector3.new(6, 6, 6),
+	}
+	local layerHeights = { 7, 11, 14.5 }
+
+	for index, layerSize in ipairs(layerSizes) do
+		local foliage = createPart(
+			tree,
+			"Foliage" .. index,
+			layerSize * scale,
+			CFrame.new(basePosition + Vector3.new(0, layerHeights[index] * scale, 0)),
+			foliageColor,
+			Enum.Material.SmoothPlastic,
+			false
+		)
+		foliage.Shape = Enum.PartType.Ball
+		foliage.CanTouch = false
+	end
+end
+
+local function createStartArch(parent: Instance)
+	local arch = Instance.new("Model")
+	arch.Name = "CandyCaneStartArch"
+	arch.Parent = parent
+
+	local origin = CFrame.new(0, 127, -265)
+	local stripeHeight = 4
+
+	for _, side in ipairs({ -1, 1 }) do
+		for stripe = 0, 3 do
+			local color = if stripe % 2 == 0 then PALETTE.Red else PALETTE.White
+			createPart(
+				arch,
+				"PostStripe",
+				Vector3.new(2.5, stripeHeight, 2.5),
+				origin * CFrame.new(side * 15, 2 + stripe * stripeHeight, 0),
+				color,
+				Enum.Material.SmoothPlastic,
+				true
+			)
+		end
+	end
+
+	for stripe = 0, 7 do
+		local color = if stripe % 2 == 0 then PALETTE.White else PALETTE.Red
+		createPart(
+			arch,
+			"BeamStripe",
+			Vector3.new(4, 2.5, 2.5),
+			origin * CFrame.new(-14 + stripe * 4, 17, 0),
+			color,
+			Enum.Material.SmoothPlastic,
+			true
+		)
+	end
+
+	local sign = createPart(
+		arch,
+		"FrostlineSign",
+		Vector3.new(17, 5, 1),
+		origin * CFrame.new(0, 17, -1.8),
+		PALETTE.IceDeep,
+		Enum.Material.SmoothPlastic,
+		false
+	)
+
+	local surfaceGui = Instance.new("SurfaceGui")
+	surfaceGui.Name = "SignGui"
+	surfaceGui.Face = Enum.NormalId.Front
+	surfaceGui.LightInfluence = 0
+	surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	surfaceGui.PixelsPerStud = 40
+	surfaceGui.Parent = sign
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Title"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBlack
+	label.Text = "FROSTLINE"
+	label.TextColor3 = PALETTE.White
+	label.TextScaled = true
+	label.Parent = surfaceGui
+end
+
+local function createDistanceMarker(parent: Instance, zPosition: number, metres: number, color: Color3)
+	local band = createPart(
+		parent,
+		string.format("Zone_%03d", metres),
+		Vector3.new(272, 0.16, 7),
+		CFrame.new(0, 0.08, zPosition),
+		color,
+		Enum.Material.Neon,
+		false
+	)
+	band.Transparency = 0.22
+	band.CanTouch = false
+
+	for _, side in ipairs({ -1, 1 }) do
+		local post = createPart(
+			parent,
+			"DistancePost",
+			Vector3.new(3, 14, 3),
+			CFrame.new(side * 126, 7, zPosition),
+			if metres >= 500 then PALETTE.Gold else PALETTE.IceDeep,
+			Enum.Material.SmoothPlastic,
+			false
+		)
+		post.CanTouch = false
+
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "DistanceGui"
+		billboard.Size = UDim2.fromOffset(120, 46)
+		billboard.StudsOffset = Vector3.new(0, 9, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Parent = post
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.fromScale(1, 1)
+		label.BackgroundColor3 = Color3.fromRGB(18, 35, 58)
+		label.BackgroundTransparency = 0.16
+		label.Font = Enum.Font.GothamBold
+		label.Text = string.format("%dm", metres)
+		label.TextColor3 = PALETTE.White
+		label.TextScaled = true
+		label.Parent = billboard
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 9)
+		corner.Parent = label
+	end
+end
+
+local function buildCourse(world: Model, geometry: Folder, decor: Folder, markers: Folder)
+	local sampledPath = samplePath(WORLD.PathPoints, WORLD.SamplesPerCurve)
+	local treeCounter = 0
+
+	for index = 1, #sampledPath - 1 do
+		local pointA = sampledPath[index]
+		local pointB = sampledPath[index + 1]
+		local surfaceFrame, length = segmentSurfaceFrame(pointA, pointB)
+		local overlapLength = length + 1.25
+
+		createPart(
+			geometry,
+			string.format("MountainBed_%02d", index),
+			Vector3.new(170, 14, overlapLength),
+			surfaceFrame * CFrame.new(0, -7.05, 0),
+			PALETTE.Snow,
+			Enum.Material.Snow,
+			true
+		)
+
+		local track = createPart(
+			geometry,
+			string.format("Track_%02d", index),
+			Vector3.new(WORLD.TrackWidth, WORLD.TrackThickness, overlapLength),
+			surfaceFrame * CFrame.new(0, -WORLD.TrackThickness * 0.5, 0),
+			PALETTE.Ice,
+			Enum.Material.Ice,
+			true
+		)
+		track.CustomPhysicalProperties = PhysicalProperties.new(0.72, 0.035, 0.02, 100, 1)
+
+		for _, side in ipairs({ -1, 1 }) do
+			local sideName = if side == -1 then "Left" else "Right"
+			local bankOffset = WORLD.TrackWidth * 0.5 + WORLD.BankWidth * 0.5 - 0.75
+			local bankCenterY = 3.2
+			local bankFrame = surfaceFrame
+				* CFrame.new(side * bankOffset, bankCenterY, 0)
+				* CFrame.Angles(0, 0, math.rad(side * WORLD.BankAngleDegrees))
+
+			local bank = createPart(
+				geometry,
+				string.format("%sBank_%02d", sideName, index),
+				Vector3.new(WORLD.BankWidth, WORLD.BankThickness, overlapLength),
+				bankFrame,
+				PALETTE.Snow,
+				Enum.Material.Snow,
+				true
+			)
+			bank.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.05, 0, 100, 1)
+
+			local railColor = if index % 2 == 0 then PALETTE.Red else PALETTE.White
+			createPart(
+				geometry,
+				string.format("%sRail_%02d", sideName, index),
+				Vector3.new(2.2, WORLD.RailHeight, overlapLength),
+				surfaceFrame * CFrame.new(side * (WORLD.TrackWidth * 0.5 + 11.2), 6.2, 0),
+				railColor,
+				Enum.Material.SmoothPlastic,
+				true
+			)
+		end
+
+		if index % 5 == 0 and index < #sampledPath - 6 then
+			for _, side in ipairs({ -1, 1 }) do
+				treeCounter += 1
+				local treeBase = surfaceFrame:PointToWorldSpace(Vector3.new(side * 67, 0, 0))
+				createPine(decor, treeBase, 0.82 + (treeCounter % 3) * 0.1, treeCounter % 2 == 0)
+			end
+		end
+	end
+
+	local startTrigger = createPart(
+		markers,
+		"StartTrigger",
+		Vector3.new(28, 1, 16),
+		CFrame.new(0, 127, -246),
+		Color3.fromRGB(64, 224, 200),
+		Enum.Material.Neon,
+		false
+	)
+	startTrigger.Transparency = 0.28
+
+	local launchEdge = createPart(
+		markers,
+		"LaunchEdge",
+		Vector3.new(WORLD.TrackWidth, 10, 2),
+		CFrame.new(WORLD.PathPoints[#WORLD.PathPoints] + Vector3.new(0, 1, 0)),
+		PALETTE.Gold,
+		Enum.Material.Neon,
+		false
+	)
+	launchEdge.Transparency = 0.35
+	launchEdge.CanTouch = true
+
+	world:SetAttribute("PathSampleCount", #sampledPath)
+	world:SetAttribute("TrackStartZ", WORLD.PathPoints[1].Z)
+	world:SetAttribute("LaunchZ", WORLD.PathPoints[#WORLD.PathPoints].Z)
+end
+
+local function buildSummit(geometry: Folder, decor: Folder)
+	createPart(
+		geometry,
+		"SummitPlatform",
+		Vector3.new(120, 8, 110),
+		CFrame.new(0, 122, -305),
+		PALETTE.Snow,
+		Enum.Material.Snow,
+		true
+	)
+
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Name = "PlayerSpawn"
+	spawn.Size = Vector3.new(12, 1, 12)
+	spawn.CFrame = CFrame.new(0, 126.5, -325)
+	spawn.Anchored = true
+	spawn.CanCollide = true
+	spawn.Neutral = true
+	spawn.Transparency = 0.3
+	spawn.Color = PALETTE.Ice
+	spawn.Material = Enum.Material.Ice
+	spawn.Parent = geometry
+
+	createStartArch(decor)
+end
+
+local function buildLandingField(geometry: Folder, decor: Folder, markers: Folder)
+	createPart(
+		geometry,
+		"WorldSnow",
+		Vector3.new(1000, 4, 1800),
+		CFrame.new(0, -4, 320),
+		PALETTE.Snow,
+		Enum.Material.Snow,
+		true
+	)
+
+	local lake = createPart(
+		geometry,
+		"FrozenLake",
+		WORLD.LakeSize,
+		CFrame.new(WORLD.LakeCenter),
+		PALETTE.Ice,
+		Enum.Material.Ice,
+		true
+	)
+	lake.Reflectance = 0.08
+	lake.CustomPhysicalProperties = PhysicalProperties.new(0.75, 0.02, 0.01, 100, 1)
+
+	local distances = { 100, 200, 300, 400, 500 }
+	for index, metres in ipairs(distances) do
+		local zPosition = 420 + (index - 1) * 125
+		local color = if metres == 500 then PALETTE.Gold else Color3.fromRGB(83, 198 - index * 9, 224)
+		createDistanceMarker(markers, zPosition, metres, color)
+	end
+
+	for index = 1, 16 do
+		local side = if index % 2 == 0 then -1 else 1
+		local z = 390 + index * 43
+		local x = side * (165 + (index % 3) * 18)
+		createPine(decor, Vector3.new(x, 0, z), 0.8 + (index % 4) * 0.08, index % 2 == 0)
+	end
+end
+
+function WorldBuilder.build()
+	configureLighting()
+
+	local existing = Workspace:FindFirstChild(WORLD.FolderName)
+	if existing then
+		existing:Destroy()
+	end
+
+	local world = Instance.new("Model")
+	world.Name = WORLD.FolderName
+	world:SetAttribute("WorldVersion", 2)
+	world.Parent = Workspace
+
+	local geometry = Instance.new("Folder")
+	geometry.Name = "Geometry"
+	geometry.Parent = world
+
+	local decor = Instance.new("Folder")
+	decor.Name = "Decor"
+	decor.Parent = world
+
+	local markers = Instance.new("Folder")
+	markers.Name = "Markers"
+	markers.Parent = world
+
+	buildLandingField(geometry, decor, markers)
+	buildSummit(geometry, decor)
+	buildCourse(world, geometry, decor, markers)
+
+	print(string.format("[Frostline] V2 world generated (%d geometry parts)", #geometry:GetChildren()))
+end
+
+return WorldBuilder
