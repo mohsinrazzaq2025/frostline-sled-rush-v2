@@ -11,6 +11,22 @@ local PALETTE = GameConfig.Palette
 
 local WorldBuilder = {}
 
+local function disableTemplatePart(name: string)
+	local templatePart = Workspace:FindFirstChild(name)
+	if not templatePart or not templatePart:IsA("BasePart") then
+		return
+	end
+
+	templatePart.Transparency = 1
+	templatePart.CanCollide = false
+	templatePart.CanTouch = false
+	templatePart.CanQuery = false
+
+	if templatePart:IsA("SpawnLocation") then
+		templatePart.Enabled = false
+	end
+end
+
 local function createPart(
 	parent: Instance,
 	name: string,
@@ -216,7 +232,7 @@ end
 local function createDistanceMarker(parent: Instance, zPosition: number, metres: number, color: Color3)
 	local band = createPart(
 		parent,
-		string.format("Zone_%03d", metres),
+		string.format("DistanceBand_%03dm_Center", metres),
 		Vector3.new(272, 0.16, 7),
 		CFrame.new(0, 0.08, zPosition),
 		color,
@@ -227,9 +243,10 @@ local function createDistanceMarker(parent: Instance, zPosition: number, metres:
 	band.CanTouch = false
 
 	for _, side in ipairs({ -1, 1 }) do
+		local sideName = if side == -1 then "Left" else "Right"
 		local post = createPart(
 			parent,
-			"DistancePost",
+			string.format("DistancePost_%03dm_%s", metres, sideName),
 			Vector3.new(3, 14, 3),
 			CFrame.new(side * 126, 7, zPosition),
 			if metres >= 500 then PALETTE.Gold else PALETTE.IceDeep,
@@ -238,26 +255,31 @@ local function createDistanceMarker(parent: Instance, zPosition: number, metres:
 		)
 		post.CanTouch = false
 
-		local billboard = Instance.new("BillboardGui")
-		billboard.Name = "DistanceGui"
-		billboard.Size = UDim2.fromOffset(120, 46)
-		billboard.StudsOffset = Vector3.new(0, 9, 0)
-		billboard.AlwaysOnTop = true
-		billboard.Parent = post
+		if side == 1 then
+			local billboard = Instance.new("BillboardGui")
+			billboard.Name = string.format("DistanceBillboard_%03dm_Right", metres)
+			billboard.Size = UDim2.fromOffset(100, 38)
+			billboard.StudsOffset = Vector3.new(0, 9, 0)
+			billboard.MaxDistance = 220
+			billboard.AlwaysOnTop = true
+			billboard.Parent = post
 
-		local label = Instance.new("TextLabel")
-		label.Size = UDim2.fromScale(1, 1)
-		label.BackgroundColor3 = Color3.fromRGB(18, 35, 58)
-		label.BackgroundTransparency = 0.16
-		label.Font = Enum.Font.GothamBold
-		label.Text = string.format("%dm", metres)
-		label.TextColor3 = PALETTE.White
-		label.TextScaled = true
-		label.Parent = billboard
+			local label = Instance.new("TextLabel")
+			label.Name = string.format("DistanceLabel_%03dm_Right", metres)
+			label.Size = UDim2.fromScale(1, 1)
+			label.BackgroundColor3 = Color3.fromRGB(18, 35, 58)
+			label.BackgroundTransparency = 0.16
+			label.Font = Enum.Font.GothamBold
+			label.Text = string.format("%dm", metres)
+			label.TextColor3 = PALETTE.White
+			label.TextScaled = true
+			label.Parent = billboard
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 9)
-		corner.Parent = label
+			local corner = Instance.new("UICorner")
+			corner.Name = string.format("DistanceCorner_%03dm_Right", metres)
+			corner.CornerRadius = UDim.new(0, 9)
+			corner.Parent = label
+		end
 	end
 end
 
@@ -425,6 +447,8 @@ local function buildLandingField(geometry: Folder, decor: Folder, markers: Folde
 end
 
 function WorldBuilder.build()
+	disableTemplatePart("Baseplate")
+	disableTemplatePart("SpawnLocation")
 	configureLighting()
 
 	local existing = Workspace:FindFirstChild(WORLD.FolderName)
