@@ -27,8 +27,62 @@ local GameConfig = {
 			Vector3.new(0, 52, 330),
 		},
 
-		LakeCenter = Vector3.new(0, -1.5, 690),
-		LakeSize = Vector3.new(280, 3, 720),
+		-- Course distances are measured from LaunchEdge along positive world Z.
+		StudsPerMeter = 1.25,
+		LandingMarkedDistanceMeters = 1500,
+		LandingRunoffDistanceMeters = 300,
+		LandingWidth = 280,
+		LandingThickness = 3,
+		LandingTopY = 0,
+		LandingSegmentOverlap = 0.25,
+	},
+
+	-- High surface weights make the authored track and lake properties dominate the
+	-- low-weight sled runner properties without changing physics after touchdown.
+	Physics = {
+		TrackDensity = 0.72,
+		TrackFriction = 0.035,
+		TrackElasticity = 0.02,
+		TrackFrictionWeight = 100,
+		TrackElasticityWeight = 1,
+
+		FrozenLakeDensity = 0.75,
+		FrozenLakeFriction = 0.08,
+		FrozenLakeElasticity = 0.01,
+		FrozenLakeFrictionWeight = 100,
+		FrozenLakeElasticityWeight = 1,
+
+		SledRootDensity = 1.1,
+		SledRootFriction = 0.035,
+		SledRootElasticity = 0.04,
+		SledRootFrictionWeight = 1,
+		SledRootElasticityWeight = 1,
+	},
+
+	Run = {
+		StartPromptHoldDuration = 2.0,
+		CountdownDuration = 3,
+		InitialPushSpeed = 20,
+		TuckAcceleration = 22,
+		AntiStallSpeed = 26,
+		AntiStallAcceleration = 7,
+		StabilityYawResponse = 900,
+		StabilityRollResponse = 1100,
+		StabilityAngularDamping = 550,
+		StabilityRayDistance = 5,
+		MaximumStabilityTorque = 2400,
+		RampFreedomStartZ = 215,
+		-- A stop is physical only after both measured speeds stay below these
+		-- thresholds for the entire confirmation interval.
+		LandingStopHorizontalSpeed = 0.5,
+		LandingStopAngularSpeed = 0.5,
+		LandingStopConfirmationDuration = 1.0,
+		ResultsPauseDuration = 1.5,
+		MaximumRunDuration = 45,
+		SafetyBounds = {
+			MaximumLateralDistance = 600,
+			MinimumY = -150,
+		},
 	},
 
 	Palette = {

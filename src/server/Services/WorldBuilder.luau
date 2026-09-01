@@ -7,9 +7,19 @@ local Workspace = game:GetService("Workspace")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local WORLD = GameConfig.World
+local PHYSICS = GameConfig.Physics
 local PALETTE = GameConfig.Palette
+local RUN = GameConfig.Run
 
 local WorldBuilder = {}
+
+local TRACK_SEGMENT_OVERLAP = 1.25
+local START_CHUTE_LAST_TRACK_INDEX = 5
+local START_CHUTE_BEND_SAMPLE_INDEX = 4
+local START_CHUTE_BEND_RAISE = 0.25
+local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
+local START_PAD_THICKNESS = 0.12
+local START_PAD_SURFACE_GAP = 0.01
 
 local function disableTemplatePart(name: string)
 	local templatePart = Workspace:FindFirstChild(name)
@@ -90,6 +100,131 @@ local function segmentSurfaceFrame(pointA: Vector3, pointB: Vector3): (CFrame, n
 	local midpoint = (pointA + pointB) * 0.5
 	local surfaceFrame = CFrame.lookAt(midpoint, midpoint + direction.Unit, Vector3.yAxis)
 	return surfaceFrame, direction.Magnitude
+end
+
+local function createTrackCollisionPart(
+	geometry: Folder,
+	name: string,
+	pointA: Vector3,
+	pointB: Vector3
+)
+	local surfaceFrame, length = segmentSurfaceFrame(pointA, pointB)
+	local collisionPart = createPart(
+		geometry,
+		name,
+		Vector3.new(WORLD.TrackWidth, WORLD.TrackThickness, length),
+		surfaceFrame * CFrame.new(0, -WORLD.TrackThickness * 0.5, 0),
+		PALETTE.Ice,
+		Enum.Material.Ice,
+		true
+	)
+	collisionPart.Transparency = 1
+	collisionPart.CastShadow = false
+	collisionPart.CanTouch = false
+	collisionPart:SetAttribute(TRACK_SURFACE_ATTRIBUTE, true)
+	collisionPart.CustomPhysicalProperties = PhysicalProperties.new(
+		PHYSICS.TrackDensity,
+		PHYSICS.TrackFriction,
+		PHYSICS.TrackElasticity,
+		PHYSICS.TrackFrictionWeight,
+		PHYSICS.TrackElasticityWeight
+	)
+end
+
+local function buildStartChuteCollision(geometry: Folder, sampledPath: { Vector3 })
+	-- These two faces meet only at downhill-steepening edges and remain above the
+	-- decorative track faces and collidable mountain-bed surfaces.
+	local chuteStart = sampledPath[1]
+	local chuteBend = sampledPath[START_CHUTE_BEND_SAMPLE_INDEX] + Vector3.new(0, START_CHUTE_BEND_RAISE, 0)
+	local followingSegmentStart = sampledPath[START_CHUTE_LAST_TRACK_INDEX + 1]
+	local followingSegmentEnd = sampledPath[START_CHUTE_LAST_TRACK_INDEX + 2]
+	local followingDirection = (followingSegmentEnd - followingSegmentStart).Unit
+	local chuteEnd = followingSegmentStart - followingDirection * (TRACK_SEGMENT_OVERLAP * 0.5)
+
+	createTrackCollisionPart(geometry, "StartChuteCollision_01", chuteStart, chuteBend)
+	createTrackCollisionPart(geometry, "StartChuteCollision_02", chuteBend, chuteEnd)
+
+	for index = 1, START_CHUTE_LAST_TRACK_INDEX do
+		local track = geometry:FindFirstChild(string.format("Track_%02d", index))
+		if not track or not track:IsA("BasePart") then
+			error(string.format("Missing decorative Start-chute track Track_%02d", index))
+		end
+		track.CanCollide = false
+	end
+end
+
+local function findLaunchRampTrackIndex(sampledPath: { Vector3 }): number
+	for index = 1, #sampledPath - 1 do
+		local pointA = sampledPath[index]
+		local pointB = sampledPath[index + 1]
+		if pointA.Z >= RUN.RampFreedomStartZ and pointB.Y > pointA.Y then
+			return index
+		end
+	end
+
+	error("Unable to identify the authored launch-ramp collision boundary")
+end
+
+local function overlappingTrackStartEdge(sampledPath: { Vector3 }, trackIndex: number): Vector3
+	local segmentStart = sampledPath[trackIndex]
+	local segmentEnd = sampledPath[trackIndex + 1]
+	return segmentStart - (segmentEnd - segmentStart).Unit * (TRACK_SEGMENT_OVERLAP * 0.5)
+end
+
+local function buildDescentCollision(geometry: Folder, sampledPath: { Vector3 })
+	local firstTrackIndex = START_CHUTE_LAST_TRACK_INDEX + 1
+	local launchRampTrackIndex = findLaunchRampTrackIndex(sampledPath)
+	local lastDescentTrackIndex = launchRampTrackIndex - 1
+	local firstProxyStart = overlappingTrackStartEdge(sampledPath, firstTrackIndex)
+	local rampCollisionStart = overlappingTrackStartEdge(sampledPath, launchRampTrackIndex)
+
+	for trackIndex = firstTrackIndex, lastDescentTrackIndex do
+		local pointA = if trackIndex == firstTrackIndex then firstProxyStart else sampledPath[trackIndex]
+		local pointB = if trackIndex == lastDescentTrackIndex
+			then rampCollisionStart
+			else sampledPath[trackIndex + 1]
+
+		createTrackCollisionPart(
+			geometry,
+			string.format("DescentCollision_%02d", trackIndex),
+			pointA,
+			pointB
+		)
+
+		local track = geometry:FindFirstChild(string.format("Track_%02d", trackIndex))
+		if not track or not track:IsA("BasePart") then
+			error(string.format("Missing decorative Descent track Track_%02d", trackIndex))
+		end
+		track.CanCollide = false
+	end
+end
+
+local function buildStartPadVisual(geometry: Folder, markers: Folder, startTrigger: BasePart)
+	local summitPlatform = geometry:FindFirstChild("SummitPlatform")
+	if not summitPlatform or not summitPlatform:IsA("BasePart") then
+		error("Missing SummitPlatform for StartPadVisual placement")
+	end
+
+	local summitTopY = summitPlatform.Position.Y + summitPlatform.Size.Y * 0.5
+	local padPosition = Vector3.new(
+		startTrigger.Position.X,
+		summitTopY + START_PAD_SURFACE_GAP + START_PAD_THICKNESS * 0.5,
+		startTrigger.Position.Z
+	)
+	local padCFrame = CFrame.new(padPosition) * startTrigger.CFrame.Rotation
+	local startPadVisual = createPart(
+		markers,
+		"StartPadVisual",
+		Vector3.new(startTrigger.Size.X, START_PAD_THICKNESS, startTrigger.Size.Z),
+		padCFrame,
+		startTrigger.Color,
+		Enum.Material.Neon,
+		false
+	)
+	startPadVisual.Transparency = 0.35
+	startPadVisual.CastShadow = false
+	startPadVisual.CanTouch = false
+	startPadVisual.CanQuery = false
 end
 
 local function configureLighting()
@@ -230,6 +365,7 @@ local function createStartArch(parent: Instance)
 end
 
 local function createDistanceMarker(parent: Instance, zPosition: number, metres: number, color: Color3)
+	local isMilestone = metres % 500 == 0
 	local band = createPart(
 		parent,
 		string.format("DistanceBand_%03dm_Center", metres),
@@ -249,7 +385,7 @@ local function createDistanceMarker(parent: Instance, zPosition: number, metres:
 			string.format("DistancePost_%03dm_%s", metres, sideName),
 			Vector3.new(3, 14, 3),
 			CFrame.new(side * 126, 7, zPosition),
-			if metres >= 500 then PALETTE.Gold else PALETTE.IceDeep,
+			if isMilestone then PALETTE.Gold else PALETTE.IceDeep,
 			Enum.Material.SmoothPlastic,
 			false
 		)
@@ -291,7 +427,7 @@ local function buildCourse(world: Model, geometry: Folder, decor: Folder, marker
 		local pointA = sampledPath[index]
 		local pointB = sampledPath[index + 1]
 		local surfaceFrame, length = segmentSurfaceFrame(pointA, pointB)
-		local overlapLength = length + 1.25
+		local overlapLength = length + TRACK_SEGMENT_OVERLAP
 
 		createPart(
 			geometry,
@@ -312,7 +448,13 @@ local function buildCourse(world: Model, geometry: Folder, decor: Folder, marker
 			Enum.Material.Ice,
 			true
 		)
-		track.CustomPhysicalProperties = PhysicalProperties.new(0.72, 0.035, 0.02, 100, 1)
+		track.CustomPhysicalProperties = PhysicalProperties.new(
+			PHYSICS.TrackDensity,
+			PHYSICS.TrackFriction,
+			PHYSICS.TrackElasticity,
+			PHYSICS.TrackFrictionWeight,
+			PHYSICS.TrackElasticityWeight
+		)
 
 		for _, side in ipairs({ -1, 1 }) do
 			local sideName = if side == -1 then "Left" else "Right"
@@ -354,6 +496,9 @@ local function buildCourse(world: Model, geometry: Folder, decor: Folder, marker
 		end
 	end
 
+	buildStartChuteCollision(geometry, sampledPath)
+	buildDescentCollision(geometry, sampledPath)
+
 	local startTrigger = createPart(
 		markers,
 		"StartTrigger",
@@ -363,7 +508,12 @@ local function buildCourse(world: Model, geometry: Folder, decor: Folder, marker
 		Enum.Material.Neon,
 		false
 	)
-	startTrigger.Transparency = 0.28
+	startTrigger.Transparency = 1
+	startTrigger.CastShadow = false
+	startTrigger.CanTouch = false
+	startTrigger.CanQuery = false
+
+	buildStartPadVisual(geometry, markers, startTrigger)
 
 	local launchEdge = createPart(
 		markers,
@@ -409,6 +559,13 @@ local function buildSummit(geometry: Folder, decor: Folder)
 end
 
 local function buildLandingField(geometry: Folder, decor: Folder, markers: Folder)
+	local launchZ = WORLD.PathPoints[#WORLD.PathPoints].Z
+	local markedEndZ = launchZ + WORLD.LandingMarkedDistanceMeters * WORLD.StudsPerMeter
+	local landingEndZ = markedEndZ + WORLD.LandingRunoffDistanceMeters * WORLD.StudsPerMeter
+	local halfOverlap = WORLD.LandingSegmentOverlap * 0.5
+
+	-- Preserve the original snow floor and continue it beyond the ice runoff so the
+	-- expanded landing field remains visually grounded from every marker.
 	createPart(
 		geometry,
 		"WorldSnow",
@@ -419,26 +576,58 @@ local function buildLandingField(geometry: Folder, decor: Folder, markers: Folde
 		true
 	)
 
-	local lake = createPart(
+	local existingSnowEndZ = 1220
+	local extendedSnowEndZ = landingEndZ + 250
+	createPart(
 		geometry,
-		"FrozenLake",
-		WORLD.LakeSize,
-		CFrame.new(WORLD.LakeCenter),
-		PALETTE.Ice,
-		Enum.Material.Ice,
+		"WorldSnowExtension",
+		Vector3.new(1000, 4, extendedSnowEndZ - existingSnowEndZ + halfOverlap),
+		CFrame.new(0, -4, (existingSnowEndZ - halfOverlap + extendedSnowEndZ) * 0.5),
+		PALETTE.Snow,
+		Enum.Material.Snow,
 		true
 	)
-	lake.Reflectance = 0.08
-	lake.CustomPhysicalProperties = PhysicalProperties.new(0.75, 0.02, 0.01, 100, 1)
 
-	local distances = { 100, 200, 300, 400, 500 }
-	for index, metres in ipairs(distances) do
-		local zPosition = 420 + (index - 1) * 125
-		local color = if metres == 500 then PALETTE.Gold else Color3.fromRGB(83, 198 - index * 9, 224)
+	local lake = Instance.new("Folder")
+	lake.Name = "FrozenLake"
+	lake.Parent = geometry
+
+	local function createLakeSegment(name: string, startZ: number, endZ: number)
+		local segment = createPart(
+			lake,
+			name,
+			Vector3.new(WORLD.LandingWidth, WORLD.LandingThickness, endZ - startZ),
+			CFrame.new(0, WORLD.LandingTopY - WORLD.LandingThickness * 0.5, (startZ + endZ) * 0.5),
+			PALETTE.Ice,
+			Enum.Material.Ice,
+			true
+		)
+		segment.Reflectance = 0.08
+		segment.CustomPhysicalProperties = PhysicalProperties.new(
+			PHYSICS.FrozenLakeDensity,
+			PHYSICS.FrozenLakeFriction,
+			PHYSICS.FrozenLakeElasticity,
+			PHYSICS.FrozenLakeFrictionWeight,
+			PHYSICS.FrozenLakeElasticityWeight
+		)
+	end
+
+	-- The two surfaces share an exact top height and overlap slightly at 1500m,
+	-- preventing a collision lip while keeping the full 1800m field flat.
+	createLakeSegment("FrozenLakeMarked_0000m_1500m", launchZ, markedEndZ + halfOverlap)
+	createLakeSegment("FrozenLakeRunoff_1500m_1800m", markedEndZ - halfOverlap, landingEndZ)
+
+	for metres = 100, WORLD.LandingMarkedDistanceMeters, 100 do
+		local markerIndex = metres / 100
+		local zPosition = launchZ + metres * WORLD.StudsPerMeter
+		local color = if metres % 500 == 0
+			then PALETTE.Gold
+			else Color3.fromRGB(83, math.max(80, 198 - markerIndex * 9), 224)
 		createDistanceMarker(markers, zPosition, metres, color)
 	end
 
-	for index = 1, 16 do
+	local landingTreeCount = math.max(16, math.floor((landingEndZ - 470) / 43))
+	for index = 1, landingTreeCount do
 		local side = if index % 2 == 0 then -1 else 1
 		local z = 390 + index * 43
 		local x = side * (165 + (index % 3) * 18)
