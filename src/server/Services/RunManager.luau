@@ -2519,6 +2519,21 @@ local function onResultAction(player: Player, requestedRunId: any, requestedActi
 	acceptResultAction(session, requestedRunId, requestedAction :: ResultAction, "client")
 end
 
+function RunManager.handlePlayerRemoving(player: Player)
+	local session = sessions[player]
+	pendingReplays[player] = nil
+	if session then
+		local runId = session.RunId
+		if isSameSession(session, runId) then
+			requestCleanup(session, runId, "player removed", false)
+			if session.CleanupStarted and session.Phase == RunPhase.Idle and sessions[player] == session then
+				sessions[player] = nil
+			end
+		end
+	end
+	ResultService.removePlayer(player)
+end
+
 function RunManager.start()
 	if started then
 		return
@@ -2546,21 +2561,6 @@ function RunManager.start()
 	local prompt = configurePrompt(references.StartTrigger)
 	prompt.Triggered:Connect(function(player: Player)
 		startRunSafely(player, references, false)
-	end)
-
-	Players.PlayerRemoving:Connect(function(player: Player)
-		local session = sessions[player]
-		pendingReplays[player] = nil
-		if session then
-			local runId = session.RunId
-			if isSameSession(session, runId) then
-				requestCleanup(session, runId, "player removed", false)
-				if session.CleanupStarted and session.Phase == RunPhase.Idle and sessions[player] == session then
-					sessions[player] = nil
-				end
-			end
-		end
-		ResultService.removePlayer(player)
 	end)
 
 	print("[Frostline] RunManager ready")

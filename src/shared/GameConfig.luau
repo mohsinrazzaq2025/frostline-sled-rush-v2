@@ -101,6 +101,20 @@ local GameConfig = {
 		RunTelemetryEnabled = false,
 	},
 
+	PlayerData = {
+		SchemaVersion = 1,
+		ProductionStoreName = "Frostline_PlayerProgress_v1",
+		StudioStoreName = "Frostline_PlayerProgress_Studio_v1",
+		KeyPrefix = "Player_",
+		AutosaveIntervalSeconds = 60,
+		SessionLeaseDurationSeconds = 180,
+		MaximumAttempts = 4,
+		BaseRetryDelaySeconds = 1,
+		LoadWaitTimeoutSeconds = 15,
+		ShutdownTimeoutSeconds = 25,
+		DiagnosticsEnabled = false,
+	},
+
 	Camera = {
 		NormalFieldOfView = 70,
 	},

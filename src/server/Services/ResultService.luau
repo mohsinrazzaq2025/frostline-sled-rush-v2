@@ -4,6 +4,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
+local PlayerDataService = require(script.Parent.PlayerDataService)
 
 local RESULT = GameConfig.Result
 
@@ -12,20 +13,17 @@ type Payload = ResultTypes.Payload
 type ServerFacts = ResultTypes.ServerFacts
 
 type FinalizedRecord = {
-	PreciseFinalDistanceMeters: number,
-	PreciseBestDistanceMeters: number,
 	Payload: Payload,
 }
 
-type PlayerData = {
-	BestDistanceMeters: number,
-	TotalFrostCoins: number,
+type PlayerResultState = {
 	FinalizedRuns: { [number]: FinalizedRecord },
+	FinalizingRuns: { [number]: boolean },
 }
 
 local ResultService = {}
 
-local playerData: { [Player]: PlayerData } = {}
+local playerResultState: { [Player]: PlayerResultState } = {}
 
 local function isFiniteNumber(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
@@ -41,18 +39,17 @@ local function isKnownOutcome(outcome: Outcome): boolean
 		or outcome == ResultTypes.Outcomes.Stalled
 end
 
-local function getOrCreatePlayerData(player: Player): PlayerData
-	local existing = playerData[player]
+local function getOrCreatePlayerResultState(player: Player): PlayerResultState
+	local existing = playerResultState[player]
 	if existing then
 		return existing
 	end
 
-	local created: PlayerData = {
-		BestDistanceMeters = 0,
-		TotalFrostCoins = 0,
+	local created: PlayerResultState = {
 		FinalizedRuns = {},
+		FinalizingRuns = {},
 	}
-	playerData[player] = created
+	playerResultState[player] = created
 	return created
 end
 
@@ -110,43 +107,52 @@ function ResultService.finalize(player: Player, facts: ServerFacts): (Payload?, 
 	if invalidFactsReason then
 		return nil, invalidFactsReason
 	end
-
-	local data = getOrCreatePlayerData(player)
-	if data.FinalizedRuns[facts.RunId] then
-		return nil, "RunId already finalized"
+	if not PlayerDataService.waitForLoad(player, GameConfig.PlayerData.LoadWaitTimeoutSeconds) then
+		return nil, "player profile did not finish loading"
 	end
+
+	local resultState = getOrCreatePlayerResultState(player)
+	if resultState.FinalizedRuns[facts.RunId] then
+		return nil, "RunId already finalized"
+	elseif resultState.FinalizingRuns[facts.RunId] then
+		return nil, "RunId finalization is already in progress"
+	end
+	resultState.FinalizingRuns[facts.RunId] = true
 
 	local finalDistanceMeters = math.max(0, facts.FinalStopDistanceMeters)
-	local isNewBest = finalDistanceMeters > data.BestDistanceMeters
-	if isNewBest then
-		data.BestDistanceMeters = finalDistanceMeters
-	end
-
 	local frostCoinsEarned = calculateCoins(facts.Outcome, finalDistanceMeters)
-	data.TotalFrostCoins += frostCoinsEarned
+	local rewardUpdate, mutationError = PlayerDataService.applyRunReward(
+		player,
+		finalDistanceMeters,
+		frostCoinsEarned
+	)
+	if not rewardUpdate then
+		resultState.FinalizingRuns[facts.RunId] = nil
+		return nil, mutationError or "player progression mutation failed"
+	end
 
 	local payload: Payload = table.freeze({
 		Version = ResultTypes.Version,
 		RunId = facts.RunId,
 		Outcome = facts.Outcome,
 		FinalDistanceMeters = roundDistance(finalDistanceMeters),
-		BestDistanceMeters = roundDistance(data.BestDistanceMeters),
+		BestDistanceMeters = roundDistance(rewardUpdate.BestDistance),
 		FrostCoinsEarned = frostCoinsEarned,
-		TotalFrostCoins = data.TotalFrostCoins,
+		TotalFrostCoins = rewardUpdate.FrostCoins,
 		TuckUsed = facts.TuckUsed,
-		IsNewBest = isNewBest,
+		IsNewBest = rewardUpdate.IsNewBest,
+		PersistenceStatus = rewardUpdate.PersistenceStatus,
 	})
 
-	data.FinalizedRuns[facts.RunId] = {
-		PreciseFinalDistanceMeters = finalDistanceMeters,
-		PreciseBestDistanceMeters = data.BestDistanceMeters,
+	resultState.FinalizedRuns[facts.RunId] = {
 		Payload = payload,
 	}
+	resultState.FinalizingRuns[facts.RunId] = nil
 	return payload, nil
 end
 
 function ResultService.removePlayer(player: Player)
-	playerData[player] = nil
+	playerResultState[player] = nil
 end
 
 return ResultService

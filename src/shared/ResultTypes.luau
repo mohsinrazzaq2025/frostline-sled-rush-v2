@@ -1,5 +1,7 @@
 --!strict
 
+local PlayerDataTypes = require(script.Parent.PlayerDataTypes)
+
 export type Outcome = "CleanLanding" | "Crashed" | "Stalled"
 export type Action = "PlayAgain" | "ReturnToStart"
 
@@ -26,7 +28,7 @@ local actions: ActionConstants = table.freeze({
 })
 
 local ResultTypes = {
-	Version = 1,
+	Version = 2,
 	Outcomes = outcomes,
 	Actions = actions,
 }
@@ -53,6 +55,7 @@ export type Payload = {
 	TotalFrostCoins: number,
 	TuckUsed: boolean,
 	IsNewBest: boolean,
+	PersistenceStatus: PlayerDataTypes.PersistenceStatus,
 }
 
 return table.freeze(ResultTypes)

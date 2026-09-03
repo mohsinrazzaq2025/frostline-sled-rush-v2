@@ -7,6 +7,7 @@ local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local PlayerDataTypes = require(ReplicatedStorage.Shared.PlayerDataTypes)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
 
@@ -30,6 +31,7 @@ local SECONDARY_ICE = Color3.fromRGB(180, 231, 247)
 local PANEL_WIDE_SIZE = Vector2.new(560, 400)
 local PANEL_NARROW_SIZE = Vector2.new(360, 530)
 local ENTRANCE_DURATION = 0.32
+local SESSION_ONLY_WARNING = "SESSION ONLY — PROGRESS WILL NOT SAVE"
 
 type Outcome = ResultTypes.Outcome
 type Action = ResultTypes.Action
@@ -529,6 +531,11 @@ local function isKnownOutcome(value: any): boolean
 		or value == ResultTypes.Outcomes.Stalled
 end
 
+local function isKnownPersistenceStatus(value: any): boolean
+	return value == PlayerDataTypes.PersistenceStatuses.Persistent
+		or value == PlayerDataTypes.PersistenceStatuses.SessionOnly
+end
+
 local function parsePayload(value: any): Payload?
 	if typeof(value) ~= "table"
 		or value.Version ~= ResultTypes.Version
@@ -544,6 +551,7 @@ local function parsePayload(value: any): Payload?
 		or value.TotalFrostCoins % 1 ~= 0
 		or typeof(value.TuckUsed) ~= "boolean"
 		or typeof(value.IsNewBest) ~= "boolean"
+		or not isKnownPersistenceStatus(value.PersistenceStatus)
 	then
 		return nil
 	end
@@ -681,6 +689,16 @@ function ResultController.start()
 		end
 	end
 
+	local function updateStatusLabel(payload: Payload, processing: boolean)
+		if payload.PersistenceStatus == PlayerDataTypes.PersistenceStatuses.SessionOnly then
+			ui.ProcessingLabel.Text = SESSION_ONLY_WARNING
+			ui.ProcessingLabel.TextColor3 = STALLED_AMBER
+		else
+			ui.ProcessingLabel.Text = if processing then "PROCESSING…" else "CHOOSE YOUR NEXT RUN"
+			ui.ProcessingLabel.TextColor3 = SECONDARY_ICE
+		end
+	end
+
 	local function clearCameraFollowState()
 		local cameraConnection = activeSledCameraConnection
 		activeSledCameraConnection = nil
@@ -813,7 +831,7 @@ function ResultController.start()
 		ui.CoinsEarnedLabel.Text = string.format("+%d THIS RUN", payload.FrostCoinsEarned)
 		ui.TotalCoinsLabel.Text = string.format("%d TOTAL", payload.TotalFrostCoins)
 		ui.ModeLabel.Text = if payload.TuckUsed then "TUCK RUN" else "STANDARD RUN"
-		ui.ProcessingLabel.Text = "CHOOSE YOUR NEXT RUN"
+		updateStatusLabel(payload, false)
 		setButtonsEnabled(true)
 		hideRunHud()
 		updateResponsiveLayout()
@@ -868,7 +886,7 @@ function ResultController.start()
 		actionSubmitted = true
 		submittedAction = action
 		setButtonsEnabled(false)
-		ui.ProcessingLabel.Text = "PROCESSING…"
+		updateStatusLabel(payload, true)
 		resultActionRemote:FireServer(payload.RunId, action)
 	end
 
@@ -928,7 +946,7 @@ function ResultController.start()
 		if runId == payload.RunId and phase == RunPhase.Reset then
 			actionSubmitted = true
 			setButtonsEnabled(false)
-			ui.ProcessingLabel.Text = "PROCESSING…"
+			updateStatusLabel(payload, true)
 		elseif (runId == payload.RunId and phase == RunPhase.Idle)
 			or runId > payload.RunId
 		then
