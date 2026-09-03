@@ -77,12 +77,32 @@ local GameConfig = {
 		LandingStopHorizontalSpeed = 0.5,
 		LandingStopAngularSpeed = 0.5,
 		LandingStopConfirmationDuration = 1.0,
-		ResultsPauseDuration = 1.5,
 		MaximumRunDuration = 45,
 		SafetyBounds = {
 			MaximumLateralDistance = 600,
 			MinimumY = -150,
 		},
+	},
+
+	Result = {
+		CoinsPerDistanceStep = 1,
+		DistanceStepMeters = 50,
+		CleanLandingBonus = 10,
+		CrashRewardMultiplier = 0.5,
+		StalledReward = 0,
+		MaximumCoinsPerRun = 50,
+		ResultActionTimeoutSeconds = 20,
+		MinimumCleanUprightDot = 0.65,
+		TeleportToleranceStuds = 8,
+		TeleportCharacterReadyTimeoutSeconds = 8,
+		TeleportIntermediateVerificationSeconds = 0.25,
+		TeleportFinalVerificationSeconds = 0.75,
+		LifecycleDiagnosticsEnabled = false,
+		RunTelemetryEnabled = false,
+	},
+
+	Camera = {
+		NormalFieldOfView = 70,
 	},
 
 	Palette = {

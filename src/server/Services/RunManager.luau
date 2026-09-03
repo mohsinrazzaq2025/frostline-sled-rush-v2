@@ -6,15 +6,20 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
+local ResultService = require(script.Parent.ResultService)
 local SledFactory = require(script.Parent.SledFactory)
 
 local RUN = GameConfig.Run
+local RESULT = GameConfig.Result
 local WORLD = GameConfig.World
 
 local REMOTES_FOLDER_NAME = "FrostlineRemotes"
 local TUCK_REMOTE_NAME = "TuckIntent"
 local STATE_REMOTE_NAME = "RunState"
+local RESULT_REMOTE_NAME = "RunResult"
+local RESULT_ACTION_REMOTE_NAME = "ResultAction"
 local PROMPT_NAME = "StartRunPrompt"
 local MIN_TUCK_REQUEST_INTERVAL = 0.06
 local HUD_UPDATE_INTERVAL = 0.1
@@ -40,6 +45,9 @@ type Phase = RunPhase.Name
 type Sled = SledFactory.Sled
 type StallObservationKind = "recovery" | "missed-launch"
 type RunOutcome = "missed-launch"
+type ResultAction = ResultTypes.Action
+type ResultOutcome = ResultTypes.Outcome
+type ResultPayload = ResultTypes.Payload
 
 type WorldReferences = {
 	ActiveSleds: Folder,
@@ -90,16 +98,24 @@ type Session = {
 	StallObservationKind: StallObservationKind?,
 	StallRecoveryUsed: boolean,
 	LastStallRejectionAt: number,
-	HasEnteredAirborne: boolean,
+	EnteredAirborne: boolean,
+	TouchedFrozenLake: boolean,
+	SeatSeparatedAfterAirborne: boolean,
 	MissedLaunchConfirmed: boolean,
 	Outcome: RunOutcome?,
+	ResultOutcome: ResultOutcome?,
 	MaximumDescentProgress: number,
 	StopConfirmed: boolean,
 	TuckUsed: boolean,
 	LaunchHorizontalSpeed: number?,
 	TouchdownHorizontalSpeed: number?,
-	MaximumDistance: number,
-	FinalStopDistance: number?,
+	MaximumDistanceMeters: number,
+	FinalStopDistanceMeters: number?,
+	FinalUprightDot: number?,
+	ResultFinalized: boolean,
+	ResultPayload: ResultPayload?,
+	ResultActionAccepted: boolean,
+	ReplayRequested: boolean,
 	TelemetryLogged: boolean,
 }
 
@@ -114,11 +130,19 @@ type StallSnapshot = {
 	GroundHit: string,
 }
 
+type PendingReplay = {
+	Session: Session,
+	RunId: number,
+}
+
 local RunManager = {}
 
 local sessions: { [Player]: Session } = {}
 local started = false
 local stateRemote: RemoteEvent? = nil
+local resultRemote: RemoteEvent? = nil
+local trustedReplay: ((Player) -> ())? = nil
+local pendingReplays: { [Player]: PendingReplay } = {}
 local latestRunId = 0
 
 local function isTransitionAllowed(currentPhase: Phase, nextPhase: Phase): boolean
@@ -148,6 +172,26 @@ end
 
 local function runLabel(session: Session): string
 	return string.format("player=%s RunId=%d", session.Player.Name, session.RunId)
+end
+
+local function lifecycleLog(session: Session, event: string, detail: string)
+	if not RESULT.LifecycleDiagnosticsEnabled then
+		return
+	end
+
+	print(
+		string.format(
+			"[Frostline][Lifecycle] player=%s RunId=%d session=%s phase=%s event=%s sled=%s activeExact=%s %s",
+			session.Player.Name,
+			session.RunId,
+			tostring(session),
+			session.Phase,
+			event,
+			session.Sled.Model:GetFullName(),
+			tostring(sessions[session.Player] == session),
+			detail
+		)
+	)
 end
 
 local function isFinitePositiveNumber(value: number): boolean
@@ -284,6 +328,20 @@ local function logReleaseValidity(
 	valid: boolean,
 	reason: string
 )
+	if not RESULT.LifecycleDiagnosticsEnabled then
+		if not valid then
+			warn(
+				string.format(
+					"[Frostline][Run] %s Release validation failed stage=%s reason=%s",
+					runLabel(session),
+					stage,
+					reason
+				)
+			)
+		end
+		return
+	end
+
 	local sled = session.Sled
 	local characterValid = session.Player.Character == session.Character and session.Character.Parent ~= nil
 	local humanoidValid = session.Humanoid.Parent == session.Character and session.Humanoid.Health > 0
@@ -344,11 +402,15 @@ local function setAntiStallActive(session: Session, runId: number, active: boole
 			assemblyMass * RUN.AntiStallAcceleration
 		)
 		session.AntiStallForce.Enabled = true
-		print(string.format("[Frostline][Run] %s AntiStall activated", runLabel(session)))
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(string.format("[Frostline][Run] %s AntiStall activated", runLabel(session)))
+		end
 	elseif forceAvailable then
 		session.AntiStallForce.Enabled = false
 		session.AntiStallForce.Force = Vector3.zero
-		print(string.format("[Frostline][Run] %s AntiStall deactivated", runLabel(session)))
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(string.format("[Frostline][Run] %s AntiStall deactivated", runLabel(session)))
+		end
 	end
 end
 
@@ -500,6 +562,9 @@ local function logStallRecoveryRejection(
 	reason: string,
 	snapshot: StallSnapshot
 )
+	if not RESULT.LifecycleDiagnosticsEnabled then
+		return
+	end
 	if now - session.LastStallRejectionAt < STALL_REJECTION_LOG_INTERVAL then
 		return
 	end
@@ -529,7 +594,7 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 		or session.ReleaseInProgress
 		or not session.TuckActivationReady
 		or session.Phase ~= RunPhase.Descent
-		or session.HasEnteredAirborne
+		or session.EnteredAirborne
 	then
 		resetStallObservation(session)
 		return nil
@@ -600,7 +665,7 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 			or session.ReleaseInProgress
 			or not session.TuckActivationReady
 			or session.Phase ~= RunPhase.Descent
-			or session.HasEnteredAirborne
+			or session.EnteredAirborne
 			or session.MissedLaunchConfirmed
 			or not isCurrentSledRootValid(session, root)
 		then
@@ -659,50 +724,52 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 
 	session.StallRecoveryUsed = true
 	resetStallObservation(session)
-	local recoveryStartZ = root.Position.Z
 	local currentVelocity = root.AssemblyLinearVelocity
 	root.AssemblyLinearVelocity = Vector3.new(
 		currentVelocity.X,
 		currentVelocity.Y,
 		math.max(currentVelocity.Z, RUN.InitialPushSpeed)
 	)
-	print(
-		string.format(
-			"[Frostline][Run] %s Stall recovery confirmed progress=%.2f forwardSpeed=%.2f reappliedSpeed=%.2f",
-			runLabel(session),
-			observationProgress,
-			finalSnapshot.ForwardSpeed,
-			root.AssemblyLinearVelocity.Z
-		)
-	)
-
-	task.delay(STALL_RECOVERY_RESULT_DELAY, function()
-		if not isSameSession(session, runId) then
-			return
-		end
-		if session.CleanupStarted then
-			print(string.format("[Frostline][Run] %s Stall recovery result=cleanup-started", runLabel(session)))
-			return
-		end
-		if not root.Parent then
-			print(string.format("[Frostline][Run] %s Stall recovery result=root-unavailable", runLabel(session)))
-			return
-		end
-
-		local recoveredProgress = root.Position.Z - recoveryStartZ
-		local recoveredSpeed = root.AssemblyLinearVelocity.Z
-		local recovered = recoveredProgress > STALL_RECOVERY_RESULT_MINIMUM_PROGRESS
-			or recoveredSpeed > STALL_RECOVERY_RESULT_MINIMUM_SPEED
+	if RESULT.LifecycleDiagnosticsEnabled then
+		local recoveryStartZ = root.Position.Z
 		print(
 			string.format(
-				"[Frostline][Run] %s Stall recovery result=%s progress=%.2f forwardSpeed=%.2f",
+				"[Frostline][Run] %s Stall recovery confirmed progress=%.2f forwardSpeed=%.2f reappliedSpeed=%.2f",
 				runLabel(session),
-				if recovered then "recovered" else "still-stalled",
-				recoveredProgress,
-				recoveredSpeed
+				observationProgress,
+				finalSnapshot.ForwardSpeed,
+				root.AssemblyLinearVelocity.Z
 			)
 		)
-	end)
+
+		task.delay(STALL_RECOVERY_RESULT_DELAY, function()
+			if not isSameSession(session, runId) then
+				return
+			end
+			if session.CleanupStarted then
+				print(string.format("[Frostline][Run] %s Stall recovery result=cleanup-started", runLabel(session)))
+				return
+			end
+			if not root.Parent then
+				print(string.format("[Frostline][Run] %s Stall recovery result=root-unavailable", runLabel(session)))
+				return
+			end
+
+			local recoveredProgress = root.Position.Z - recoveryStartZ
+			local recoveredSpeed = root.AssemblyLinearVelocity.Z
+			local recovered = recoveredProgress > STALL_RECOVERY_RESULT_MINIMUM_PROGRESS
+				or recoveredSpeed > STALL_RECOVERY_RESULT_MINIMUM_SPEED
+			print(
+				string.format(
+					"[Frostline][Run] %s Stall recovery result=%s progress=%.2f forwardSpeed=%.2f",
+					runLabel(session),
+					if recovered then "recovered" else "still-stalled",
+					recoveredProgress,
+					recoveredSpeed
+				)
+			)
+		end)
+	end
 	return nil
 end
 
@@ -850,178 +917,469 @@ local function disconnectSession(session: Session)
 	table.clear(session.Connections)
 end
 
-local function teleportToSpawn(session: Session, runId: number): boolean
-	if session.Player.Parent ~= Players then
-		return false
+local function logCharacterRootPosition(session: Session, event: string, character: Model?)
+	if not RESULT.LifecycleDiagnosticsEnabled then
+		return
 	end
 
-	local character = session.Player.Character
-	local humanoidRootPart = session.Character:FindFirstChild("HumanoidRootPart")
-	if character ~= session.Character
-		or not session.Character.Parent
-		or not humanoidRootPart
-		or not humanoidRootPart:IsA("BasePart")
-	then
-		warn(string.format("[Frostline][Run] %s Teleport verification result=character unavailable", runLabel(session)))
-		return false
+	local liveCharacter = character
+	local root: BasePart? = nil
+	if liveCharacter and liveCharacter.Parent then
+		local rootInstance = liveCharacter:FindFirstChild("HumanoidRootPart")
+		if rootInstance and rootInstance:IsA("BasePart") then
+			root = rootInstance
+		end
 	end
 
-	local originalAnchored = humanoidRootPart.Anchored
-	local function restoreRootAnchored()
-		pcall(function()
-			humanoidRootPart.Anchored = originalAnchored
-		end)
+	local characterIdentity = if liveCharacter then liveCharacter:GetFullName() else "nil"
+	local positionText = "unavailable"
+	if root then
+		local position = root.Position
+		positionText = string.format("(%.2f,%.2f,%.2f)", position.X, position.Y, position.Z)
+	end
+	lifecycleLog(
+		session,
+		event,
+		string.format("character=%s rootPosition=%s", characterIdentity, positionText)
+	)
+end
+
+local function teleportToSpawn(session: Session, runId: number, traceReturn: boolean): boolean
+	if not isSameSession(session, runId) or session.Player.Parent ~= Players then
+		return false
 	end
 
 	local targetCFrame = CFrame.new()
 	local targetAvailable = pcall(function()
+		if not session.PlayerSpawn.Parent or not session.PlayerSpawn:IsDescendantOf(Workspace) then
+			error("PlayerSpawn unavailable")
+		end
 		targetCFrame = session.PlayerSpawn.CFrame + Vector3.new(0, 4, 0)
 	end)
 	if not targetAvailable then
 		warn(string.format("[Frostline][Run] %s Teleport verification result=spawn unavailable", runLabel(session)))
 		return false
 	end
+	if RESULT.LifecycleDiagnosticsEnabled then
+		lifecycleLog(
+			session,
+			"teleport-target",
+			string.format("target=(%.1f,%.1f,%.1f)", targetCFrame.X, targetCFrame.Y, targetCFrame.Z)
+		)
+	end
 
-	local function readTeleportDistance(): (boolean, number)
-		local distance = math.huge
-		local succeeded = pcall(function()
-			if not humanoidRootPart.Parent or humanoidRootPart.Parent ~= session.Character then
-				error("HumanoidRootPart is no longer in the run character")
-			end
-			distance = (humanoidRootPart.Position - targetCFrame.Position).Magnitude
+	local controlledRoot: BasePart? = nil
+	local function releaseControlledRoot()
+		local root = controlledRoot
+		controlledRoot = nil
+		if not root or not root.Parent then
+			return
+		end
+		pcall(function()
+			root.Anchored = false
 		end)
-		return succeeded, distance
+		pcall(function()
+			root:SetNetworkOwnershipAuto()
+		end)
 	end
 
-	local setupSucceeded = pcall(function()
-		humanoidRootPart.Anchored = true
-		humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
-		humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
-		session.Character:PivotTo(targetCFrame)
-	end)
-	if not setupSucceeded then
-		restoreRootAnchored()
-		warn(string.format("[Frostline][Run] %s Teleport verification result=initial pivot failed", runLabel(session)))
-		return false
+	local function getLiveCharacter(): (Model?, Humanoid?, BasePart?)
+		local character = session.Player.Character
+		if not character or not character:IsA("Model") or not character.Parent then
+			return nil, nil, nil
+		end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local rootInstance = character:FindFirstChild("HumanoidRootPart")
+		if not humanoid
+			or humanoid.Health <= 0
+			or not rootInstance
+			or not rootInstance:IsA("BasePart")
+		then
+			return nil, nil, nil
+		end
+		return character, humanoid, rootInstance
 	end
 
-	RunService.Heartbeat:Wait()
-	if not isSameSession(session, runId) then
-		restoreRootAnchored()
-		return false
+	local characterReadyWaitElapsed = 0
+	local function getLiveCharacterWithinBudget(): (Model?, Humanoid?, BasePart?)
+		local character, humanoid, root = getLiveCharacter()
+		local loggedWait = false
+		while not character
+			and characterReadyWaitElapsed < RESULT.TeleportCharacterReadyTimeoutSeconds
+		do
+			if not isSameSession(session, runId) or session.Player.Parent ~= Players then
+				return nil, nil, nil
+			end
+			if not loggedWait then
+				loggedWait = true
+				lifecycleLog(session, "teleport-character-wait", "state=waiting-for-live-character")
+			end
+			characterReadyWaitElapsed += RunService.Heartbeat:Wait()
+			character, humanoid, root = getLiveCharacter()
+		end
+		return character, humanoid, root
 	end
 
-	local distanceAvailable, distance = readTeleportDistance()
-	if not distanceAvailable then
-		restoreRootAnchored()
-		warn(string.format("[Frostline][Run] %s Teleport verification result=character invalid", runLabel(session)))
-		return false
+	local function isCurrentSubject(character: Model, humanoid: Humanoid, root: BasePart): boolean
+		return isSameSession(session, runId)
+			and session.Player.Parent == Players
+			and session.Player.Character == character
+			and character.Parent ~= nil
+			and humanoid.Parent == character
+			and humanoid.Health > 0
+			and root.Parent ~= nil
+			and root:IsDescendantOf(character)
 	end
-	local retried = false
-	if distance > 8 then
-		retried = true
-		warn(
+
+	local function setServerOwnership(root: BasePart): boolean
+		local succeeded = pcall(function()
+			root:SetNetworkOwner(nil)
+		end)
+		return succeeded
+	end
+
+	local function logTeleportStage(stage: string, attempt: number, character: Model, root: BasePart, distance: number)
+		if not traceReturn or not RESULT.LifecycleDiagnosticsEnabled then
+			return
+		end
+		local position = root.Position
+		lifecycleLog(
+			session,
+			"teleport-" .. stage,
 			string.format(
-				"[Frostline][Run] %s Teleport verification failed distance=%.1f; retrying",
-				runLabel(session),
+				"attempt=%d character=%s rootPosition=(%.2f,%.2f,%.2f) distance=%.2f",
+				attempt,
+				character:GetFullName(),
+				position.X,
+				position.Y,
+				position.Z,
 				distance
 			)
 		)
-		pcall(function()
-			humanoidRootPart.AssemblyLinearVelocity = Vector3.zero
-			humanoidRootPart.AssemblyAngularVelocity = Vector3.zero
-			session.Character:PivotTo(targetCFrame)
-		end)
-		RunService.Heartbeat:Wait()
-		if not isSameSession(session, runId) then
-			restoreRootAnchored()
-			return false
-		end
-		local retryDistanceAvailable, retryDistance = readTeleportDistance()
-		if not retryDistanceAvailable then
-			restoreRootAnchored()
-			warn(
-				string.format("[Frostline][Run] %s Teleport verification result=character invalid after retry", runLabel(session))
-			)
-			return false
-		end
-		distance = retryDistance
 	end
 
-	restoreRootAnchored()
-	pcall(function()
-		session.Humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	local function readDistance(character: Model, humanoid: Humanoid, root: BasePart): (boolean, number)
+		if not isCurrentSubject(character, humanoid, root) then
+			return false, math.huge
+		end
+		return true, (root.Position - targetCFrame.Position).Magnitude
+	end
+
+	local function waitUntilElapsed(
+		character: Model,
+		humanoid: Humanoid,
+		root: BasePart,
+		elapsed: number,
+		targetElapsed: number
+	): (boolean, number)
+		local accumulated = elapsed
+		while accumulated < targetElapsed do
+			accumulated += RunService.Heartbeat:Wait()
+			if not isCurrentSubject(character, humanoid, root) then
+				return false, accumulated
+			end
+		end
+		return true, accumulated
+	end
+
+	local function performAttempt(attempt: number): (boolean, number, string)
+		if not isSameSession(session, runId) or session.Player.Parent ~= Players then
+			return false, math.huge, "session unavailable"
+		end
+		local character, humanoid, root = getLiveCharacterWithinBudget()
+		if not character or not humanoid or not root then
+			return false, math.huge, "character unavailable"
+		end
+		controlledRoot = root
+
+		if root.Anchored then
+			root.Anchored = false
+		end
+		if not setServerOwnership(root) then
+			return false, math.huge, "server network ownership unavailable"
+		end
+
+		root.Anchored = true
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		character:PivotTo(targetCFrame)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+
+		local immediateAvailable, immediateDistance = readDistance(character, humanoid, root)
+		if not immediateAvailable then
+			return false, math.huge, "character changed after pivot"
+		end
+		logTeleportStage("pivot-immediate", attempt, character, root, immediateDistance)
+
+		for anchoredStep = 1, 2 do
+			RunService.PostSimulation:Wait()
+			local stepAvailable, stepDistance = readDistance(character, humanoid, root)
+			if not stepAvailable then
+				return false, math.huge, "character changed while anchored"
+			end
+			if anchoredStep == 1 then
+				logTeleportStage("anchored-first-step", attempt, character, root, stepDistance)
+			end
+		end
+
+		root.Anchored = false
+		if not setServerOwnership(root) then
+			return false, math.huge, "server network ownership lost on release"
+		end
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+		local elapsed = RunService.Heartbeat:Wait()
+		local firstAvailable, firstDistance = readDistance(character, humanoid, root)
+		if not firstAvailable then
+			return false, math.huge, "character changed after release"
+		end
+		logTeleportStage("released-first-step", attempt, character, root, firstDistance)
+		if firstDistance > RESULT.TeleportToleranceStuds then
+			return false, firstDistance, "rollback after first released step"
+		end
+
+		local intermediateWaited: boolean
+		intermediateWaited, elapsed = waitUntilElapsed(
+			character,
+			humanoid,
+			root,
+			elapsed,
+			RESULT.TeleportIntermediateVerificationSeconds
+		)
+		if not intermediateWaited then
+			return false, math.huge, "character changed before intermediate verification"
+		end
+		local intermediateAvailable, intermediateDistance = readDistance(character, humanoid, root)
+		if not intermediateAvailable then
+			return false, math.huge, "character changed at intermediate verification"
+		end
+		logTeleportStage("released-0.25", attempt, character, root, intermediateDistance)
+		if intermediateDistance > RESULT.TeleportToleranceStuds then
+			return false, intermediateDistance, "rollback by intermediate verification"
+		end
+
+		local finalWaited: boolean
+		finalWaited, elapsed = waitUntilElapsed(
+			character,
+			humanoid,
+			root,
+			elapsed,
+			RESULT.TeleportFinalVerificationSeconds
+		)
+		if not finalWaited then
+			return false, math.huge, "character changed before final verification"
+		end
+		local finalAvailable, finalDistance = readDistance(character, humanoid, root)
+		if not finalAvailable then
+			return false, math.huge, "character changed at final verification"
+		end
+		logTeleportStage("released-0.75", attempt, character, root, finalDistance)
+		if finalDistance > RESULT.TeleportToleranceStuds then
+			return false, finalDistance, "rollback by final verification"
+		end
+
+		return true, finalDistance, "stable"
+	end
+
+	local callSucceeded, verified, finalDistance, detail = pcall(function(): (boolean, number, string)
+		local firstVerified, firstDistance, firstDetail = performAttempt(1)
+		if firstVerified then
+			return true, firstDistance, firstDetail
+		end
+
+		warn(
+			string.format(
+				"[Frostline][Run] %s Teleport attempt failed distance=%s detail=%s; retrying once",
+				runLabel(session),
+				if firstDistance < math.huge then string.format("%.2f", firstDistance) else "unavailable",
+				firstDetail
+			)
+		)
+		releaseControlledRoot()
+		if not isSameSession(session, runId) or session.Player.Parent ~= Players then
+			return false, math.huge, "session unavailable before retry"
+		end
+		local retryVerified, retryDistance, retryDetail = performAttempt(2)
+		return retryVerified, retryDistance, retryDetail
 	end)
 
-	local verified = distance <= 8
-	print(
-		string.format(
-			"[Frostline][Run] %s Teleport verification result=%s distance=%.1f retried=%s",
-			runLabel(session),
-			if verified then "passed" else "failed",
-			distance,
-			tostring(retried)
+	releaseControlledRoot()
+	if not callSucceeded then
+		warn(
+			string.format(
+				"[Frostline][Run] %s Teleport verification result=error detail=%s",
+				runLabel(session),
+				tostring(verified)
+			)
 		)
-	)
+		return false
+	end
+
+	if verified then
+		if RESULT.LifecycleDiagnosticsEnabled then
+			local resultMessage = string.format(
+				"result=passed distance=%s detail=%s",
+				if finalDistance < math.huge then string.format("%.2f", finalDistance) else "unavailable",
+				detail
+			)
+			print(string.format("[Frostline][Run] %s Teleport verification %s", runLabel(session), resultMessage))
+			lifecycleLog(session, "teleport-verification", resultMessage)
+		end
+	else
+		local resultMessage = string.format(
+			"result=failed distance=%s detail=%s",
+			if finalDistance < math.huge then string.format("%.2f", finalDistance) else "unavailable",
+			detail
+		)
+		warn(string.format("[Frostline][Run] %s Teleport verification %s", runLabel(session), resultMessage))
+		lifecycleLog(session, "teleport-verification", resultMessage)
+	end
 	return verified
+end
+
+local function scheduleTrustedReplay(session: Session, runId: number)
+	local player = session.Player
+	pendingReplays[player] = {
+		Session = session,
+		RunId = runId,
+	}
+	lifecycleLog(session, "replay-queued", "waitingFor=cleanup-boundary")
+
+	task.defer(function()
+		RunService.Heartbeat:Wait()
+		local pendingReplay = pendingReplays[player]
+		if not pendingReplay
+			or pendingReplay.Session ~= session
+			or pendingReplay.RunId ~= runId
+		then
+			return
+		end
+		if sessions[player] ~= session or session.RunId ~= runId then
+			pendingReplays[player] = nil
+			return
+		end
+
+		pendingReplays[player] = nil
+		if player.Parent ~= Players then
+			sessions[player] = nil
+			return
+		end
+
+		local replay = trustedReplay
+		if not replay then
+			lifecycleLog(session, "replay-cancelled", "reason=trusted-replay-unavailable")
+			sessions[player] = nil
+			return
+		end
+
+		-- Remove the captured old session and synchronously enter the trusted start
+		-- path. beginRun publishes the replacement session before its first yield.
+		lifecycleLog(session, "replay-creation", "state=starting")
+		sessions[player] = nil
+		replay(player)
+	end)
 end
 
 local function cleanupSession(session: Session, runId: number, teleportPlayer: boolean, reason: string)
 	if not isSameSession(session, runId) then
 		return
 	end
+	if RESULT.LifecycleDiagnosticsEnabled then
+		lifecycleLog(session, "cleanup-started", string.format("reason=%s", reason))
+	end
 
 	disconnectSession(session)
+	local traceReturn = teleportPlayer and session.ResultActionAccepted and not session.ReplayRequested
+	if traceReturn then
+		logCharacterRootPosition(session, "return-before-seat-detachment", session.Player.Character)
+	end
 	pcall(function()
 		if session.Humanoid.Parent then
 			session.Humanoid.Sit = false
+			session.Humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 		end
 	end)
 	pcall(function()
-		local seatWeld = session.Sled.DriverSeat:FindFirstChild("SeatWeld")
+		local seatWeld = session.Sled.DriverSeat:FindFirstChild("SeatWeld", true)
 		if seatWeld then
 			seatWeld:Destroy()
 		end
 	end)
-
-	RunService.Heartbeat:Wait()
-	if not isSameSession(session, runId) then
-		return
+	if traceReturn then
+		logCharacterRootPosition(session, "return-after-seat-detachment", session.Player.Character)
 	end
 
 	if session.Sled.Model.Parent then
 		session.Sled.Model:Destroy()
 	end
+	if traceReturn then
+		logCharacterRootPosition(session, "return-after-sled-destruction", session.Player.Character)
+	end
 	restoreCharacterMass(session.OriginalMassless)
 
+	RunService.PostSimulation:Wait()
+	if not isSameSession(session, runId) then
+		return
+	end
+
+	local teleportVerified = not teleportPlayer
 	if teleportPlayer then
-		local teleportCallSucceeded, teleportError = pcall(teleportToSpawn, session, runId)
+		local teleportCallSucceeded, teleportResult = pcall(teleportToSpawn, session, runId, traceReturn)
+		teleportVerified = teleportCallSucceeded and teleportResult == true
 		if not teleportCallSucceeded then
 			warn(
 				string.format(
 					"[Frostline][Run] %s Teleport verification result=error detail=%s",
 					runLabel(session),
-					tostring(teleportError)
+					tostring(teleportResult)
 				)
 			)
+		elseif not teleportVerified then
+			warn(string.format("[Frostline][Run] %s Teleport verification result=failed", runLabel(session)))
 		end
 	end
 
 	if not isSameSession(session, runId) then
 		return
 	end
+	if teleportPlayer and not teleportVerified then
+		session.ReplayRequested = false
+		lifecycleLog(session, "cleanup-failed", "reason=teleport-not-stable")
+		warn(
+			string.format(
+				"[Frostline][Run] %s Cleanup incomplete reason=%s teleportStable=false",
+				runLabel(session),
+				reason
+			)
+		)
+		if sessions[session.Player] == session then
+			sessions[session.Player] = nil
+		end
+		return
+	end
+	local replayRequested = session.ReplayRequested and teleportVerified
 	if session.Player.Parent == Players then
 		session.Outcome = nil
 		transitionTo(session, RunPhase.Idle)
 	end
-	sessions[session.Player] = nil
-	print(
-		string.format(
-			"[Frostline][Run] %s Cleanup completed reason=%s",
-			runLabel(session),
-			reason
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(
+			string.format(
+				"[Frostline][Run] %s Cleanup completed reason=%s",
+				runLabel(session),
+				reason
+			)
 		)
-	)
+	end
+
+	if replayRequested and session.Player.Parent == Players then
+		scheduleTrustedReplay(session, runId)
+	elseif sessions[session.Player] == session then
+		sessions[session.Player] = nil
+	end
 end
 
 local function formatTelemetryNumber(value: number?): string
@@ -1037,8 +1395,8 @@ local function updateMaximumDistance(session: Session)
 		return
 	end
 
-	session.MaximumDistance = math.max(
-		session.MaximumDistance,
+	session.MaximumDistanceMeters = math.max(
+		session.MaximumDistanceMeters,
 		distanceFromLaunch(session, session.Sled.Root.Position.Z)
 	)
 end
@@ -1048,8 +1406,12 @@ local function emitTelemetry(session: Session)
 		return
 	end
 	session.TelemetryLogged = true
+	if not RESULT.RunTelemetryEnabled then
+		return
+	end
+
 	local fieldDistance = WORLD.LandingMarkedDistanceMeters + WORLD.LandingRunoffDistanceMeters
-	local finalStopDistance = session.FinalStopDistance
+	local finalStopDistance = session.FinalStopDistanceMeters
 	local remainingDistance = if finalStopDistance == nil
 		then nil
 		else math.max(0, fieldDistance - finalStopDistance)
@@ -1061,8 +1423,8 @@ local function emitTelemetry(session: Session)
 		if session.TuckUsed then "tuck" else "no-tuck",
 		formatTelemetryNumber(session.LaunchHorizontalSpeed),
 		formatTelemetryNumber(session.TouchdownHorizontalSpeed),
-		session.MaximumDistance,
-		formatTelemetryNumber(session.FinalStopDistance),
+		session.MaximumDistanceMeters,
+		formatTelemetryNumber(session.FinalStopDistanceMeters),
 		formatTelemetryNumber(remainingDistance)
 	)
 	if session.Outcome == MISSED_LAUNCH_OUTCOME then
@@ -1080,21 +1442,26 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 		return
 	end
 	if session.CleanupStarted then
-		print(
-			string.format(
-				"[Frostline][Run] %s Duplicate cleanup ignored reason=%s firstReason=%s",
-				runLabel(session),
-				reason,
-				session.FirstCleanupReason or "unknown"
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(
+				string.format(
+					"[Frostline][Run] %s Duplicate cleanup ignored reason=%s firstReason=%s",
+					runLabel(session),
+					reason,
+					session.FirstCleanupReason or "unknown"
+				)
 			)
-		)
+		end
 		return
 	end
 
 	-- This flag is deliberately first: changing Reset state, seating, or physics can fire callbacks.
 	session.CleanupStarted = true
 	session.FirstCleanupReason = reason
-	print(string.format("[Frostline][Run] %s Cleanup requested firstReason=%s", runLabel(session), reason))
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(string.format("[Frostline][Run] %s Cleanup requested firstReason=%s", runLabel(session), reason))
+		lifecycleLog(session, "cleanup-requested", string.format("reason=%s", reason))
+	end
 	session.ReleaseInProgress = false
 	resetStallObservation(session)
 	clearTuckState(session)
@@ -1115,13 +1482,95 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 	end)
 end
 
+local function acceptResultAction(session: Session, runId: number, action: ResultAction, source: string)
+	if not isSameSession(session, runId)
+		or session.CleanupStarted
+		or session.Phase ~= RunPhase.Results
+		or not session.ResultFinalized
+		or session.ResultActionAccepted
+	then
+		return
+	end
+
+	session.ResultActionAccepted = true
+	session.ReplayRequested = action == ResultTypes.Actions.PlayAgain
+	if RESULT.LifecycleDiagnosticsEnabled then
+		lifecycleLog(session, "result-action", string.format("action=%s source=%s", action, source))
+	end
+	requestCleanup(session, runId, string.format("result action %s source=%s", action, source), true)
+end
+
+local function scheduleResultTimeout(session: Session, runId: number)
+	task.delay(RESULT.ResultActionTimeoutSeconds, function()
+		if isSameSession(session, runId)
+			and not session.CleanupStarted
+			and session.Phase == RunPhase.Results
+			and session.ResultFinalized
+			and not session.ResultActionAccepted
+		then
+			acceptResultAction(session, runId, ResultTypes.Actions.ReturnToStart, "timeout")
+		end
+	end)
+end
+
+local function finalizeResult(session: Session, runId: number, outcome: ResultOutcome): boolean
+	if not isSameSession(session, runId)
+		or session.CleanupStarted
+		or session.Phase ~= RunPhase.Results
+		or session.ResultFinalized
+	then
+		return false
+	end
+
+	local finalStopDistanceMeters = session.FinalStopDistanceMeters
+	local finalUprightDot = session.FinalUprightDot
+	local remote = resultRemote
+	if finalStopDistanceMeters == nil
+		or finalUprightDot == nil
+		or not remote
+		or session.Player.Parent ~= Players
+	then
+		return false
+	end
+
+	local facts: ResultTypes.ServerFacts = {
+		RunId = runId,
+		Outcome = outcome,
+		FinalStopDistanceMeters = finalStopDistanceMeters,
+		MaximumDistanceMeters = session.MaximumDistanceMeters,
+		TuckUsed = session.TuckUsed,
+		EnteredAirborne = session.EnteredAirborne,
+		TouchedFrozenLake = session.TouchedFrozenLake,
+		SeatSeparatedAfterAirborne = session.SeatSeparatedAfterAirborne,
+		FinalUprightDot = finalUprightDot,
+	}
+	local payload, failureReason = ResultService.finalize(session.Player, facts)
+	if not payload then
+		warn(
+			string.format(
+				"[Frostline][Result] %s Finalization rejected reason=%s",
+				runLabel(session),
+				failureReason or "unknown"
+			)
+		)
+		return false
+	end
+
+	session.ResultOutcome = outcome
+	session.ResultPayload = payload
+	session.ResultFinalized = true
+	remote:FireClient(session.Player, payload)
+	scheduleResultTimeout(session, runId)
+	return true
+end
+
 local function finishMissedLaunch(session: Session, runId: number, snapshot: StallSnapshot)
 	if not isSameSession(session, runId)
 		or session.CleanupStarted
 		or session.ReleaseInProgress
 		or not session.TuckActivationReady
 		or session.Phase ~= RunPhase.Descent
-		or session.HasEnteredAirborne
+		or session.EnteredAirborne
 		or session.MissedLaunchConfirmed
 	then
 		return
@@ -1130,35 +1579,36 @@ local function finishMissedLaunch(session: Session, runId: number, snapshot: Sta
 	session.MissedLaunchConfirmed = true
 	session.Outcome = MISSED_LAUNCH_OUTCOME
 	session.MaximumDescentProgress = math.max(session.MaximumDescentProgress, snapshot.Progress)
+	local root = session.Sled.Root
+	if not root.Parent then
+		requestCleanup(session, runId, "sled removed during missed launch", true)
+		return
+	end
+	session.FinalStopDistanceMeters = distanceFromLaunch(session, root.Position.Z)
+	session.FinalUprightDot = root.CFrame.UpVector:Dot(Vector3.yAxis)
 	resetStallObservation(session)
 	clearTuckState(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
-	print(
-		string.format(
-			"[Frostline][Run] %s Missed launch confirmed progress=%.2f horizontalSpeed=%.2f angularSpeed=%.2f",
-			runLabel(session),
-			session.MaximumDescentProgress,
-			snapshot.HorizontalSpeed,
-			snapshot.AngularSpeed
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(
+			string.format(
+				"[Frostline][Run] %s Missed launch confirmed progress=%.2f horizontalSpeed=%.2f angularSpeed=%.2f",
+				runLabel(session),
+				session.MaximumDescentProgress,
+				snapshot.HorizontalSpeed,
+				snapshot.AngularSpeed
+			)
 		)
-	)
+	end
 
 	if not transitionTo(session, RunPhase.Results) then
 		requestCleanup(session, runId, "missed launch transition failed", true)
 		return
 	end
-
-	task.delay(RUN.ResultsPauseDuration, function()
-		if isSameSession(session, runId)
-			and not session.CleanupStarted
-			and session.MissedLaunchConfirmed
-			and session.Outcome == MISSED_LAUNCH_OUTCOME
-			and session.Phase == RunPhase.Results
-		then
-			requestCleanup(session, runId, "missed launch physically stopped", true)
-		end
-	end)
+	if not finalizeResult(session, runId, ResultTypes.Outcomes.Stalled) then
+		requestCleanup(session, runId, "stalled result finalization failed", true)
+	end
 end
 
 local function finishLanding(session: Session, runId: number)
@@ -1177,41 +1627,58 @@ local function finishLanding(session: Session, runId: number)
 	end
 
 	local position = root.Position
-	local velocity = root.AssemblyLinearVelocity
-	local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-	local angularSpeed = root.AssemblyAngularVelocity.Magnitude
+	local diagnosticHorizontalSpeed = 0
+	local diagnosticAngularSpeed = 0
+	if RESULT.LifecycleDiagnosticsEnabled then
+		local velocity = root.AssemblyLinearVelocity
+		diagnosticHorizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+		diagnosticAngularSpeed = root.AssemblyAngularVelocity.Magnitude
+	end
 	updateMaximumDistance(session)
-	session.FinalStopDistance = distanceFromLaunch(session, position.Z)
+	session.FinalStopDistanceMeters = distanceFromLaunch(session, position.Z)
+	session.FinalUprightDot = root.CFrame.UpVector:Dot(Vector3.yAxis)
+	if session.Sled.DriverSeat.Occupant ~= session.Humanoid then
+		session.SeatSeparatedAfterAirborne = true
+	end
 	session.StopConfirmed = true
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 	root.Anchored = true
 
-	print(
-		string.format(
-			"[Frostline][Run] %s Landing stop confirmed position=(%.1f, %.1f, %.1f) speed=%.2f angularSpeed=%.2f",
-			runLabel(session),
-			position.X,
-			position.Y,
-			position.Z,
-			horizontalSpeed,
-			angularSpeed
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(
+			string.format(
+				"[Frostline][Run] %s Landing stop confirmed position=(%.1f, %.1f, %.1f) speed=%.2f angularSpeed=%.2f",
+				runLabel(session),
+				position.X,
+				position.Y,
+				position.Z,
+				diagnosticHorizontalSpeed,
+				diagnosticAngularSpeed
+			)
 		)
-	)
+	end
 	if not transitionTo(session, RunPhase.Results) then
 		requestCleanup(session, runId, "results transition failed", true)
 		return
 	end
 
-	task.delay(RUN.ResultsPauseDuration, function()
-		if isSameSession(session, runId)
-			and not session.CleanupStarted
-			and session.StopConfirmed
-			and session.Phase == RunPhase.Results
-		then
-			requestCleanup(session, runId, "landing physically stopped", true)
-		end
-	end)
+	if not session.EnteredAirborne or not session.TouchedFrozenLake then
+		requestCleanup(session, runId, "landing result facts invalid", true)
+		return
+	end
+	local finalUprightDot = session.FinalUprightDot
+	if finalUprightDot == nil then
+		requestCleanup(session, runId, "landing upright result unavailable", true)
+		return
+	end
+	local outcome: ResultOutcome = if session.SeatSeparatedAfterAirborne
+		or finalUprightDot < RESULT.MinimumCleanUprightDot
+		then ResultTypes.Outcomes.Crashed
+		else ResultTypes.Outcomes.CleanLanding
+	if not finalizeResult(session, runId, outcome) then
+		requestCleanup(session, runId, "landing result finalization failed", true)
+	end
 end
 
 local function updateLandingStopDetection(session: Session, runId: number, now: number)
@@ -1272,8 +1739,10 @@ local function enterAirborne(session: Session, runId: number)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if transitionTo(session, RunPhase.Airborne) then
-		session.HasEnteredAirborne = true
-		print(string.format("[Frostline][Run] %s Airborne", runLabel(session)))
+		session.EnteredAirborne = true
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(string.format("[Frostline][Run] %s Airborne", runLabel(session)))
+		end
 	end
 end
 
@@ -1290,6 +1759,10 @@ local function enterLanded(session: Session, runId: number)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if transitionTo(session, RunPhase.Landed) then
+		session.TouchedFrozenLake = true
+		if session.Sled.DriverSeat.Occupant ~= session.Humanoid then
+			session.SeatSeparatedAfterAirborne = true
+		end
 		local touchdownVelocity = session.Sled.Root.AssemblyLinearVelocity
 		local touchdownHorizontalSpeed = Vector3.new(
 			touchdownVelocity.X,
@@ -1299,14 +1772,16 @@ local function enterLanded(session: Session, runId: number)
 		session.TouchdownHorizontalSpeed = touchdownHorizontalSpeed
 		session.LandingSettledSince = nil
 		updateMaximumDistance(session)
-		print(
-			string.format(
-				"[Frostline][Run] %s Landed z=%.1f horizontalSpeed=%.1f",
-				runLabel(session),
-				session.Sled.Root.Position.Z,
-				touchdownHorizontalSpeed
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(
+				string.format(
+					"[Frostline][Run] %s Landed z=%.1f horizontalSpeed=%.1f",
+					runLabel(session),
+					session.Sled.Root.Position.Z,
+					touchdownHorizontalSpeed
+				)
 			)
-		)
+		end
 		updateLandingStopDetection(session, runId, os.clock())
 	end
 end
@@ -1442,10 +1917,16 @@ local function connectRunEvents(session: Session, references: WorldReferences, r
 		session.Sled.DriverSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
 			if not isSameSession(session, runId)
 				or session.CleanupStarted
-				or session.Phase == RunPhase.Landed
-				or session.Phase == RunPhase.Results
 				or session.Phase == RunPhase.Reset
 			then
+				return
+			end
+
+			local seatSeparated = session.Sled.DriverSeat.Occupant ~= session.Humanoid
+			if session.EnteredAirborne and seatSeparated then
+				session.SeatSeparatedAfterAirborne = true
+			end
+			if session.Phase == RunPhase.Landed or session.Phase == RunPhase.Results then
 				return
 			end
 
@@ -1453,7 +1934,7 @@ local function connectRunEvents(session: Session, references: WorldReferences, r
 			-- the physical run still owns cleanup and returns them after the sled stops.
 			local phaseAllowsSeatExit = session.Phase == RunPhase.Countdown
 				or (session.Phase == RunPhase.Descent and not session.RampFreedomEntered)
-			if phaseAllowsSeatExit and session.Sled.DriverSeat.Occupant ~= session.Humanoid then
+			if phaseAllowsSeatExit and seatSeparated then
 				requestCleanup(session, runId, "player left sled", true)
 			end
 		end)
@@ -1476,26 +1957,28 @@ local function verifyReleaseAfterHeartbeat(
 	local root = session.Sled.Root
 	local measuredVelocity = root.AssemblyLinearVelocity
 	local measuredForwardSpeed = measuredVelocity.Z
-	local progress = root.Position.Z - releasePositionZ
-	local result = "passed"
+	local reapplied = false
 	if measuredForwardSpeed < RUN.InitialPushSpeed then
 		root.AssemblyLinearVelocity = Vector3.new(
 			measuredVelocity.X,
 			measuredVelocity.Y,
 			math.max(measuredForwardSpeed, RUN.InitialPushSpeed)
 		)
-		result = "reapplied"
+		reapplied = true
 	end
 
-	print(
-		string.format(
-			"[Frostline][Run] %s Release verification result=%s progress=%.2f forwardSpeed=%.2f",
-			runLabel(session),
-			result,
-			progress,
-			measuredForwardSpeed
+	if RESULT.LifecycleDiagnosticsEnabled then
+		local progress = root.Position.Z - releasePositionZ
+		print(
+			string.format(
+				"[Frostline][Run] %s Release verification result=%s progress=%.2f forwardSpeed=%.2f",
+				runLabel(session),
+				if reapplied then "reapplied" else "passed",
+				progress,
+				measuredForwardSpeed
+			)
 		)
-	)
+	end
 	return true, "ok"
 end
 
@@ -1523,8 +2006,16 @@ local function runCountdown(session: Session, runId: number)
 	end
 
 	session.CountdownValue = nil
+	lifecycleLog(session, "countdown-completed", "state=validating-release")
 	local preReleaseValid, preReleaseReason = validateRelease(session, runId, RunPhase.Countdown, true)
 	logReleaseValidity(session, "pre", preReleaseValid, preReleaseReason)
+	if RESULT.LifecycleDiagnosticsEnabled then
+		lifecycleLog(
+			session,
+			"release-validation",
+			string.format("stage=pre valid=%s reason=%s", tostring(preReleaseValid), preReleaseReason)
+		)
+	end
 	if not preReleaseValid then
 		requestCleanup(session, runId, "release validation failed before GO: " .. preReleaseReason, true)
 		return
@@ -1560,13 +2051,15 @@ local function runCountdown(session: Session, runId: number)
 	local releasePositionZ = root.Position.Z
 	session.DescentStartedAt = os.clock()
 	session.ReleasePositionZ = releasePositionZ
-	print(
-		string.format(
-			"[Frostline][Run] %s Released initialSpeed=%.1f",
-			runLabel(session),
-			root.AssemblyLinearVelocity.Z
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(
+			string.format(
+				"[Frostline][Run] %s Released initialSpeed=%.1f",
+				runLabel(session),
+				root.AssemblyLinearVelocity.Z
+			)
 		)
-	)
+	end
 
 	RunService.Heartbeat:Wait()
 	local releaseVerified, releaseVerificationReason = verifyReleaseAfterHeartbeat(
@@ -1584,6 +2077,7 @@ local function runCountdown(session: Session, runId: number)
 		)
 		return
 	end
+	lifecycleLog(session, "release-validation", "stage=post valid=true reason=ok")
 
 	session.ReleaseInProgress = false
 	resetStallObservation(session)
@@ -1594,14 +2088,16 @@ local function runCountdown(session: Session, runId: number)
 	setTuckActive(session, activateQueuedTuck)
 	updateAntiStall(session, runId)
 	if session.TuckQueueScheduled then
-		print(
-			string.format(
-				"[Frostline][Run] %s Queued Tuck acceptance accepted=%s held=%s",
-				runLabel(session),
-				tostring(session.Tucking),
-				tostring(session.TuckIntentHeld)
+		if RESULT.LifecycleDiagnosticsEnabled then
+			print(
+				string.format(
+					"[Frostline][Run] %s Queued Tuck acceptance accepted=%s held=%s",
+					runLabel(session),
+					tostring(session.Tucking),
+					tostring(session.TuckIntentHeld)
+				)
 			)
-		)
+		end
 		session.TuckQueueScheduled = false
 	end
 	sendState(session)
@@ -1658,7 +2154,7 @@ local function seatPlayer(session: Session, runId: number): boolean
 		and seat.Occupant == session.Humanoid
 end
 
-local function beginRun(player: Player, references: WorldReferences)
+local function beginRun(player: Player, references: WorldReferences, trustedStart: boolean)
 	if sessions[player] then
 		return
 	end
@@ -1681,7 +2177,7 @@ local function beginRun(player: Player, references: WorldReferences)
 	if not humanoidInstance or humanoidInstance.Health <= 0 or not rootPart or not rootPart:IsA("BasePart") then
 		return
 	end
-	if (rootPart.Position - references.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
+	if not trustedStart and (rootPart.Position - references.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
 		return
 	end
 
@@ -1743,19 +2239,30 @@ local function beginRun(player: Player, references: WorldReferences)
 		StallObservationKind = nil,
 		StallRecoveryUsed = false,
 		LastStallRejectionAt = -math.huge,
-		HasEnteredAirborne = false,
+		EnteredAirborne = false,
+		TouchedFrozenLake = false,
+		SeatSeparatedAfterAirborne = false,
 		MissedLaunchConfirmed = false,
 		Outcome = nil,
+		ResultOutcome = nil,
 		MaximumDescentProgress = 0,
 		StopConfirmed = false,
 		TuckUsed = false,
 		LaunchHorizontalSpeed = nil,
 		TouchdownHorizontalSpeed = nil,
-		MaximumDistance = 0,
-		FinalStopDistance = nil,
+		MaximumDistanceMeters = 0,
+		FinalStopDistanceMeters = nil,
+		FinalUprightDot = nil,
+		ResultFinalized = false,
+		ResultPayload = nil,
+		ResultActionAccepted = false,
+		ReplayRequested = false,
 		TelemetryLogged = false,
 	}
 	sessions[player] = session
+	if RESULT.LifecycleDiagnosticsEnabled then
+		lifecycleLog(session, "run-created", string.format("source=%s", if trustedStart then "replay" else "prompt"))
+	end
 
 	if not transitionTo(session, RunPhase.Countdown) then
 		requestCleanup(session, runId, "could not start countdown", true)
@@ -1771,6 +2278,30 @@ local function beginRun(player: Player, references: WorldReferences)
 	end
 
 	task.spawn(runCountdown, session, runId)
+end
+
+local function startRunSafely(player: Player, references: WorldReferences, trustedStart: boolean)
+	local ok, message = pcall(beginRun, player, references, trustedStart)
+	if ok then
+		return
+	end
+
+	local session = sessions[player]
+	if session then
+		local runId = session.RunId
+		if isSameSession(session, runId) then
+			warn(
+				string.format(
+					"[Frostline][Run] %s Run setup error=%s",
+					runLabel(session),
+					tostring(message)
+				)
+			)
+			requestCleanup(session, runId, "run setup error", true)
+		end
+	else
+		warn(string.format("[Frostline] Failed to create run for %s: %s", player.Name, tostring(message)))
+	end
 end
 
 local function findWorldReferences(): WorldReferences?
@@ -1898,13 +2429,15 @@ local function noteQueuedTuckScheduling(session: Session, sourcePhase: Phase)
 		return
 	end
 	session.TuckQueueScheduled = true
-	print(
-		string.format(
-			"[Frostline][Run] %s Queued Tuck scheduling phase=%s",
-			runLabel(session),
-			sourcePhase
+	if RESULT.LifecycleDiagnosticsEnabled then
+		print(
+			string.format(
+				"[Frostline][Run] %s Queued Tuck scheduling phase=%s",
+				runLabel(session),
+				sourcePhase
+			)
 		)
-	)
+	end
 end
 
 local function onTuckIntent(player: Player, requestedRunId: any, intent: any)
@@ -1965,6 +2498,27 @@ local function onTuckIntent(player: Player, requestedRunId: any, intent: any)
 	sendState(session)
 end
 
+local function onResultAction(player: Player, requestedRunId: any, requestedAction: any)
+	if typeof(requestedRunId) ~= "number"
+		or requestedRunId % 1 ~= 0
+		or typeof(requestedAction) ~= "string"
+		or (requestedAction ~= ResultTypes.Actions.PlayAgain
+			and requestedAction ~= ResultTypes.Actions.ReturnToStart)
+	then
+		return
+	end
+
+	local session = sessions[player]
+	if not session
+		or requestedRunId ~= session.RunId
+		or not isSameSession(session, requestedRunId)
+	then
+		return
+	end
+
+	acceptResultAction(session, requestedRunId, requestedAction :: ResultAction, "client")
+end
+
 function RunManager.start()
 	if started then
 		return
@@ -1980,40 +2534,33 @@ function RunManager.start()
 	local remoteFolder = getOrCreateRemoteFolder()
 	local tuckRemote = getOrCreateRemote(remoteFolder, TUCK_REMOTE_NAME)
 	stateRemote = getOrCreateRemote(remoteFolder, STATE_REMOTE_NAME)
+	resultRemote = getOrCreateRemote(remoteFolder, RESULT_REMOTE_NAME)
+	local resultActionRemote = getOrCreateRemote(remoteFolder, RESULT_ACTION_REMOTE_NAME)
 
 	tuckRemote.OnServerEvent:Connect(onTuckIntent)
+	resultActionRemote.OnServerEvent:Connect(onResultAction)
+	trustedReplay = function(player: Player)
+		startRunSafely(player, references, true)
+	end
 
 	local prompt = configurePrompt(references.StartTrigger)
 	prompt.Triggered:Connect(function(player: Player)
-		local ok, message = pcall(beginRun, player, references)
-		if not ok then
-			local session = sessions[player]
-			if session then
-				local runId = session.RunId
-				if isSameSession(session, runId) then
-					warn(
-						string.format(
-							"[Frostline][Run] %s Run setup error=%s",
-							runLabel(session),
-							tostring(message)
-						)
-					)
-					requestCleanup(session, runId, "run setup error", true)
-				end
-			else
-				warn(string.format("[Frostline] Failed to create run for %s: %s", player.Name, tostring(message)))
-			end
-		end
+		startRunSafely(player, references, false)
 	end)
 
 	Players.PlayerRemoving:Connect(function(player: Player)
 		local session = sessions[player]
+		pendingReplays[player] = nil
 		if session then
 			local runId = session.RunId
 			if isSameSession(session, runId) then
 				requestCleanup(session, runId, "player removed", false)
+				if session.CleanupStarted and session.Phase == RunPhase.Idle and sessions[player] == session then
+					sessions[player] = nil
+				end
 			end
 		end
+		ResultService.removePlayer(player)
 	end)
 
 	print("[Frostline] RunManager ready")
