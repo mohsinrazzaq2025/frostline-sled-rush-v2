@@ -362,6 +362,12 @@ local function shouldBlockJump(phase: string): boolean
 		or phase == RunPhase.Results
 end
 
+local function isTuckTouchButtonPhase(phase: string): boolean
+	return phase == RunPhase.Countdown
+		or phase == RunPhase.Descent
+		or phase == RunPhase.Airborne
+end
+
 local function getSafeBounds(): (Vector2, Vector2)
 	local succeeded, insetArea = pcall(function()
 		return GuiService:GetInsetArea(Enum.ScreenInsets.DeviceSafeInsets)
@@ -416,7 +422,7 @@ local function setAbsoluteButtonPosition(button: GuiObject, topLeft: Vector2): b
 	return true
 end
 
-local function setupTouchButtonLayout(): () -> ()
+local function setupTouchButtonLayout(onTuckButtonResolved: (GuiObject?) -> ()): () -> ()
 	local playerGuiInstance = Players.LocalPlayer:WaitForChild("PlayerGui")
 	if not playerGuiInstance:IsA("PlayerGui") then
 		return function() end
@@ -498,11 +504,13 @@ local function setupTouchButtonLayout(): () -> ()
 
 	local function observeTuckButton(tuckButton: GuiObject?)
 		if observedTuckButton == tuckButton then
+			onTuckButtonResolved(tuckButton)
 			return
 		end
 
 		clearTuckConnections()
 		observedTuckButton = tuckButton
+		onTuckButtonResolved(tuckButton)
 		if not tuckButton then
 			return
 		end
@@ -516,13 +524,23 @@ local function setupTouchButtonLayout(): () -> ()
 		end
 	end
 
-	local function applyLayout(): boolean
-		if destroyed then
+	local function applyLayout(generation: number): boolean
+		if destroyed or generation ~= layoutGeneration then
 			return false
 		end
 		local tuckButtonInstance = ContextActionService:GetButton(ACTION_NAME)
-		if not tuckButtonInstance or not tuckButtonInstance:IsA("GuiObject") then
-			observeTuckButton(nil)
+		-- GetButton may yield while Roblox creates the touch control. Revalidate the
+		-- layout lifecycle after it returns, and let the callback read current run state.
+		if destroyed or generation ~= layoutGeneration then
+			return false
+		end
+		if not tuckButtonInstance
+			or not tuckButtonInstance:IsA("GuiObject")
+			or not tuckButtonInstance.Parent
+		then
+			if observedTuckButton and not observedTuckButton.Parent then
+				observeTuckButton(nil)
+			end
 			return false
 		end
 		local tuckButton = tuckButtonInstance
@@ -587,7 +605,10 @@ local function setupTouchButtonLayout(): () -> ()
 				return
 			end
 
-			local positionedBesideJump = applyLayout()
+			local positionedBesideJump = applyLayout(generation)
+			if destroyed or generation ~= layoutGeneration then
+				return
+			end
 			if not positionedBesideJump and retriesRemaining > 0 then
 				task.delay(TOUCH_LAYOUT_RETRY_DELAY, function()
 					attemptLayout(generation, retriesRemaining - 1)
@@ -618,6 +639,9 @@ local function setupTouchButtonLayout(): () -> ()
 	end
 
 	table.insert(persistentConnections, playerGui.DescendantAdded:Connect(function(descendant: Instance)
+		if descendant.Name == ACTION_NAME and descendant:IsA("GuiObject") then
+			observeTuckButton(descendant)
+		end
 		if descendant.Name == "JumpButton"
 			or descendant.Name == "ContextActionGui"
 			or descendant.Name == ACTION_NAME
@@ -695,12 +719,56 @@ function RunController.start()
 	local tuckBadgePulseGeneration = 0
 	local touchLayoutCleanup: (() -> ())? = nil
 	local runControllerConnections: { RBXScriptConnection } = {}
+	local controllerCleanupStarted = false
+	local tuckTouchSessionCharacter: Model? = nil
+	local tuckTouchButton: GuiObject? = nil
+	local tuckTouchButtonVisible = false
+	local releaseHeldTuckForLifecycle: (() -> ())? = nil
 	local player = Players.LocalPlayer
 	local playerGuiInstance = hud.ScreenGui.Parent
 	if not playerGuiInstance or not playerGuiInstance:IsA("PlayerGui") then
 		error("FrostlineRunHud must be parented to PlayerGui")
 	end
 	local playerGui = playerGuiInstance
+
+	local function reconcileTuckTouchButtonVisibility()
+		local runId = currentRunId
+		local shouldBeVisible = not controllerCleanupStarted
+			and tuckTouchSessionCharacter ~= nil
+			and player.Character == tuckTouchSessionCharacter
+			and tuckTouchSessionCharacter.Parent ~= nil
+			and runId ~= nil
+			and runId > 0
+			and runId == latestRunId
+			and isTuckTouchButtonPhase(currentPhase)
+		tuckTouchButtonVisible = shouldBeVisible
+
+		local button = tuckTouchButton
+		if not button or not button.Parent then
+			tuckTouchButton = nil
+			return
+		end
+		local succeeded = pcall(function()
+			if button.Visible ~= tuckTouchButtonVisible then
+				button.Visible = tuckTouchButtonVisible
+			end
+		end)
+		if not succeeded then
+			tuckTouchButton = nil
+		end
+	end
+
+	local function acceptResolvedTuckTouchButton(button: GuiObject?)
+		if button and button.Parent then
+			tuckTouchButton = button
+		elseif not tuckTouchButton or not tuckTouchButton.Parent then
+			tuckTouchButton = nil
+		end
+		-- This callback runs only after deferred discovery or a live DescendantAdded
+		-- event, so it always derives visibility from the latest accepted run state.
+		reconcileTuckTouchButtonVisibility()
+	end
+
 	local jumpBlockActive = false
 	local jumpActionBound = false
 	local jumpBlockDestroyed = false
@@ -911,11 +979,23 @@ function RunController.start()
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterRemoving:Connect(function(_character: Model)
+		local releaseHeldTuck = releaseHeldTuckForLifecycle
+		if releaseHeldTuck then
+			releaseHeldTuck()
+		end
+		tuckTouchSessionCharacter = nil
+		reconcileTuckTouchButtonVisibility()
 		if jumpBlockActive then
 			cancelJumpBlockForCurrentRun()
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterAdded:Connect(function(_character: Model)
+		local releaseHeldTuck = releaseHeldTuckForLifecycle
+		if releaseHeldTuck then
+			releaseHeldTuck()
+		end
+		tuckTouchSessionCharacter = nil
+		reconcileTuckTouchButtonVisibility()
 		if jumpBlockActive then
 			cancelJumpBlockForCurrentRun()
 		end
@@ -1052,21 +1132,48 @@ function RunController.start()
 		updateTuckFeedback()
 	end
 
-	local function sendTuckIntent(forceSend: boolean)
+	local function sendTuckIntent(
+		forceSend: boolean,
+		explicitIntent: boolean?,
+		allowReleaseOutsideIntentPhases: boolean?
+	)
 		local runId = currentRunId
+		local intent = if explicitIntent == nil then tuckHeld else explicitIntent
+		local phaseAcceptsIntent = currentPhase == RunPhase.Countdown or currentPhase == RunPhase.Descent
 		if runId == nil
-			or (currentPhase ~= RunPhase.Countdown and currentPhase ~= RunPhase.Descent)
+			or (not phaseAcceptsIntent and not (allowReleaseOutsideIntentPhases == true and intent == false))
 		then
 			return
 		end
-		if not forceSend and lastSentRunId == runId and lastSentIntent == tuckHeld then
+		if not forceSend and lastSentRunId == runId and lastSentIntent == intent then
 			return
 		end
 
 		lastSentRunId = runId
-		lastSentIntent = tuckHeld
-		tuckRemote:FireServer(runId, tuckHeld)
+		lastSentIntent = intent
+		tuckRemote:FireServer(runId, intent)
 	end
+
+	local function releaseHeldTuck()
+		if tuckHeld
+			and (currentPhase == RunPhase.Countdown or isTuckTouchButtonPhase(currentPhase))
+		then
+			-- Force exactly one fail-safe release through the existing authoritative
+			-- intent path before clearing local state. Airborne is allowed here because
+			-- the server already treats false intent as a safe clear outside Descent.
+			sendTuckIntent(true, false, true)
+		end
+
+		heldInputs.LeftShift = false
+		heldInputs.RightShift = false
+		heldInputs.GamepadL2 = false
+		heldInputs.Mobile = false
+		if tuckHeld then
+			tuckHeld = false
+			updateTuckFeedback()
+		end
+	end
+	releaseHeldTuckForLifecycle = releaseHeldTuck
 
 	local function refreshTuckHeld(sendIntent: boolean)
 		local held = heldInputs.LeftShift
@@ -1129,6 +1236,11 @@ function RunController.start()
 		return Enum.ContextActionResult.Sink
 	end
 
+	if UserInputService.TouchEnabled then
+		-- Install the existing GUI observer before binding so a newly created CAS
+		-- button can be hidden before its first rendered frame without yielding here.
+		touchLayoutCleanup = setupTouchButtonLayout(acceptResolvedTuckTouchButton)
+	end
 	ContextActionService:BindAction(
 		ACTION_NAME,
 		handleTuckAction,
@@ -1137,10 +1249,9 @@ function RunController.start()
 		Enum.KeyCode.RightShift,
 		Enum.KeyCode.ButtonL2
 	)
+	reconcileTuckTouchButtonVisibility()
 	ContextActionService:SetTitle(ACTION_NAME, "TUCK")
-	if UserInputService.TouchEnabled then
-		touchLayoutCleanup = setupTouchButtonLayout()
-	end
+	reconcileTuckTouchButtonVisibility()
 
 	table.insert(runControllerConnections, UserInputService.LastInputTypeChanged:Connect(function(_lastInputType)
 		refreshInputCopy()
@@ -1168,13 +1279,23 @@ function RunController.start()
 
 		local previousPhase = currentPhase
 		local runChanged = currentRunId ~= runId
+		if isTuckTouchButtonPhase(previousPhase)
+			and (runChanged or not isTuckTouchButtonPhase(phase))
+		then
+			releaseHeldTuck()
+		end
 		if runId > latestRunId then
 			latestRunId = runId
 		end
 		if runChanged then
 			currentRunId = runId
+			tuckTouchSessionCharacter = player.Character
 			lastSentRunId = nil
 			lastSentIntent = nil
+			-- A CAS touch End/Cancel can be lost while its button is hidden or
+			-- replaced. Never carry that unqueryable mobile press into a new RunId.
+			heldInputs.Mobile = false
+			refreshTuckHeld(false)
 		end
 
 		local enteredCountdown = phase == RunPhase.Countdown
@@ -1184,6 +1305,7 @@ function RunController.start()
 		end
 
 		currentPhase = phase
+		reconcileTuckTouchButtonVisibility()
 		updateJumpBlockForPhase(runId)
 		serverTuckQueued = if typeof(tuckQueued) == "boolean" then tuckQueued else false
 		serverTucking = if typeof(tucking) == "boolean" then tucking else false
@@ -1243,12 +1365,14 @@ function RunController.start()
 		)
 	end))
 
-	local controllerCleanupStarted = false
 	local function cleanupController()
 		if controllerCleanupStarted then
 			return
 		end
+		releaseHeldTuck()
 		controllerCleanupStarted = true
+		tuckTouchSessionCharacter = nil
+		reconcileTuckTouchButtonVisibility()
 		tuckBadgePulseGeneration += 1
 		if touchLayoutCleanup then
 			touchLayoutCleanup()
