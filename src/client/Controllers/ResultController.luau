@@ -10,6 +10,8 @@ local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local PlayerDataTypes = require(ReplicatedStorage.Shared.PlayerDataTypes)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
+local AudioController = require(script.Parent.AudioController)
+local VFXController = require(script.Parent.VFXController)
 
 local REMOTES_FOLDER_NAME = "FrostlineRemotes"
 local RESULT_REMOTE_NAME = "RunResult"
@@ -31,7 +33,7 @@ local SECONDARY_ICE = Color3.fromRGB(180, 231, 247)
 local PANEL_WIDE_SIZE = Vector2.new(560, 400)
 local PANEL_NARROW_SIZE = Vector2.new(360, 530)
 local ENTRANCE_DURATION = 0.32
-local SESSION_ONLY_WARNING = "SESSION ONLY — PROGRESS WILL NOT SAVE"
+local SESSION_ONLY_WARNING = "SESSION ONLY - PROGRESS WILL NOT SAVE"
 
 type Outcome = ResultTypes.Outcome
 type Action = ResultTypes.Action
@@ -47,7 +49,10 @@ type ResultUi = {
 	OutcomeGlow: Frame,
 	OutcomeBadge: Frame,
 	OutcomeLabel: TextLabel,
+	EffectsLayer: Frame,
 	NewBestLabel: TextLabel,
+	NewBestGradient: UIGradient,
+	NewBestGlow: UIStroke,
 	FinalDistanceLabel: TextLabel,
 	BestDistanceLabel: TextLabel,
 	CoinsEarnedLabel: TextLabel,
@@ -186,6 +191,39 @@ local function createButton(parent: Instance, name: string, text: string, color:
 	return button
 end
 
+local function createSnowflakeDecoration(
+	parent: Instance,
+	name: string,
+	position: UDim2,
+	anchorPoint: Vector2,
+	color: Color3,
+	rotation: number
+)
+	local decoration = Instance.new("Frame")
+	decoration.Name = name
+	decoration.AnchorPoint = anchorPoint
+	decoration.Position = position
+	decoration.Size = UDim2.fromOffset(28, 28)
+	decoration.BackgroundTransparency = 1
+	decoration.BorderSizePixel = 0
+	decoration.Rotation = rotation
+	decoration.Parent = parent
+
+	for index, armRotation in { 0, 60, 120 } do
+		local arm = Instance.new("Frame")
+		arm.Name = string.format("Arm%02d", index)
+		arm.AnchorPoint = Vector2.new(0.5, 0.5)
+		arm.Position = UDim2.fromScale(0.5, 0.5)
+		arm.Size = UDim2.fromOffset(2, 23)
+		arm.BackgroundColor3 = color
+		arm.BackgroundTransparency = 0.18
+		arm.BorderSizePixel = 0
+		arm.Rotation = armRotation
+		arm.Parent = decoration
+		addCorner(arm, 999)
+	end
+end
+
 local function createResultUi(): ResultUi
 	local playerGuiInstance = Players.LocalPlayer:WaitForChild("PlayerGui")
 	if not playerGuiInstance:IsA("PlayerGui") then
@@ -321,18 +359,31 @@ local function createResultUi(): ResultUi
 		addCorner(drift, 999)
 	end
 
-	local leftSnowflake = createLabel(panel, "LeftSnowflake", "❄", SNOW_WHITE, Enum.Font.GothamBold, 14, 24)
-	leftSnowflake.Position = UDim2.fromScale(0.055, 0.065)
-	leftSnowflake.Size = UDim2.fromOffset(28, 28)
-	leftSnowflake.TextTransparency = 0.16
-	leftSnowflake.Rotation = -12
+	createSnowflakeDecoration(
+		panel,
+		"LeftSnowflake",
+		UDim2.fromScale(0.055, 0.065),
+		Vector2.zero,
+		SNOW_WHITE,
+		-12
+	)
+	createSnowflakeDecoration(
+		panel,
+		"RightSnowflake",
+		UDim2.fromScale(0.945, 0.065),
+		Vector2.new(1, 0),
+		ICE_CYAN,
+		12
+	)
 
-	local rightSnowflake = createLabel(panel, "RightSnowflake", "❄", ICE_CYAN, Enum.Font.GothamBold, 14, 24)
-	rightSnowflake.AnchorPoint = Vector2.new(1, 0)
-	rightSnowflake.Position = UDim2.fromScale(0.945, 0.065)
-	rightSnowflake.Size = UDim2.fromOffset(28, 28)
-	rightSnowflake.TextTransparency = 0.18
-	rightSnowflake.Rotation = 12
+	local effectsLayer = Instance.new("Frame")
+	effectsLayer.Name = "FiniteResultEffects"
+	effectsLayer.Size = UDim2.fromScale(1, 1)
+	effectsLayer.BackgroundTransparency = 1
+	effectsLayer.BorderSizePixel = 0
+	effectsLayer.ClipsDescendants = true
+	effectsLayer.Active = false
+	effectsLayer.Parent = panel
 
 	local content = Instance.new("Frame")
 	content.Name = "OrderedContent"
@@ -411,6 +462,25 @@ local function createResultUi(): ResultUi
 	newBestLabel.LayoutOrder = 4
 	newBestLabel.Size = UDim2.new(1, 0, 0, 20)
 	newBestLabel.Visible = false
+
+	local newBestGradient = Instance.new("UIGradient")
+	newBestGradient.Name = "FiniteGoldShimmer"
+	newBestGradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, COIN_GOLD),
+		ColorSequenceKeypoint.new(0.5, SNOW_WHITE),
+		ColorSequenceKeypoint.new(1, COIN_GOLD),
+	})
+	newBestGradient.Offset = Vector2.new(-1, 0)
+	newBestGradient.Rotation = 12
+	newBestGradient.Enabled = false
+	newBestGradient.Parent = newBestLabel
+
+	local newBestGlow = Instance.new("UIStroke")
+	newBestGlow.Name = "FiniteGoldGlow"
+	newBestGlow.Color = COIN_GOLD
+	newBestGlow.Thickness = 1.5
+	newBestGlow.Transparency = 1
+	newBestGlow.Parent = newBestLabel
 
 	local statRow = Instance.new("Frame")
 	statRow.Name = "StatCards"
@@ -506,7 +576,10 @@ local function createResultUi(): ResultUi
 		OutcomeGlow = outcomeGlow,
 		OutcomeBadge = outcomeBadge,
 		OutcomeLabel = outcomeLabel,
+		EffectsLayer = effectsLayer,
 		NewBestLabel = newBestLabel,
+		NewBestGradient = newBestGradient,
+		NewBestGlow = newBestGlow,
 		FinalDistanceLabel = finalDistanceLabel,
 		BestDistanceLabel = bestDistanceLabel,
 		CoinsEarnedLabel = coinsEarnedLabel,
@@ -600,7 +673,9 @@ function ResultController.start()
 	local idleTraceRunId: number? = nil
 	local cameraRestoreGeneration = 0
 	local animationGeneration = 0
+	local resultEffectGeneration = 0
 	local activeTweens: { Tween } = {}
+	local activeResultEffectTweens: { Tween } = {}
 	local controllerConnections: { RBXScriptConnection } = {}
 
 	local function cancelTweens()
@@ -614,6 +689,188 @@ function ResultController.start()
 		local tween = TweenService:Create(instance, tweenInfo, properties)
 		table.insert(activeTweens, tween)
 		tween:Play()
+	end
+
+	local function playResultEffectTween(instance: Instance, tweenInfo: TweenInfo, properties: { [string]: any })
+		local tween = TweenService:Create(instance, tweenInfo, properties)
+		table.insert(activeResultEffectTweens, tween)
+		tween:Play()
+	end
+
+	local function clearLocalResultPresentation()
+		resultEffectGeneration += 1
+		for _, tween in activeResultEffectTweens do
+			tween:Cancel()
+		end
+		table.clear(activeResultEffectTweens)
+		for _, child in ui.EffectsLayer:GetChildren() do
+			child:Destroy()
+		end
+		ui.NewBestGradient.Enabled = false
+		ui.NewBestGradient.Offset = Vector2.new(-1, 0)
+		ui.NewBestGlow.Transparency = 1
+		ui.NewBestLabel.TextTransparency = 0
+	end
+
+	local function clearResultPresentation()
+		clearLocalResultPresentation()
+		VFXController.clearResultPresentation()
+	end
+
+	local function addFiniteCoinDots(generation: number)
+		local positions = {
+			Vector2.new(0.64, 0.39),
+			Vector2.new(0.70, 0.47),
+			Vector2.new(0.77, 0.40),
+			Vector2.new(0.84, 0.48),
+			Vector2.new(0.90, 0.39),
+			Vector2.new(0.94, 0.51),
+			Vector2.new(0.72, 0.56),
+			Vector2.new(0.87, 0.57),
+		}
+		for index, position in positions do
+			local dot = Instance.new("Frame")
+			dot.Name = string.format("CoinDot%02d", index)
+			dot.AnchorPoint = Vector2.new(0.5, 0.5)
+			dot.Position = UDim2.fromScale(position.X, position.Y)
+			local diameter = if index % 3 == 0 then 6 else 4
+			dot.Size = UDim2.fromOffset(diameter, diameter)
+			dot.BackgroundColor3 = if index % 2 == 0 then COIN_GOLD else SNOW_WHITE
+			dot.BackgroundTransparency = 0.08
+			dot.BorderSizePixel = 0
+			dot.Parent = ui.EffectsLayer
+			addCorner(dot, 999)
+
+			local horizontalDrift = if index % 2 == 0 then 0.025 else -0.018
+			playResultEffectTween(
+				dot,
+				TweenInfo.new(0.58 + index * 0.025, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+				{
+					Position = UDim2.fromScale(position.X + horizontalDrift, position.Y - 0.10),
+					BackgroundTransparency = 1,
+				}
+			)
+		end
+
+		task.delay(0.9, function()
+			if generation ~= resultEffectGeneration then
+				return
+			end
+			for _, child in ui.EffectsLayer:GetChildren() do
+				if string.sub(child.Name, 1, 7) == "CoinDot" then
+					child:Destroy()
+				end
+			end
+		end)
+	end
+
+	local function addFiniteCleanLandingSparkles(generation: number)
+		local positions = {
+			Vector2.new(0.13, 0.20),
+			Vector2.new(0.21, 0.29),
+			Vector2.new(0.31, 0.18),
+			Vector2.new(0.42, 0.27),
+			Vector2.new(0.58, 0.19),
+			Vector2.new(0.69, 0.28),
+			Vector2.new(0.79, 0.18),
+			Vector2.new(0.88, 0.27),
+		}
+		for index, position in positions do
+			local sparkle = Instance.new("CanvasGroup")
+			sparkle.Name = string.format("CleanSparkle%02d", index)
+			sparkle.AnchorPoint = Vector2.new(0.5, 0.5)
+			sparkle.Position = UDim2.fromScale(position.X, position.Y)
+			sparkle.Size = UDim2.fromOffset(12, 12)
+			sparkle.BackgroundTransparency = 1
+			sparkle.BorderSizePixel = 0
+			sparkle.GroupTransparency = 0.08
+			sparkle.Rotation = if index % 2 == 0 then 12 else -12
+			sparkle.Parent = ui.EffectsLayer
+
+			for armIndex, armRotation in { 0, 90 } do
+				local arm = Instance.new("Frame")
+				arm.Name = string.format("Arm%02d", armIndex)
+				arm.AnchorPoint = Vector2.new(0.5, 0.5)
+				arm.Position = UDim2.fromScale(0.5, 0.5)
+				arm.Size = UDim2.fromOffset(2, if index % 3 == 0 then 12 else 9)
+				arm.BackgroundColor3 = if index % 2 == 0 then ICE_CYAN else SNOW_WHITE
+				arm.BorderSizePixel = 0
+				arm.Rotation = armRotation
+				arm.Parent = sparkle
+				addCorner(arm, 999)
+			end
+
+			playResultEffectTween(
+				sparkle,
+				TweenInfo.new(0.62 + index * 0.02, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+				{
+					GroupTransparency = 1,
+					Position = UDim2.fromScale(position.X, position.Y - 0.055),
+					Rotation = sparkle.Rotation + 35,
+				}
+			)
+		end
+
+		task.delay(0.9, function()
+			if generation ~= resultEffectGeneration then
+				return
+			end
+			for _, child in ui.EffectsLayer:GetChildren() do
+				if string.sub(child.Name, 1, 12) == "CleanSparkle" then
+					child:Destroy()
+				end
+			end
+		end)
+	end
+
+	local function playFiniteNewBestShimmer(generation: number)
+		ui.NewBestGradient.Offset = Vector2.new(-1, 0)
+		ui.NewBestGradient.Enabled = true
+		ui.NewBestGlow.Transparency = 1
+		playResultEffectTween(
+			ui.NewBestGradient,
+			TweenInfo.new(0.72, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+			{ Offset = Vector2.new(1, 0) }
+		)
+		playResultEffectTween(
+			ui.NewBestGlow,
+			TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Transparency = 0.08 }
+		)
+
+		task.delay(0.22, function()
+			if generation ~= resultEffectGeneration then
+				return
+			end
+			playResultEffectTween(
+				ui.NewBestGlow,
+				TweenInfo.new(0.48, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+				{ Transparency = 1 }
+			)
+		end)
+		task.delay(0.78, function()
+			if generation ~= resultEffectGeneration then
+				return
+			end
+			ui.NewBestGradient.Enabled = false
+			ui.NewBestGradient.Offset = Vector2.new(-1, 0)
+		end)
+	end
+
+	local function presentResultPresentation(payload: Payload)
+		clearResultPresentation()
+		local generation = resultEffectGeneration
+		AudioController.presentResult(payload)
+		VFXController.presentResult(payload)
+		if payload.FrostCoinsEarned > 0 then
+			addFiniteCoinDots(generation)
+		end
+		if payload.Outcome == ResultTypes.Outcomes.CleanLanding then
+			addFiniteCleanLandingSparkles(generation)
+		end
+		if payload.IsNewBest then
+			playFiniteNewBestShimmer(generation)
+		end
 	end
 
 	local function updateResponsiveLayout()
@@ -694,7 +951,7 @@ function ResultController.start()
 			ui.ProcessingLabel.Text = SESSION_ONLY_WARNING
 			ui.ProcessingLabel.TextColor3 = STALLED_AMBER
 		else
-			ui.ProcessingLabel.Text = if processing then "PROCESSING…" else "CHOOSE YOUR NEXT RUN"
+			ui.ProcessingLabel.Text = if processing then "PROCESSING..." else "CHOOSE YOUR NEXT RUN"
 			ui.ProcessingLabel.TextColor3 = SECONDARY_ICE
 		end
 	end
@@ -806,6 +1063,7 @@ function ResultController.start()
 	local function hideResult()
 		animationGeneration += 1
 		cancelTweens()
+		clearResultPresentation()
 		currentPayload = nil
 		actionSubmitted = false
 		submittedAction = nil
@@ -844,6 +1102,7 @@ function ResultController.start()
 		ui.OutcomeGroup.GroupTransparency = 1
 		ui.CoinCardStroke.Transparency = 0.12
 		ui.ScreenGui.Enabled = true
+		presentResultPresentation(payload)
 		playTween(
 			ui.Backdrop,
 			TweenInfo.new(ENTRANCE_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
@@ -887,6 +1146,8 @@ function ResultController.start()
 		submittedAction = action
 		setButtonsEnabled(false)
 		updateStatusLabel(payload, true)
+		AudioController.playAcceptedButton(payload.RunId)
+		clearResultPresentation()
 		resultActionRemote:FireServer(payload.RunId, action)
 	end
 
@@ -978,6 +1239,7 @@ function ResultController.start()
 		cameraRestoreGeneration += 1
 		animationGeneration += 1
 		cancelTweens()
+		clearResultPresentation()
 		clearCameraFollowState()
 		applyNormalCamera()
 		restoreRunHud()

@@ -72,6 +72,11 @@ local GameConfig = {
 		StabilityRayDistance = 5,
 		MaximumStabilityTorque = 2400,
 		RampFreedomStartZ = 215,
+		RampExitRollGuardEnabled = true,
+		RampExitMaxRollRateRadiansPerSecond = math.rad(30),
+		RampExitPitchGuardEnabled = true,
+		RampExitMaxPitchRateRadiansPerSecond = math.rad(30),
+		LaunchStabilityDiagnosticsEnabled = false,
 		-- A stop is physical only after both measured speeds stay below these
 		-- thresholds for the entire confirmation interval.
 		LandingStopHorizontalSpeed = 0.5,
@@ -113,6 +118,129 @@ local GameConfig = {
 		LoadWaitTimeoutSeconds = 15,
 		ShutdownTimeoutSeconds = 25,
 		DiagnosticsEnabled = false,
+	},
+
+	Audio = {
+		DiagnosticsEnabled = false,
+		PreloadTimeoutSeconds = 15,
+		MusicFadeInSeconds = 1.5,
+		ShortFadeSeconds = 0.12,
+		TuckReplayCooldownSeconds = 0.45,
+		SlideMovingThreshold = 2,
+		SlideFullVolumeSpeed = 70,
+		LakeSlideVolumeMultiplier = 0.45,
+
+		Music = {
+			IdleTarget = 0.06,
+			CountdownTarget = 0.035,
+			DescentTarget = 0.03,
+			AirborneTarget = 0.025,
+			LandedTarget = 0.03,
+			ResultsTarget = 0.035,
+			PriorityCueDuckTarget = 0.015,
+			DuckAttackSeconds = 0.10,
+			NormalReleaseSeconds = 0.55,
+			CountdownDuckSeconds = 1.10,
+			LaunchDuckSeconds = 0.70,
+			TuckDuckSeconds = 0.45,
+			ImpactDuckSeconds = 0.65,
+			ResultDuckSeconds = 1.15,
+			ButtonDuckSeconds = 0.25,
+			SlideDuckMultiplier = 0.55,
+		},
+
+		Assets = {
+			BackgroundMusic = "rbxassetid://9046740461", -- Winter Holidays, uploaded by APMOfficial
+			SledSnowSlide = "rbxassetid://9125945654", -- Sign Slide Snow Large Plastic Real Estate Ty (SFX), uploaded by ProSoundEffects
+			CountdownBeep = "rbxassetid://9117060548", -- Nasa Transmission Beep 4 (SFX), uploaded by ProSoundEffects
+			LaunchWhoosh = "rbxassetid://9120629528", -- Web Whoosh Fast Heavy Swooshes 3 (SFX), uploaded by ProSoundEffects
+			TuckWhoosh = "rbxassetid://9113080265", -- Airy Pass By Fast Breathing Rush Of Air 5 (SFX), uploaded by ProSoundEffects
+			SnowImpact = "rbxassetid://9125965330", -- Snow Impact Big Hits Semi- Deep Stomping Jum (SFX), uploaded by ProSoundEffects
+			CoinReward = "rbxassetid://127645268874265", -- CoinTransfer_01, uploaded by Roblox
+			Victory = "rbxassetid://12222253", -- victory.wav, uploaded by Roblox
+			Failure = "rbxassetid://12221944", -- bass.wav, uploaded by Roblox
+			UIButton = "rbxassetid://12221967", -- button.wav, uploaded by Roblox
+		},
+
+		Volumes = {
+			SledSnowSlide = 0.31,
+			CountdownBeep = 0.32,
+			LaunchWhoosh = 0.46,
+			TuckWhoosh = 0.29,
+			SnowImpact = 0.44,
+			CoinReward = 0.32,
+			Victory = 0.36,
+			Failure = 0.32,
+			UIButton = 0.22,
+		},
+	},
+
+	Presentation = {
+		DiagnosticsEnabled = false,
+
+		Snowfall = {
+			Far = {
+				DesktopRate = 36,
+				MobileRate = 18,
+				CameraOffset = Vector3.new(0, 13, -9),
+				RegionSize = Vector3.new(44, 2, 32),
+			},
+			Near = {
+				DesktopRate = 12,
+				MobileRate = 6,
+				CameraOffset = Vector3.new(0, 8, -5),
+				RegionSize = Vector3.new(28, 2, 20),
+			},
+		},
+
+		Trails = {
+			BroadLifetime = 0.34,
+			HighlightLifetime = 0.21,
+			MinimumSpeed = 3,
+			FullStrengthSpeed = 70,
+			BroadWidth = 0.36,
+			HighlightWidth = 0.065,
+			TuckStrengthBonus = 0.18,
+			LakeStrengthMultiplier = 0.62,
+			LandingBoostDuration = 0.58,
+		},
+
+		SnowSpray = {
+			MinimumSpeed = 8,
+			FullRateSpeed = 70,
+			DesktopMaximumRate = 54,
+			MobileMaximumRate = 28,
+			Lifetime = NumberRange.new(0.32, 0.48),
+			GroundRayDistance = 4.5,
+		},
+
+		TuckStreaks = {
+			DesktopRate = 36,
+			MobileRate = 19,
+			Lifetime = NumberRange.new(0.26, 0.38),
+		},
+
+		Bursts = {
+			DesktopLaunch = 48,
+			MobileLaunch = 26,
+			DesktopLanding = 66,
+			MobileLanding = 38,
+			DesktopCrash = 82,
+			MobileCrash = 46,
+			LaunchLifetime = NumberRange.new(0.38, 0.50),
+			LandingLifetime = NumberRange.new(0.50, 0.68),
+			CrashLifetime = NumberRange.new(0.55, 0.72),
+		},
+
+		WinterGrade = {
+			BloomIntensity = 0.15,
+			BloomThreshold = 1.2,
+			BloomSize = 22,
+			Brightness = -0.01,
+			Contrast = 0.07,
+			Saturation = 0.02,
+			TintColor = Color3.fromRGB(239, 248, 255),
+		},
 	},
 
 	Camera = {

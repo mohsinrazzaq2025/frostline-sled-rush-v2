@@ -4,9 +4,12 @@ local ContextActionService = game:GetService("ContextActionService")
 local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
+local AudioController = require(script.Parent.AudioController)
+local VFXController = require(script.Parent.VFXController)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
 
 local ACTION_NAME = "FrostlineTuck"
@@ -26,13 +29,23 @@ local MISSED_LAUNCH_OUTCOME = "missed-launch"
 local MINIMUM_TOUCH_BUTTON_GAP = 16
 local TOUCH_LAYOUT_RETRY_DELAY = 0.25
 local TOUCH_LAYOUT_RETRY_COUNT = 20
+local DARK_NAVY = Color3.fromRGB(11, 31, 58)
+local WINTER_BLUE = Color3.fromRGB(18, 59, 93)
+local ICE_CYAN = Color3.fromRGB(115, 232, 255)
+local SNOW_WHITE = Color3.fromRGB(245, 251, 255)
 
 type Hud = {
 	ScreenGui: ScreenGui,
+	StatusPanel: Frame,
 	CountdownLabel: TextLabel,
 	PhaseLabel: TextLabel,
 	SpeedLabel: TextLabel,
+	TuckBadge: Frame,
+	TuckBadgeStroke: UIStroke,
+	TuckBadgeScale: UIScale,
 	TuckLabel: TextLabel,
+	TutorialFrame: Frame,
+	TutorialDetail: TextLabel,
 }
 
 type HeldInputs = {
@@ -53,7 +66,38 @@ local function addTextSizeConstraint(label: TextLabel, minimum: number, maximum:
 	constraint.Parent = label
 end
 
-local function createHud(defaultTuckInstruction: string): Hud
+local function addCorner(parent: Instance, radius: number)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius)
+	corner.Parent = parent
+end
+
+local function isGamepadInput(inputType: Enum.UserInputType): boolean
+	return string.sub(inputType.Name, 1, 7) == "Gamepad"
+end
+
+local function getTuckInputCopy(): (string, string, string, string)
+	local lastInputType = UserInputService:GetLastInputType()
+	local inputName: string
+	if lastInputType == Enum.UserInputType.Touch then
+		inputName = "TUCK"
+	elseif isGamepadInput(lastInputType) then
+		inputName = "L2"
+	elseif UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+		inputName = "TUCK"
+	elseif UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
+		inputName = "L2"
+	else
+		inputName = "Shift"
+	end
+
+	return string.format("HOLD %s TO TUCK", string.upper(inputName)),
+		string.format("HOLD %s TO PREPARE TUCK", string.upper(inputName)),
+		string.format("Hold %s during the downhill run.", inputName),
+		string.format("KEEP HOLDING %s", string.upper(inputName))
+end
+
+local function createHud(defaultTuckInstruction: string, tutorialDetail: string): Hud
 	local player = Players.LocalPlayer
 	local playerGui = player:WaitForChild("PlayerGui")
 	if not playerGui:IsA("PlayerGui") then
@@ -74,77 +118,129 @@ local function createHud(defaultTuckInstruction: string): Hud
 
 	local statusPanel = Instance.new("Frame")
 	statusPanel.Name = "StatusPanel"
-	statusPanel.Size = UDim2.fromScale(0.28, 0.135)
-	statusPanel.Position = UDim2.fromScale(0.025, 0.045)
-	statusPanel.BackgroundColor3 = Color3.fromRGB(16, 31, 52)
-	statusPanel.BackgroundTransparency = 0.12
+	statusPanel.Size = UDim2.fromScale(0.255, 0.14)
+	statusPanel.Position = UDim2.fromScale(0.025, 0.042)
+	statusPanel.BackgroundColor3 = DARK_NAVY
+	statusPanel.BackgroundTransparency = 0.08
 	statusPanel.BorderSizePixel = 0
 	statusPanel.Parent = screenGui
 
 	local panelConstraint = Instance.new("UISizeConstraint")
-	panelConstraint.MinSize = Vector2.new(210, 92)
-	panelConstraint.MaxSize = Vector2.new(430, 165)
+	panelConstraint.MinSize = Vector2.new(238, 112)
+	panelConstraint.MaxSize = Vector2.new(350, 144)
 	panelConstraint.Parent = statusPanel
 
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0.08, 0)
-	corner.Parent = statusPanel
+	addCorner(statusPanel, 15)
+
+	local panelGradient = Instance.new("UIGradient")
+	panelGradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, WINTER_BLUE),
+		ColorSequenceKeypoint.new(0.58, DARK_NAVY),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(6, 22, 43)),
+	})
+	panelGradient.Rotation = 105
+	panelGradient.Parent = statusPanel
 
 	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(244, 190, 70)
+	stroke.Color = ICE_CYAN
 	stroke.Thickness = 2
-	stroke.Transparency = 0.18
+	stroke.Transparency = 0.12
 	stroke.Parent = statusPanel
 
-	local padding = Instance.new("UIPadding")
-	padding.PaddingTop = UDim.new(0.09, 0)
-	padding.PaddingBottom = UDim.new(0.09, 0)
-	padding.PaddingLeft = UDim.new(0.07, 0)
-	padding.PaddingRight = UDim.new(0.07, 0)
-	padding.Parent = statusPanel
-
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.HorizontalAlignment = Enum.HorizontalAlignment.Left
-	layout.VerticalAlignment = Enum.VerticalAlignment.Center
-	layout.Padding = UDim.new(0.035, 0)
-	layout.Parent = statusPanel
+	local snowCap = Instance.new("Frame")
+	snowCap.Name = "SnowCap"
+	snowCap.Position = UDim2.fromOffset(0, -2)
+	snowCap.Size = UDim2.new(1, 0, 0, 12)
+	snowCap.BackgroundColor3 = SNOW_WHITE
+	snowCap.BackgroundTransparency = 0.03
+	snowCap.BorderSizePixel = 0
+	snowCap.Parent = statusPanel
+	addCorner(snowCap, 15)
+	for index, position in { 0.16, 0.42, 0.68, 0.88 } do
+		local drift = Instance.new("Frame")
+		drift.Name = string.format("SnowDrift%02d", index)
+		drift.AnchorPoint = Vector2.new(0.5, 0.5)
+		drift.Position = UDim2.fromScale(position, 0.92)
+		drift.Size = UDim2.fromOffset(if index % 2 == 0 then 68 else 50, if index % 2 == 0 then 14 else 11)
+		drift.BackgroundColor3 = SNOW_WHITE
+		drift.BorderSizePixel = 0
+		drift.Parent = snowCap
+		addCorner(drift, 999)
+	end
 
 	local phaseLabel = Instance.new("TextLabel")
-	phaseLabel.Name = "Phase"
-	phaseLabel.Size = UDim2.fromScale(1, 0.28)
+	phaseLabel.Name = "PlayerStatus"
+	phaseLabel.Position = UDim2.fromScale(0.055, 0.18)
+	phaseLabel.Size = UDim2.fromScale(0.65, 0.25)
 	phaseLabel.BackgroundTransparency = 1
-	phaseLabel.Font = Enum.Font.GothamBold
-	phaseLabel.Text = "Phase: Idle"
-	phaseLabel.TextColor3 = Color3.fromRGB(250, 251, 252)
+	phaseLabel.Font = Enum.Font.GothamBlack
+	phaseLabel.Text = "READY"
+	phaseLabel.TextColor3 = SNOW_WHITE
 	phaseLabel.TextScaled = true
 	phaseLabel.TextXAlignment = Enum.TextXAlignment.Left
 	phaseLabel.Parent = statusPanel
-	addTextSizeConstraint(phaseLabel, 13, 26)
+	addTextSizeConstraint(phaseLabel, 13, 23)
+
+	local speedCaption = Instance.new("TextLabel")
+	speedCaption.Name = "SpeedCaption"
+	speedCaption.AnchorPoint = Vector2.new(1, 0)
+	speedCaption.Position = UDim2.fromScale(0.945, 0.13)
+	speedCaption.Size = UDim2.fromScale(0.23, 0.17)
+	speedCaption.BackgroundTransparency = 1
+	speedCaption.Font = Enum.Font.GothamBold
+	speedCaption.Text = "SPEED"
+	speedCaption.TextColor3 = ICE_CYAN
+	speedCaption.TextScaled = true
+	speedCaption.TextXAlignment = Enum.TextXAlignment.Right
+	speedCaption.Parent = statusPanel
+	addTextSizeConstraint(speedCaption, 9, 12)
 
 	local speedLabel = Instance.new("TextLabel")
-	speedLabel.Name = "Speed"
-	speedLabel.Size = UDim2.fromScale(1, 0.28)
+	speedLabel.Name = "SpeedValue"
+	speedLabel.AnchorPoint = Vector2.new(1, 0)
+	speedLabel.Position = UDim2.fromScale(0.945, 0.27)
+	speedLabel.Size = UDim2.fromScale(0.25, 0.25)
 	speedLabel.BackgroundTransparency = 1
 	speedLabel.Font = Enum.Font.GothamBlack
-	speedLabel.Text = "Speed: 0 studs/s"
-	speedLabel.TextColor3 = Color3.fromRGB(150, 218, 242)
+	speedLabel.Text = "0"
+	speedLabel.TextColor3 = SNOW_WHITE
 	speedLabel.TextScaled = true
-	speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+	speedLabel.TextXAlignment = Enum.TextXAlignment.Right
 	speedLabel.Parent = statusPanel
-	addTextSizeConstraint(speedLabel, 13, 28)
+	addTextSizeConstraint(speedLabel, 18, 30)
+
+	local tuckBadge = Instance.new("Frame")
+	tuckBadge.Name = "TuckBadge"
+	tuckBadge.Position = UDim2.fromScale(0.05, 0.58)
+	tuckBadge.Size = UDim2.fromScale(0.9, 0.28)
+	tuckBadge.BackgroundColor3 = Color3.fromRGB(37, 69, 91)
+	tuckBadge.BackgroundTransparency = 0.16
+	tuckBadge.BorderSizePixel = 0
+	tuckBadge.Parent = statusPanel
+	addCorner(tuckBadge, 9)
+
+	local tuckBadgeStroke = Instance.new("UIStroke")
+	tuckBadgeStroke.Name = "TuckBadgeStroke"
+	tuckBadgeStroke.Color = TUCK_DEFAULT_COLOR
+	tuckBadgeStroke.Thickness = 1.4
+	tuckBadgeStroke.Transparency = 0.28
+	tuckBadgeStroke.Parent = tuckBadge
+
+	local tuckBadgeScale = Instance.new("UIScale")
+	tuckBadgeScale.Name = "FeedbackScale"
+	tuckBadgeScale.Scale = 1
+	tuckBadgeScale.Parent = tuckBadge
 
 	local instructionLabel = Instance.new("TextLabel")
 	instructionLabel.Name = "TuckInstruction"
-	instructionLabel.Size = UDim2.fromScale(1, 0.28)
+	instructionLabel.Size = UDim2.fromScale(1, 1)
 	instructionLabel.BackgroundTransparency = 1
-	instructionLabel.Font = Enum.Font.GothamMedium
+	instructionLabel.Font = Enum.Font.GothamBold
 	instructionLabel.Text = defaultTuckInstruction
 	instructionLabel.TextColor3 = TUCK_DEFAULT_COLOR
 	instructionLabel.TextScaled = true
-	instructionLabel.TextXAlignment = Enum.TextXAlignment.Left
-	instructionLabel.Parent = statusPanel
-	addTextSizeConstraint(instructionLabel, 12, 23)
+	instructionLabel.Parent = tuckBadge
+	addTextSizeConstraint(instructionLabel, 10, 17)
 
 	local countdownLabel = Instance.new("TextLabel")
 	countdownLabel.Name = "Countdown"
@@ -162,12 +258,76 @@ local function createHud(defaultTuckInstruction: string): Hud
 	countdownLabel.Parent = screenGui
 	addTextSizeConstraint(countdownLabel, 42, 118)
 
+	local tutorialFrame = Instance.new("Frame")
+	tutorialFrame.Name = "TuckTutorial"
+	-- StatusPanel is capped at 144 px; this keeps a 12 px gap even at its maximum height.
+	tutorialFrame.Position = UDim2.new(0.025, 0, 0.042, 156)
+	tutorialFrame.Size = UDim2.fromScale(0.29, 0.078)
+	tutorialFrame.BackgroundColor3 = DARK_NAVY
+	tutorialFrame.BackgroundTransparency = 0.14
+	tutorialFrame.BorderSizePixel = 0
+	tutorialFrame.Active = false
+	tutorialFrame.Parent = screenGui
+	addCorner(tutorialFrame, 12)
+
+	local tutorialConstraint = Instance.new("UISizeConstraint")
+	tutorialConstraint.MinSize = Vector2.new(238, 62)
+	tutorialConstraint.MaxSize = Vector2.new(390, 82)
+	tutorialConstraint.Parent = tutorialFrame
+
+	local tutorialStroke = Instance.new("UIStroke")
+	tutorialStroke.Color = ICE_CYAN
+	tutorialStroke.Thickness = 1.5
+	tutorialStroke.Transparency = 0.28
+	tutorialStroke.Parent = tutorialFrame
+
+	local tutorialAccent = Instance.new("Frame")
+	tutorialAccent.Name = "GoldAccent"
+	tutorialAccent.Size = UDim2.new(0, 5, 1, -16)
+	tutorialAccent.Position = UDim2.fromOffset(10, 8)
+	tutorialAccent.BackgroundColor3 = TUCK_DEFAULT_COLOR
+	tutorialAccent.BorderSizePixel = 0
+	tutorialAccent.Parent = tutorialFrame
+	addCorner(tutorialAccent, 999)
+
+	local tutorialTitle = Instance.new("TextLabel")
+	tutorialTitle.Name = "Title"
+	tutorialTitle.Position = UDim2.new(0, 25, 0.08, 0)
+	tutorialTitle.Size = UDim2.new(1, -34, 0.4, 0)
+	tutorialTitle.BackgroundTransparency = 1
+	tutorialTitle.Font = Enum.Font.GothamBlack
+	tutorialTitle.Text = "TUCK FOR MORE SPEED"
+	tutorialTitle.TextColor3 = SNOW_WHITE
+	tutorialTitle.TextScaled = true
+	tutorialTitle.TextXAlignment = Enum.TextXAlignment.Left
+	tutorialTitle.Parent = tutorialFrame
+	addTextSizeConstraint(tutorialTitle, 11, 17)
+
+	local tutorialDetailLabel = Instance.new("TextLabel")
+	tutorialDetailLabel.Name = "Detail"
+	tutorialDetailLabel.Position = UDim2.new(0, 25, 0.49, 0)
+	tutorialDetailLabel.Size = UDim2.new(1, -34, 0.36, 0)
+	tutorialDetailLabel.BackgroundTransparency = 1
+	tutorialDetailLabel.Font = Enum.Font.GothamMedium
+	tutorialDetailLabel.Text = tutorialDetail
+	tutorialDetailLabel.TextColor3 = Color3.fromRGB(196, 228, 241)
+	tutorialDetailLabel.TextScaled = true
+	tutorialDetailLabel.TextXAlignment = Enum.TextXAlignment.Left
+	tutorialDetailLabel.Parent = tutorialFrame
+	addTextSizeConstraint(tutorialDetailLabel, 9, 14)
+
 	return {
 		ScreenGui = screenGui,
+		StatusPanel = statusPanel,
 		CountdownLabel = countdownLabel,
 		PhaseLabel = phaseLabel,
 		SpeedLabel = speedLabel,
+		TuckBadge = tuckBadge,
+		TuckBadgeStroke = tuckBadgeStroke,
+		TuckBadgeScale = tuckBadgeScale,
 		TuckLabel = instructionLabel,
+		TutorialFrame = tutorialFrame,
+		TutorialDetail = tutorialDetailLabel,
 	}
 end
 
@@ -256,10 +416,10 @@ local function setAbsoluteButtonPosition(button: GuiObject, topLeft: Vector2): b
 	return true
 end
 
-local function setupTouchButtonLayout()
+local function setupTouchButtonLayout(): () -> ()
 	local playerGuiInstance = Players.LocalPlayer:WaitForChild("PlayerGui")
 	if not playerGuiInstance:IsA("PlayerGui") then
-		return
+		return function() end
 	end
 	local playerGui = playerGuiInstance
 
@@ -268,8 +428,42 @@ local function setupTouchButtonLayout()
 	local observedTuckButton: GuiObject? = nil
 	local tuckConnections: { RBXScriptConnection } = {}
 	local cameraConnection: RBXScriptConnection? = nil
+	local persistentConnections: { RBXScriptConnection } = {}
 	local layoutGeneration = 0
+	local destroyed = false
 	local requestLayout: () -> ()
+
+	local function styleTuckButton(tuckButton: GuiObject)
+		tuckButton.BackgroundColor3 = DARK_NAVY
+		tuckButton.BackgroundTransparency = 0.08
+		if tuckButton:IsA("ImageButton") then
+			tuckButton.ImageColor3 = Color3.fromRGB(35, 91, 118)
+			tuckButton.ImageTransparency = 0.06
+		end
+
+		if not tuckButton:FindFirstChild("FrostlineCorner") then
+			local corner = Instance.new("UICorner")
+			corner.Name = "FrostlineCorner"
+			corner.CornerRadius = UDim.new(1, 0)
+			corner.Parent = tuckButton
+		end
+		if not tuckButton:FindFirstChild("FrostlineStroke") then
+			local stroke = Instance.new("UIStroke")
+			stroke.Name = "FrostlineStroke"
+			stroke.Color = ICE_CYAN
+			stroke.Thickness = 2
+			stroke.Transparency = 0.12
+			stroke.Parent = tuckButton
+		end
+
+		local title = tuckButton:FindFirstChildWhichIsA("TextLabel", true)
+		if title and title:IsA("TextLabel") then
+			title.Font = Enum.Font.GothamBlack
+			title.TextColor3 = SNOW_WHITE
+			title.TextStrokeColor3 = DARK_NAVY
+			title.TextStrokeTransparency = 0.25
+		end
+	end
 
 	local function clearJumpConnections()
 		for _, connection in jumpConnections do
@@ -323,12 +517,16 @@ local function setupTouchButtonLayout()
 	end
 
 	local function applyLayout(): boolean
+		if destroyed then
+			return false
+		end
 		local tuckButtonInstance = ContextActionService:GetButton(ACTION_NAME)
 		if not tuckButtonInstance or not tuckButtonInstance:IsA("GuiObject") then
 			observeTuckButton(nil)
 			return false
 		end
 		local tuckButton = tuckButtonInstance
+		styleTuckButton(tuckButton)
 		observeTuckButton(tuckButton)
 		local tuckSize = tuckButton.AbsoluteSize
 		if tuckSize.X <= 0 or tuckSize.Y <= 0 then
@@ -385,7 +583,7 @@ local function setupTouchButtonLayout()
 
 	local function attemptLayout(generation: number, retriesRemaining: number)
 		task.defer(function()
-			if generation ~= layoutGeneration then
+			if destroyed or generation ~= layoutGeneration then
 				return
 			end
 
@@ -399,6 +597,9 @@ local function setupTouchButtonLayout()
 	end
 
 	requestLayout = function()
+		if destroyed then
+			return
+		end
 		layoutGeneration += 1
 		attemptLayout(layoutGeneration, TOUCH_LAYOUT_RETRY_COUNT)
 	end
@@ -416,18 +617,39 @@ local function setupTouchButtonLayout()
 		requestLayout()
 	end
 
-	playerGui.DescendantAdded:Connect(function(descendant: Instance)
+	table.insert(persistentConnections, playerGui.DescendantAdded:Connect(function(descendant: Instance)
 		if descendant.Name == "JumpButton"
 			or descendant.Name == "ContextActionGui"
 			or descendant.Name == ACTION_NAME
 		then
 			requestLayout()
 		end
-	end)
-	playerGui:GetPropertyChangedSignal("CurrentScreenOrientation"):Connect(requestLayout)
-	Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(observeCurrentCamera)
-	GuiService:GetPropertyChangedSignal("ViewportDisplaySize"):Connect(requestLayout)
+	end))
+	table.insert(
+		persistentConnections,
+		playerGui:GetPropertyChangedSignal("CurrentScreenOrientation"):Connect(requestLayout)
+	)
+	table.insert(persistentConnections, Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(observeCurrentCamera))
+	table.insert(persistentConnections, GuiService:GetPropertyChangedSignal("ViewportDisplaySize"):Connect(requestLayout))
 	observeCurrentCamera()
+
+	return function()
+		if destroyed then
+			return
+		end
+		destroyed = true
+		layoutGeneration += 1
+		clearJumpConnections()
+		clearTuckConnections()
+		if cameraConnection then
+			cameraConnection:Disconnect()
+			cameraConnection = nil
+		end
+		for _, connection in persistentConnections do
+			connection:Disconnect()
+		end
+		table.clear(persistentConnections)
+	end
 end
 
 function RunController.start()
@@ -450,12 +672,8 @@ function RunController.start()
 		error("RunState must be a RemoteEvent")
 	end
 
-	local usesMobileTuckInstructions = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-	local defaultTuckInstruction = if usesMobileTuckInstructions then "Hold TUCK to Tuck" else "Hold Shift to Tuck"
-	local prepareTuckInstruction = if usesMobileTuckInstructions
-		then "Hold TUCK to prepare"
-		else "Hold Shift to prepare Tuck"
-	local hud = createHud(defaultTuckInstruction)
+	local defaultTuckInstruction, prepareTuckInstruction, tutorialDetail, activeTuckInstruction = getTuckInputCopy()
+	local hud = createHud(defaultTuckInstruction, tutorialDetail)
 	local heldInputs: HeldInputs = {
 		LeftShift = false,
 		RightShift = false,
@@ -470,7 +688,13 @@ function RunController.start()
 	local lastSentIntent: boolean? = nil
 	local serverTuckQueued = false
 	local serverTucking = false
+	local serverReleaseAccepted = false
 	local currentOutcome: string? = nil
+	local tutorialDismissed = false
+	local lastTuckBadgeStyle = ""
+	local tuckBadgePulseGeneration = 0
+	local touchLayoutCleanup: (() -> ())? = nil
+	local runControllerConnections: { RBXScriptConnection } = {}
 	local player = Players.LocalPlayer
 	local playerGuiInstance = hud.ScreenGui.Parent
 	if not playerGuiInstance or not playerGuiInstance:IsA("PlayerGui") then
@@ -704,55 +928,128 @@ function RunController.start()
 	end
 
 	local function updatePhaseFeedback()
+		hud.StatusPanel.Visible = currentPhase ~= RunPhase.Results and currentPhase ~= RunPhase.Reset
+		hud.TutorialFrame.Visible = not tutorialDismissed and currentPhase == RunPhase.Idle
 		hud.PhaseLabel.TextColor3 = PHASE_DEFAULT_COLOR
-		hud.PhaseLabel.Font = Enum.Font.GothamBold
+		hud.PhaseLabel.Font = Enum.Font.GothamBlack
 		if isShowingMissedLaunch() then
 			hud.PhaseLabel.Text = "MISSED LAUNCH"
 			hud.PhaseLabel.TextColor3 = MISSED_LAUNCH_COLOR
-			hud.PhaseLabel.Font = Enum.Font.GothamBlack
+		elseif currentPhase == RunPhase.Idle then
+			hud.PhaseLabel.Text = "READY"
+		elseif currentPhase == RunPhase.Countdown then
+			hud.PhaseLabel.Text = "GET READY"
+		elseif currentPhase == RunPhase.Descent then
+			hud.PhaseLabel.Text = if serverTucking then "TUCK ACTIVE" else "DOWNHILL"
+			hud.PhaseLabel.TextColor3 = if serverTucking then TUCK_ACTIVE_COLOR else PHASE_DEFAULT_COLOR
+		elseif currentPhase == RunPhase.Airborne then
+			hud.PhaseLabel.Text = "AIRBORNE"
+			hud.PhaseLabel.TextColor3 = TUCK_FLIGHT_COLOR
 		elseif currentPhase == RunPhase.Landed then
-			hud.PhaseLabel.Text = "LANDED! • Slowing down…"
+			hud.PhaseLabel.Text = "MEASURING DISTANCE..."
 		elseif currentPhase == RunPhase.Results or currentPhase == RunPhase.Reset then
 			hud.PhaseLabel.Text = "RUN COMPLETE"
 		else
-			hud.PhaseLabel.Text = string.format("Phase: %s", currentPhase)
+			hud.PhaseLabel.Text = "READY"
+		end
+	end
+
+	local function pulseTuckBadge()
+		tuckBadgePulseGeneration += 1
+		local generation = tuckBadgePulseGeneration
+		hud.TuckBadgeScale.Scale = 1
+		local grow = TweenService:Create(
+			hud.TuckBadgeScale,
+			TweenInfo.new(0.11, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Scale = 1.055 }
+		)
+		grow:Play()
+		task.spawn(function()
+			grow.Completed:Wait()
+			if generation ~= tuckBadgePulseGeneration or not hud.TuckBadgeScale.Parent then
+				return
+			end
+			TweenService:Create(
+				hud.TuckBadgeScale,
+				TweenInfo.new(0.18, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+				{ Scale = 1 }
+			):Play()
+		end)
+	end
+
+	local function applyTuckBadgeStyle(styleName: string, color: Color3)
+		if styleName == lastTuckBadgeStyle then
+			return
+		end
+		local wasActive = lastTuckBadgeStyle == "active"
+		lastTuckBadgeStyle = styleName
+		TweenService:Create(
+			hud.TuckBadge,
+			TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ BackgroundColor3 = color:Lerp(DARK_NAVY, 0.72) }
+		):Play()
+		TweenService:Create(
+			hud.TuckBadgeStroke,
+			TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Color = color, Transparency = if styleName == "active" then 0.04 else 0.28 }
+		):Play()
+		if styleName == "active" and not wasActive then
+			pulseTuckBadge()
 		end
 	end
 
 	local function updateTuckFeedback()
 		if isShowingMissedLaunch() then
-			hud.TuckLabel.Text = "Run ended — resetting"
+			hud.TuckLabel.Text = "RUN ENDED - RESETTING"
 			hud.TuckLabel.TextColor3 = MISSED_LAUNCH_DETAIL_COLOR
 			hud.TuckLabel.Font = Enum.Font.GothamBold
+			applyTuckBadgeStyle("missed", MISSED_LAUNCH_DETAIL_COLOR)
 		elseif currentPhase == RunPhase.Countdown then
 			if tuckHeld then
-				hud.TuckLabel.Text = "TUCK READY — activates at GO"
+				hud.TuckLabel.Text = "TUCK READY - ACTIVATES AT GO"
 				hud.TuckLabel.TextColor3 = TUCK_READY_COLOR
 				hud.TuckLabel.Font = Enum.Font.GothamBlack
+				applyTuckBadgeStyle("ready", TUCK_READY_COLOR)
 			else
 				hud.TuckLabel.Text = prepareTuckInstruction
 				hud.TuckLabel.TextColor3 = TUCK_DEFAULT_COLOR
 				hud.TuckLabel.Font = Enum.Font.GothamMedium
+				applyTuckBadgeStyle("default", TUCK_DEFAULT_COLOR)
 			end
 		elseif currentPhase == RunPhase.Descent then
-			if tuckHeld and serverTucking then
-				hud.TuckLabel.Text = "TUCK ACTIVE"
+			if serverTucking then
+				hud.TuckLabel.Text = activeTuckInstruction
 				hud.TuckLabel.TextColor3 = TUCK_ACTIVE_COLOR
 				hud.TuckLabel.Font = Enum.Font.GothamBlack
+				applyTuckBadgeStyle("active", TUCK_ACTIVE_COLOR)
 			else
 				hud.TuckLabel.Text = defaultTuckInstruction
 				hud.TuckLabel.TextColor3 = TUCK_DEFAULT_COLOR
 				hud.TuckLabel.Font = Enum.Font.GothamMedium
+				applyTuckBadgeStyle("default", TUCK_DEFAULT_COLOR)
 			end
 		elseif currentPhase == RunPhase.Airborne then
-			hud.TuckLabel.Text = "BALLISTIC FLIGHT"
+			hud.TuckLabel.Text = "NATURAL FLIGHT"
 			hud.TuckLabel.TextColor3 = TUCK_FLIGHT_COLOR
 			hud.TuckLabel.Font = Enum.Font.GothamBold
+			applyTuckBadgeStyle("flight", TUCK_FLIGHT_COLOR)
+		elseif currentPhase == RunPhase.Landed then
+			hud.TuckLabel.Text = "COASTING TO A STOP"
+			hud.TuckLabel.TextColor3 = TUCK_FLIGHT_COLOR
+			hud.TuckLabel.Font = Enum.Font.GothamBold
+			applyTuckBadgeStyle("landed", TUCK_FLIGHT_COLOR)
 		else
 			hud.TuckLabel.Text = defaultTuckInstruction
 			hud.TuckLabel.TextColor3 = TUCK_DEFAULT_COLOR
 			hud.TuckLabel.Font = Enum.Font.GothamMedium
+			applyTuckBadgeStyle("default", TUCK_DEFAULT_COLOR)
 		end
+	end
+
+	local function refreshInputCopy()
+		defaultTuckInstruction, prepareTuckInstruction, tutorialDetail, activeTuckInstruction = getTuckInputCopy()
+		hud.TutorialDetail.Text = tutorialDetail
+		updateTuckFeedback()
 	end
 
 	local function sendTuckIntent(forceSend: boolean)
@@ -842,17 +1139,22 @@ function RunController.start()
 	)
 	ContextActionService:SetTitle(ACTION_NAME, "TUCK")
 	if UserInputService.TouchEnabled then
-		setupTouchButtonLayout()
+		touchLayoutCleanup = setupTouchButtonLayout()
 	end
 
-	runStateRemote.OnClientEvent:Connect(function(
+	table.insert(runControllerConnections, UserInputService.LastInputTypeChanged:Connect(function(_lastInputType)
+		refreshInputCopy()
+	end))
+
+	table.insert(runControllerConnections, runStateRemote.OnClientEvent:Connect(function(
 		phase: any,
 		countdown: any,
 		speed: any,
 		runId: any,
 		tuckQueued: any,
 		tucking: any,
-		outcome: any
+		outcome: any,
+		releaseAccepted: any
 	)
 		if typeof(phase) ~= "string"
 			or typeof(runId) ~= "number"
@@ -875,10 +1177,17 @@ function RunController.start()
 			lastSentIntent = nil
 		end
 
+		local enteredCountdown = phase == RunPhase.Countdown
+			and (runChanged or previousPhase ~= RunPhase.Countdown)
+		if enteredCountdown then
+			tutorialDismissed = true
+		end
+
 		currentPhase = phase
 		updateJumpBlockForPhase(runId)
 		serverTuckQueued = if typeof(tuckQueued) == "boolean" then tuckQueued else false
 		serverTucking = if typeof(tucking) == "boolean" then tucking else false
+		serverReleaseAccepted = if typeof(releaseAccepted) == "boolean" then releaseAccepted else false
 		currentOutcome = if phase ~= RunPhase.Idle
 			and typeof(outcome) == "string"
 			and outcome == MISSED_LAUNCH_OUTCOME
@@ -886,8 +1195,10 @@ function RunController.start()
 			else nil
 
 		updatePhaseFeedback()
-		if typeof(speed) == "number" then
-			hud.SpeedLabel.Text = string.format("Speed: %.0f studs/s", math.max(0, speed))
+		local presentationSpeed = 0
+		if typeof(speed) == "number" and speed == speed and math.abs(speed) < math.huge then
+			presentationSpeed = math.max(0, speed)
+			hud.SpeedLabel.Text = string.format("%.0f", presentationSpeed)
 		end
 
 		if phase == RunPhase.Countdown and typeof(countdown) == "number" then
@@ -897,8 +1208,6 @@ function RunController.start()
 			hud.CountdownLabel.Visible = false
 		end
 
-		local enteredCountdown = phase == RunPhase.Countdown
-			and (runChanged or previousPhase ~= RunPhase.Countdown)
 		if enteredCountdown then
 			synchronizeHeldInputs()
 			sendTuckIntent(true)
@@ -911,7 +1220,57 @@ function RunController.start()
 			lastSentIntent = nil
 		end
 		updateTuckFeedback()
-	end)
+
+		AudioController.presentRunState(
+			currentPhase,
+			countdown,
+			presentationSpeed,
+			runId,
+			serverTuckQueued,
+			serverTucking,
+			currentOutcome,
+			serverReleaseAccepted
+		)
+		VFXController.presentRunState(
+			currentPhase,
+			countdown,
+			presentationSpeed,
+			runId,
+			serverTuckQueued,
+			serverTucking,
+			currentOutcome,
+			serverReleaseAccepted
+		)
+	end))
+
+	local controllerCleanupStarted = false
+	local function cleanupController()
+		if controllerCleanupStarted then
+			return
+		end
+		controllerCleanupStarted = true
+		tuckBadgePulseGeneration += 1
+		if touchLayoutCleanup then
+			touchLayoutCleanup()
+			touchLayoutCleanup = nil
+		end
+		for _, connection in runControllerConnections do
+			connection:Disconnect()
+		end
+		table.clear(runControllerConnections)
+		pcall(function()
+			ContextActionService:UnbindAction(ACTION_NAME)
+		end)
+		destroyJumpBlocker()
+	end
+
+	table.insert(runControllerConnections, hud.ScreenGui.Destroying:Connect(cleanupController))
+	table.insert(runControllerConnections, script.Destroying:Connect(function()
+		cleanupController()
+		if hud.ScreenGui.Parent then
+			hud.ScreenGui:Destroy()
+		end
+	end))
 
 	print("[Frostline] RunController ready")
 end

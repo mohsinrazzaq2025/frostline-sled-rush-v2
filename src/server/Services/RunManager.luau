@@ -40,6 +40,12 @@ local STALL_RECOVERY_RESULT_DELAY = 0.5
 local STALL_REJECTION_LOG_INTERVAL = 3
 local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
 local MISSED_LAUNCH_OUTCOME = "missed-launch"
+local RAMP_EXIT_ROLL_WRITE_EPSILON = 1e-4
+local RAMP_EXIT_INVARIANT_EPSILON = 1e-5
+local LANDING_CONTACT_LOG_PREFIX = "[Frostline][LandingContact]"
+local LANDING_CONTACT_SOURCE = "SledRoot.Touched"
+local LANDING_CONTACT_CONDITION =
+	"activeExact&&!CleanupStarted&&otherPart:IsDescendantOf(references.LandingSurfaces)&&phase==Airborne&&SledRoot.Parent~=nil&&transitionTo(Landed)==true"
 
 type Phase = RunPhase.Name
 type Sled = SledFactory.Sled
@@ -48,6 +54,68 @@ type RunOutcome = "missed-launch"
 type ResultAction = ResultTypes.Action
 type ResultOutcome = ResultTypes.Outcome
 type ResultPayload = ResultTypes.Payload
+
+type LandingContactMotionSnapshot = {
+	CapturedAt: number,
+	RunId: number,
+	Phase: Phase,
+	Position: Vector3,
+	CFrame: CFrame,
+	LinearVelocity: Vector3,
+	HorizontalSpeed: number,
+	VerticalSpeed: number,
+	AngularVelocity: Vector3,
+	BodyRightRate: number,
+	BodyUpRate: number,
+	LongitudinalRollRate: number,
+	UprightDot: number,
+	LookUpDot: number,
+	RightUpDot: number,
+	AssemblyCenterOfMass: Vector3?,
+	OwnerLabel: string,
+	AutomaticOwnershipLabel: string,
+	OwnerIsServer: boolean?,
+	SeatOccupantLabel: string,
+	SeatOccupantPresent: boolean,
+	SeatOccupantValid: boolean,
+	ExpectedPlayerSeated: boolean,
+	TuckActive: boolean,
+	AntiStallActive: boolean,
+	StabilizationActive: boolean,
+	SledValid: boolean,
+	ActiveSessionExact: boolean,
+	CleanupStarted: boolean,
+}
+
+type LandingContactTriggerSnapshot = {
+	CapturedAt: number,
+	RunId: number,
+	Phase: Phase,
+	DetectorSource: string,
+	AcceptedCondition: string,
+	HitName: string,
+	HitPath: string,
+	HitClass: string,
+	HitMaterial: string,
+	HitPosition: Vector3,
+	HitSize: Vector3,
+	HitTopSurfaceY: number,
+	HitCanCollide: boolean,
+	HitCanTouch: boolean,
+	HitCanQuery: boolean,
+	HitCollisionGroup: string,
+	RootPosition: Vector3,
+	RootBottomY: number,
+	OwnerLabel: string,
+	AutomaticOwnershipLabel: string,
+	OwnerIsServer: boolean?,
+	SeatOccupantLabel: string,
+	SeatOccupantPresent: boolean,
+	SeatOccupantValid: boolean,
+	ExpectedPlayerSeated: boolean,
+	SledValid: boolean,
+	ActiveSessionExact: boolean,
+}
 
 type WorldReferences = {
 	ActiveSleds: Folder,
@@ -99,6 +167,11 @@ type Session = {
 	StallRecoveryUsed: boolean,
 	LastStallRejectionAt: number,
 	EnteredAirborne: boolean,
+	rampExitRollGuardConsumed: boolean,
+	rampExitRollGuardApplied: boolean,
+	rampExitRollGuardSkipReason: string?,
+	LastAirborneContactSnapshot: LandingContactMotionSnapshot?,
+	LandingContactDiagnosticsConsumed: boolean?,
 	TouchedFrozenLake: boolean,
 	SeatSeparatedAfterAirborne: boolean,
 	MissedLaunchConfirmed: boolean,
@@ -135,15 +208,61 @@ type PendingReplay = {
 	RunId: number,
 }
 
+type NetworkOwnershipSnapshot = {
+	OwnerLabel: string,
+	AutomaticLabel: string,
+	OwnerIsServer: boolean?,
+	OwnerReadFailure: string?,
+}
+
+type RampExitGuardResult = {
+	Applied: boolean,
+	SkipReason: string?,
+	InvariantFailure: string?,
+	RollRateBefore: number?,
+	RollRateAfter: number?,
+	CorrectionMagnitude: number?,
+	PitchRateBefore: number?,
+	PitchRateAfter: number?,
+	PitchCorrection: number?,
+	PitchGuardApplied: boolean,
+	LinearVelocityBefore: Vector3?,
+	LinearVelocityAfter: Vector3?,
+	BodyRightRateBefore: number?,
+	BodyRightRateAfter: number?,
+	BodyUpRateBefore: number?,
+	BodyUpRateAfter: number?,
+	OwnerBefore: string?,
+	OwnerAfter: string?,
+	AutomaticBefore: string?,
+	AutomaticAfter: string?,
+}
+
 local RunManager = {}
 
 local sessions: { [Player]: Session } = {}
 local started = false
 local stateRemote: RemoteEvent? = nil
 local resultRemote: RemoteEvent? = nil
+local startPrompt: ProximityPrompt? = nil
 local trustedReplay: ((Player) -> ())? = nil
 local pendingReplays: { [Player]: PendingReplay } = {}
 local latestRunId = 0
+
+local function refreshStartPrompt()
+	local prompt = startPrompt
+	if not prompt or not prompt.Parent then
+		return
+	end
+	prompt.Enabled = next(sessions) == nil
+end
+
+local function disableStartPrompt()
+	local prompt = startPrompt
+	if prompt and prompt.Parent then
+		prompt.Enabled = false
+	end
+end
 
 local function isTransitionAllowed(currentPhase: Phase, nextPhase: Phase): boolean
 	if currentPhase == RunPhase.Idle then
@@ -194,8 +313,757 @@ local function lifecycleLog(session: Session, event: string, detail: string)
 	)
 end
 
+local function isFiniteNumber(value: number): boolean
+	return value == value and value > -math.huge and value < math.huge
+end
+
 local function isFinitePositiveNumber(value: number): boolean
-	return value == value and value > 0 and value < math.huge
+	return isFiniteNumber(value) and value > 0
+end
+
+local function isFiniteVector3(value: Vector3): boolean
+	return isFiniteNumber(value.X) and isFiniteNumber(value.Y) and isFiniteNumber(value.Z)
+end
+
+local function isFiniteCFrame(value: CFrame): boolean
+	local components = { value:GetComponents() }
+	for _, component in components do
+		if not isFiniteNumber(component) then
+			return false
+		end
+	end
+	return true
+end
+
+local function captureNetworkOwnership(root: BasePart): NetworkOwnershipSnapshot
+	local owner: Player? = nil
+	local ownerReadSucceeded, ownerReadError = pcall(function()
+		owner = root:GetNetworkOwner()
+	end)
+	local automatic: boolean? = nil
+	local automaticReadSucceeded = pcall(function()
+		automatic = root:GetNetworkOwnershipAuto()
+	end)
+
+	return {
+		OwnerLabel = if not ownerReadSucceeded
+			then "Unavailable"
+			elseif owner == nil
+			then "Server"
+			else (owner :: Player).Name,
+		AutomaticLabel = if not automaticReadSucceeded
+			then "unavailable"
+			elseif automatic == true
+			then "automatic"
+			else "manual",
+		OwnerIsServer = if ownerReadSucceeded then owner == nil else nil,
+		OwnerReadFailure = if ownerReadSucceeded then nil else tostring(ownerReadError),
+	}
+end
+
+local function formatDiagnosticNumber(value: number?): string
+	if value == nil then
+		return "unavailable"
+	end
+	return if isFiniteNumber(value) then string.format("%.5f", value) else tostring(value)
+end
+
+local function formatDiagnosticBoolean(value: boolean?): string
+	return if value == nil then "unavailable" else tostring(value)
+end
+
+local function formatDiagnosticVector(value: Vector3?): string
+	if value == nil then
+		return "unavailable"
+	end
+	return string.format(
+		"(%s,%s,%s)",
+		formatDiagnosticNumber(value.X),
+		formatDiagnosticNumber(value.Y),
+		formatDiagnosticNumber(value.Z)
+	)
+end
+
+local function getDiagnosticFullName(instance: Instance): string
+	local fullName = instance.Name
+	pcall(function()
+		fullName = instance:GetFullName()
+	end)
+	return fullName
+end
+
+local function getWorldVerticalHalfExtent(cframe: CFrame, size: Vector3): number
+	local halfSize = size * 0.5
+	return math.abs(cframe.RightVector.Y) * halfSize.X
+		+ math.abs(cframe.UpVector.Y) * halfSize.Y
+		+ math.abs(cframe.LookVector.Y) * halfSize.Z
+end
+
+local function captureSeatOccupantState(session: Session): (string, boolean, boolean, boolean)
+	local occupant = session.Sled.DriverSeat.Occupant
+	if occupant == nil then
+		return "none", false, false, false
+	end
+
+	local occupantValid = occupant.Parent ~= nil and occupant:IsDescendantOf(Workspace)
+	local expectedPlayerSeated = occupantValid
+		and occupant == session.Humanoid
+		and session.Player.Character == session.Character
+		and session.Character.Parent ~= nil
+		and session.Humanoid.Parent == session.Character
+	return getDiagnosticFullName(occupant), true, occupantValid, expectedPlayerSeated
+end
+
+local function captureLandingContactMotionSnapshot(
+	session: Session,
+	runId: number,
+	timestamp: number
+): LandingContactMotionSnapshot
+	local root = session.Sled.Root
+	local model = session.Sled.Model
+	local capturedCFrame = root.CFrame
+	local linearVelocity = root.AssemblyLinearVelocity
+	local angularVelocity = root.AssemblyAngularVelocity
+	local ownership = captureNetworkOwnership(root)
+	local occupantLabel, occupantPresent, occupantValid, expectedPlayerSeated = captureSeatOccupantState(session)
+	local assemblyCenterOfMass: Vector3? = nil
+	pcall(function()
+		assemblyCenterOfMass = root.AssemblyCenterOfMass
+	end)
+
+	return {
+		CapturedAt = timestamp,
+		RunId = runId,
+		Phase = session.Phase,
+		Position = capturedCFrame.Position,
+		CFrame = capturedCFrame,
+		LinearVelocity = linearVelocity,
+		HorizontalSpeed = Vector3.new(linearVelocity.X, 0, linearVelocity.Z).Magnitude,
+		VerticalSpeed = linearVelocity.Y,
+		AngularVelocity = angularVelocity,
+		BodyRightRate = angularVelocity:Dot(capturedCFrame.RightVector),
+		BodyUpRate = angularVelocity:Dot(capturedCFrame.UpVector),
+		LongitudinalRollRate = angularVelocity:Dot(capturedCFrame.LookVector),
+		UprightDot = capturedCFrame.UpVector:Dot(Vector3.yAxis),
+		LookUpDot = capturedCFrame.LookVector:Dot(Vector3.yAxis),
+		RightUpDot = capturedCFrame.RightVector:Dot(Vector3.yAxis),
+		AssemblyCenterOfMass = assemblyCenterOfMass,
+		OwnerLabel = ownership.OwnerLabel,
+		AutomaticOwnershipLabel = ownership.AutomaticLabel,
+		OwnerIsServer = ownership.OwnerIsServer,
+		SeatOccupantLabel = occupantLabel,
+		SeatOccupantPresent = occupantPresent,
+		SeatOccupantValid = occupantValid,
+		ExpectedPlayerSeated = expectedPlayerSeated,
+		TuckActive = session.Tucking,
+		AntiStallActive = session.AntiStallActive,
+		StabilizationActive = session.StabilityTorque.Parent ~= nil and session.StabilityTorque.Enabled,
+		SledValid = root.Parent == model
+			and model:IsDescendantOf(Workspace)
+			and session.Sled.DriverSeat.Parent == model,
+		ActiveSessionExact = isSameSession(session, runId),
+		CleanupStarted = session.CleanupStarted,
+	}
+end
+
+local function safelyCaptureLandingContactMotionSnapshot(
+	session: Session,
+	runId: number,
+	timestamp: number
+): (LandingContactMotionSnapshot?, string?)
+	local snapshot: LandingContactMotionSnapshot? = nil
+	local succeeded, captureError = pcall(function()
+		snapshot = captureLandingContactMotionSnapshot(session, runId, timestamp)
+	end)
+	if not succeeded then
+		return nil, tostring(captureError)
+	end
+	return snapshot, nil
+end
+
+local function captureLandingContactTriggerSnapshot(
+	session: Session,
+	runId: number,
+	hitPart: BasePart,
+	timestamp: number,
+	detectorSource: string,
+	acceptedCondition: string
+): LandingContactTriggerSnapshot
+	local root = session.Sled.Root
+	local rootCFrame = root.CFrame
+	local rootSize = root.Size
+	local hitCFrame = hitPart.CFrame
+	local hitSize = hitPart.Size
+	local ownership = captureNetworkOwnership(root)
+	local occupantLabel, occupantPresent, occupantValid, expectedPlayerSeated = captureSeatOccupantState(session)
+
+	return {
+		CapturedAt = timestamp,
+		RunId = runId,
+		Phase = session.Phase,
+		DetectorSource = detectorSource,
+		AcceptedCondition = acceptedCondition,
+		HitName = hitPart.Name,
+		HitPath = getDiagnosticFullName(hitPart),
+		HitClass = hitPart.ClassName,
+		HitMaterial = hitPart.Material.Name,
+		HitPosition = hitCFrame.Position,
+		HitSize = hitSize,
+		HitTopSurfaceY = hitCFrame.Position.Y + getWorldVerticalHalfExtent(hitCFrame, hitSize),
+		HitCanCollide = hitPart.CanCollide,
+		HitCanTouch = hitPart.CanTouch,
+		HitCanQuery = hitPart.CanQuery,
+		HitCollisionGroup = hitPart.CollisionGroup,
+		RootPosition = rootCFrame.Position,
+		RootBottomY = rootCFrame.Position.Y - getWorldVerticalHalfExtent(rootCFrame, rootSize),
+		OwnerLabel = ownership.OwnerLabel,
+		AutomaticOwnershipLabel = ownership.AutomaticLabel,
+		OwnerIsServer = ownership.OwnerIsServer,
+		SeatOccupantLabel = occupantLabel,
+		SeatOccupantPresent = occupantPresent,
+		SeatOccupantValid = occupantValid,
+		ExpectedPlayerSeated = expectedPlayerSeated,
+		SledValid = root.Parent == session.Sled.Model
+			and session.Sled.Model:IsDescendantOf(Workspace)
+			and session.Sled.DriverSeat.Parent == session.Sled.Model,
+		ActiveSessionExact = isSameSession(session, runId),
+	}
+end
+
+local function safelyCaptureLandingContactTriggerSnapshot(
+	session: Session,
+	runId: number,
+	hitPart: BasePart,
+	timestamp: number,
+	detectorSource: string,
+	acceptedCondition: string
+): (LandingContactTriggerSnapshot?, string?)
+	local snapshot: LandingContactTriggerSnapshot? = nil
+	local succeeded, captureError = pcall(function()
+		snapshot = captureLandingContactTriggerSnapshot(
+			session,
+			runId,
+			hitPart,
+			timestamp,
+			detectorSource,
+			acceptedCondition
+		)
+	end)
+	if not succeeded then
+		return nil, tostring(captureError)
+	end
+	return snapshot, nil
+end
+
+local function formatLandingContactMotionRecord(
+	session: Session,
+	runId: number,
+	stage: string,
+	snapshot: LandingContactMotionSnapshot,
+	snapshotAge: number
+): string
+	local fields: { string } = {
+		LANDING_CONTACT_LOG_PREFIX,
+		"player=" .. session.Player.Name,
+		string.format("RunId=%d", runId),
+		string.format("capturedRunId=%d", snapshot.RunId),
+		"phase=" .. snapshot.Phase,
+		"stage=" .. stage,
+		"activeExact=" .. tostring(isSameSession(session, runId)),
+		"capturedActiveExact=" .. tostring(snapshot.ActiveSessionExact),
+		"owner=" .. snapshot.OwnerLabel,
+		"ownership=" .. snapshot.AutomaticOwnershipLabel,
+		"serverOwned=" .. formatDiagnosticBoolean(snapshot.OwnerIsServer),
+		"timestamp=" .. formatDiagnosticNumber(snapshot.CapturedAt),
+		"snapshotAge=" .. formatDiagnosticNumber(snapshotAge),
+		"position=" .. formatDiagnosticVector(snapshot.Position),
+		"orientationRight=" .. formatDiagnosticVector(snapshot.CFrame.RightVector),
+		"orientationUp=" .. formatDiagnosticVector(snapshot.CFrame.UpVector),
+		"orientationLook=" .. formatDiagnosticVector(snapshot.CFrame.LookVector),
+		"linear=" .. formatDiagnosticVector(snapshot.LinearVelocity),
+		"horizontalSpeed=" .. formatDiagnosticNumber(snapshot.HorizontalSpeed),
+		"verticalSpeed=" .. formatDiagnosticNumber(snapshot.VerticalSpeed),
+		"angularWorld=" .. formatDiagnosticVector(snapshot.AngularVelocity),
+		"bodyRightRate=" .. formatDiagnosticNumber(snapshot.BodyRightRate),
+		"bodyUpRate=" .. formatDiagnosticNumber(snapshot.BodyUpRate),
+		"longitudinalRollRate=" .. formatDiagnosticNumber(snapshot.LongitudinalRollRate),
+		"uprightDot=" .. formatDiagnosticNumber(snapshot.UprightDot),
+		"lookUpDot=" .. formatDiagnosticNumber(snapshot.LookUpDot),
+		"rightUpDot=" .. formatDiagnosticNumber(snapshot.RightUpDot),
+		"assemblyCenterOfMass=" .. formatDiagnosticVector(snapshot.AssemblyCenterOfMass),
+		"seatOccupant=" .. snapshot.SeatOccupantLabel,
+		"seatOccupantPresent=" .. tostring(snapshot.SeatOccupantPresent),
+		"seatOccupantValid=" .. tostring(snapshot.SeatOccupantValid),
+		"expectedPlayerSeated=" .. tostring(snapshot.ExpectedPlayerSeated),
+		"tuck=" .. tostring(snapshot.TuckActive),
+		"antiStall=" .. tostring(snapshot.AntiStallActive),
+		"stabilization=" .. tostring(snapshot.StabilizationActive),
+		"sledValid=" .. tostring(snapshot.SledValid),
+		"cleanupStarted=" .. tostring(snapshot.CleanupStarted),
+	}
+	return table.concat(fields, " ")
+end
+
+local function formatMissingLastAirborneRecord(
+	session: Session,
+	runId: number,
+	triggerSnapshot: LandingContactTriggerSnapshot?
+): string
+	local ownerLabel = if triggerSnapshot then triggerSnapshot.OwnerLabel else "unavailable"
+	local ownershipLabel = if triggerSnapshot then triggerSnapshot.AutomaticOwnershipLabel else "unavailable"
+	local serverOwned = if triggerSnapshot then formatDiagnosticBoolean(triggerSnapshot.OwnerIsServer) else "unavailable"
+	local phase = if triggerSnapshot then triggerSnapshot.Phase else session.Phase
+	return table.concat({
+		LANDING_CONTACT_LOG_PREFIX,
+		"player=" .. session.Player.Name,
+		string.format("RunId=%d", runId),
+		"phase=" .. phase,
+		"stage=last-airborne-pre-contact",
+		"activeExact=" .. tostring(isSameSession(session, runId)),
+		"capturedActiveExact=unavailable",
+		"owner=" .. ownerLabel,
+		"ownership=" .. ownershipLabel,
+		"serverOwned=" .. serverOwned,
+		"ownerSample=touchdown-trigger-fallback",
+		"timestamp=unavailable",
+		"snapshotAge=unavailable",
+		"position=unavailable",
+		"orientationRight=unavailable",
+		"orientationUp=unavailable",
+		"orientationLook=unavailable",
+		"linear=unavailable",
+		"horizontalSpeed=unavailable",
+		"verticalSpeed=unavailable",
+		"angularWorld=unavailable",
+		"bodyRightRate=unavailable",
+		"bodyUpRate=unavailable",
+		"longitudinalRollRate=unavailable",
+		"uprightDot=unavailable",
+		"lookUpDot=unavailable",
+		"rightUpDot=unavailable",
+		"assemblyCenterOfMass=unavailable",
+		"seatOccupant=unavailable",
+		"seatOccupantPresent=unavailable",
+		"seatOccupantValid=unavailable",
+		"expectedPlayerSeated=unavailable",
+		"tuck=unavailable",
+		"antiStall=unavailable",
+		"stabilization=unavailable",
+		"sledValid=unavailable",
+		"cleanupStarted=" .. tostring(session.CleanupStarted),
+		"reason=no-authoritative-Airborne-update-before-touchdown",
+	}, " ")
+end
+
+local function formatLandingContactTriggerRecord(
+	session: Session,
+	runId: number,
+	snapshot: LandingContactTriggerSnapshot
+): string
+	local fields: { string } = {
+		LANDING_CONTACT_LOG_PREFIX,
+		"player=" .. session.Player.Name,
+		string.format("RunId=%d", runId),
+		string.format("capturedRunId=%d", snapshot.RunId),
+		"phase=" .. snapshot.Phase,
+		"stage=touchdown-trigger",
+		"activeExact=" .. tostring(isSameSession(session, runId)),
+		"capturedActiveExact=" .. tostring(snapshot.ActiveSessionExact),
+		"owner=" .. snapshot.OwnerLabel,
+		"ownership=" .. snapshot.AutomaticOwnershipLabel,
+		"serverOwned=" .. formatDiagnosticBoolean(snapshot.OwnerIsServer),
+		"timestamp=" .. formatDiagnosticNumber(snapshot.CapturedAt),
+		"source=" .. snapshot.DetectorSource,
+		"condition=" .. snapshot.AcceptedCondition,
+		"hitUnique=true",
+		"hitName=" .. snapshot.HitName,
+		"hitPath=" .. snapshot.HitPath,
+		"hitClass=" .. snapshot.HitClass,
+		"hitMaterial=" .. snapshot.HitMaterial,
+		"hitPosition=" .. formatDiagnosticVector(snapshot.HitPosition),
+		"hitSize=" .. formatDiagnosticVector(snapshot.HitSize),
+		"hitTopSurfaceY=" .. formatDiagnosticNumber(snapshot.HitTopSurfaceY),
+		"hitCanCollide=" .. tostring(snapshot.HitCanCollide),
+		"hitCanTouch=" .. tostring(snapshot.HitCanTouch),
+		"hitCanQuery=" .. tostring(snapshot.HitCanQuery),
+		"hitCollisionGroup=" .. snapshot.HitCollisionGroup,
+		"raycastResultAvailable=false",
+		"raycastHitPosition=unavailable",
+		"raycastNormal=unavailable",
+		"raycastDistance=unavailable",
+		"rootBottomY=" .. formatDiagnosticNumber(snapshot.RootBottomY),
+		"rootPosition=" .. formatDiagnosticVector(snapshot.RootPosition),
+		"seatOccupant=" .. snapshot.SeatOccupantLabel,
+		"seatOccupantPresent=" .. tostring(snapshot.SeatOccupantPresent),
+		"seatOccupantValid=" .. tostring(snapshot.SeatOccupantValid),
+		"expectedPlayerSeated=" .. tostring(snapshot.ExpectedPlayerSeated),
+		"sledValid=" .. tostring(snapshot.SledValid),
+		"detectorLimitation=SledRoot.Touched-provides-no-contact-position-normal-or-distance",
+	}
+	return table.concat(fields, " ")
+end
+
+local function emitLandingContactRecord(
+	session: Session,
+	runId: number,
+	stage: string,
+	buildRecord: () -> string
+)
+	local succeeded, recordOrError = pcall(buildRecord)
+	if succeeded then
+		print(recordOrError)
+		return
+	end
+
+	warn(
+		string.format(
+			"%s player=%s RunId=%d phase=%s stage=%s activeExact=%s owner=unavailable ownership=unavailable serverOwned=unavailable diagnosticError=%s",
+			LANDING_CONTACT_LOG_PREFIX,
+			session.Player.Name,
+			runId,
+			session.Phase,
+			stage,
+			tostring(isSameSession(session, runId)),
+			tostring(recordOrError)
+		)
+	)
+end
+
+local function retainLastAirborneContactSnapshot(session: Session, runId: number, timestamp: number)
+	if not RUN.LaunchStabilityDiagnosticsEnabled then
+		return
+	end
+	if not isSameSession(session, runId)
+		or session.CleanupStarted
+		or session.Phase ~= RunPhase.Airborne
+		or session.Sled.Root.Parent ~= session.Sled.Model
+	then
+		return
+	end
+
+	local snapshot = safelyCaptureLandingContactMotionSnapshot(session, runId, timestamp)
+	session.LastAirborneContactSnapshot = snapshot
+end
+
+local function emitLandingContactDiagnostics(
+	session: Session,
+	runId: number,
+	touchdownAt: number,
+	triggerSnapshot: LandingContactTriggerSnapshot?,
+	triggerCaptureError: string?
+)
+	if not RUN.LaunchStabilityDiagnosticsEnabled then
+		return
+	end
+	if session.LandingContactDiagnosticsConsumed == true then
+		return
+	end
+
+	-- Consume before capture, formatting, or output so this diagnostic path is
+	-- bounded to three records even if an individual record cannot be formatted.
+	session.LandingContactDiagnosticsConsumed = true
+	local lastAirborneSnapshot = session.LastAirborneContactSnapshot
+	session.LastAirborneContactSnapshot = nil
+
+	emitLandingContactRecord(session, runId, "last-airborne-pre-contact", function(): string
+		if lastAirborneSnapshot and lastAirborneSnapshot.RunId == runId then
+			return formatLandingContactMotionRecord(
+				session,
+				runId,
+				"last-airborne-pre-contact",
+				lastAirborneSnapshot,
+				math.max(0, touchdownAt - lastAirborneSnapshot.CapturedAt)
+			)
+		end
+		return formatMissingLastAirborneRecord(session, runId, triggerSnapshot)
+	end)
+
+	emitLandingContactRecord(session, runId, "touchdown-trigger", function(): string
+		if triggerSnapshot then
+			return formatLandingContactTriggerRecord(session, runId, triggerSnapshot)
+		end
+		error("trigger capture failed: " .. (triggerCaptureError or "unknown"))
+	end)
+
+	local postStateSnapshot, postCaptureError = safelyCaptureLandingContactMotionSnapshot(session, runId, os.clock())
+	emitLandingContactRecord(session, runId, "touchdown-post-state", function(): string
+		if postStateSnapshot then
+			return formatLandingContactMotionRecord(
+				session,
+				runId,
+				"touchdown-post-state",
+				postStateSnapshot,
+				0
+			)
+		end
+		error("post-state capture failed: " .. (postCaptureError or "unknown"))
+	end)
+end
+
+local function logLaunchStabilitySnapshot(
+	session: Session,
+	stage: string,
+	guardResult: RampExitGuardResult?,
+	asWarning: boolean
+): boolean
+	if not RUN.LaunchStabilityDiagnosticsEnabled then
+		return false
+	end
+
+	local succeeded, message = pcall(function(): string
+		local root = session.Sled.Root
+		if root.Parent ~= session.Sled.Model then
+			return string.format(
+				"[Frostline][LaunchStability] player=%s RunId=%d phase=%s stage=%s root=unavailable guardConsumed=%s guardApplied=%s rollLimit=%s skipReason=%s",
+				session.Player.Name,
+				session.RunId,
+				session.Phase,
+				stage,
+				tostring(session.rampExitRollGuardConsumed),
+				tostring(session.rampExitRollGuardApplied),
+				formatDiagnosticNumber(RUN.RampExitMaxRollRateRadiansPerSecond),
+				session.rampExitRollGuardSkipReason or "root unavailable"
+			)
+		end
+
+		local capturedCFrame = root.CFrame
+		local linearVelocity = root.AssemblyLinearVelocity
+		local horizontalSpeed = Vector3.new(linearVelocity.X, 0, linearVelocity.Z).Magnitude
+		local angularVelocity = root.AssemblyAngularVelocity
+		local bodyRightRate = angularVelocity:Dot(capturedCFrame.RightVector)
+		local bodyUpRate = angularVelocity:Dot(capturedCFrame.UpVector)
+		local longitudinalRollRate = angularVelocity:Dot(capturedCFrame.LookVector)
+		local ownership = captureNetworkOwnership(root)
+		local stabilizing = session.StabilityTorque.Parent ~= nil and session.StabilityTorque.Enabled
+		local line = string.format(
+			"[Frostline][LaunchStability] player=%s RunId=%d phase=%s stage=%s owner=%s ownership=%s position=%s mass=%s linear=%s horizontalSpeed=%s angularWorld=%s bodyRightRate=%s bodyUpRate=%s longitudinalRollRate=%s uprightDot=%s tuck=%s antiStall=%s stabilization=%s guardConsumed=%s guardApplied=%s rollLimit=%s skipReason=%s",
+			session.Player.Name,
+			session.RunId,
+			session.Phase,
+			stage,
+			ownership.OwnerLabel,
+			ownership.AutomaticLabel,
+			formatDiagnosticVector(capturedCFrame.Position),
+			formatDiagnosticNumber(root.AssemblyMass),
+			formatDiagnosticVector(linearVelocity),
+			formatDiagnosticNumber(horizontalSpeed),
+			formatDiagnosticVector(angularVelocity),
+			formatDiagnosticNumber(bodyRightRate),
+			formatDiagnosticNumber(bodyUpRate),
+			formatDiagnosticNumber(longitudinalRollRate),
+			formatDiagnosticNumber(capturedCFrame.UpVector:Dot(Vector3.yAxis)),
+			tostring(session.Tucking),
+			tostring(session.AntiStallActive),
+			tostring(stabilizing),
+			tostring(session.rampExitRollGuardConsumed),
+			tostring(session.rampExitRollGuardApplied),
+			formatDiagnosticNumber(RUN.RampExitMaxRollRateRadiansPerSecond),
+			session.rampExitRollGuardSkipReason or "none"
+		)
+
+		if guardResult then
+			line ..= string.format(
+				" rollBefore=%s rollAfter=%s correctionMagnitude=%s pitchBefore=%s pitchAfter=%s pitchCorrection=%s pitchGuardApplied=%s linearBefore=%s linearAfter=%s bodyRightBefore=%s bodyRightAfter=%s bodyUpBefore=%s bodyUpAfter=%s ownerBefore=%s ownerAfter=%s ownershipBefore=%s ownershipAfter=%s invariantFailure=%s",
+				formatDiagnosticNumber(guardResult.RollRateBefore),
+				formatDiagnosticNumber(guardResult.RollRateAfter),
+				formatDiagnosticNumber(guardResult.CorrectionMagnitude),
+				formatDiagnosticNumber(guardResult.PitchRateBefore),
+				formatDiagnosticNumber(guardResult.PitchRateAfter),
+				formatDiagnosticNumber(guardResult.PitchCorrection),
+				tostring(guardResult.PitchGuardApplied),
+				formatDiagnosticVector(guardResult.LinearVelocityBefore),
+				formatDiagnosticVector(guardResult.LinearVelocityAfter),
+				formatDiagnosticNumber(guardResult.BodyRightRateBefore),
+				formatDiagnosticNumber(guardResult.BodyRightRateAfter),
+				formatDiagnosticNumber(guardResult.BodyUpRateBefore),
+				formatDiagnosticNumber(guardResult.BodyUpRateAfter),
+				guardResult.OwnerBefore or "unavailable",
+				guardResult.OwnerAfter or "unavailable",
+				guardResult.AutomaticBefore or "unavailable",
+				guardResult.AutomaticAfter or "unavailable",
+				guardResult.InvariantFailure or "none"
+			)
+		end
+		return line
+	end)
+
+	if succeeded then
+		if asWarning then
+			warn(message)
+		else
+			print(message)
+		end
+	else
+		warn(
+			string.format(
+				"[Frostline][LaunchStability] player=%s RunId=%d phase=%s stage=%s snapshot failed reason=%s",
+				session.Player.Name,
+				session.RunId,
+				session.Phase,
+				stage,
+				tostring(message)
+			)
+		)
+	end
+	return true
+end
+
+local function applyRampExitRollGuard(session: Session, runId: number): RampExitGuardResult
+	local result: RampExitGuardResult = {
+		Applied = false,
+		SkipReason = nil,
+		InvariantFailure = nil,
+		RollRateBefore = nil,
+		RollRateAfter = nil,
+		CorrectionMagnitude = nil,
+		PitchRateBefore = nil,
+		PitchRateAfter = nil,
+		PitchCorrection = nil,
+		PitchGuardApplied = false,
+		LinearVelocityBefore = nil,
+		LinearVelocityAfter = nil,
+		BodyRightRateBefore = nil,
+		BodyRightRateAfter = nil,
+		BodyUpRateBefore = nil,
+		BodyUpRateAfter = nil,
+		OwnerBefore = nil,
+		OwnerAfter = nil,
+		AutomaticBefore = nil,
+		AutomaticAfter = nil,
+	}
+
+	local function skip(reason: string): RampExitGuardResult
+		result.SkipReason = reason
+		session.rampExitRollGuardSkipReason = reason
+		return result
+	end
+
+	if not isSameSession(session, runId) then
+		return skip("active session or RunId changed")
+	elseif session.CleanupStarted then
+		return skip("cleanup already started")
+	elseif session.Phase ~= RunPhase.Airborne then
+		return skip("first Airborne transition was not accepted")
+	elseif session.EnteredAirborne then
+		return skip("Airborne transition was not the first")
+	elseif session.rampExitRollGuardConsumed then
+		return skip("guard already consumed")
+	end
+
+	local root = session.Sled.Root
+	local model = session.Sled.Model
+	if root.Parent ~= model or not model:IsDescendantOf(Workspace) then
+		return skip("SledRoot is not parented to the active sled")
+	elseif root.Anchored then
+		return skip("SledRoot is anchored")
+	end
+
+	local capturedCFrame = root.CFrame
+	local angularVelocityBefore = root.AssemblyAngularVelocity
+	local maximumRollRate = RUN.RampExitMaxRollRateRadiansPerSecond
+	local maximumPitchRate = RUN.RampExitMaxPitchRateRadiansPerSecond
+	if not isFiniteCFrame(capturedCFrame) then
+		return skip("SledRoot CFrame is not finite")
+	elseif not isFiniteVector3(angularVelocityBefore) then
+		return skip("AssemblyAngularVelocity is not finite")
+	elseif not isFinitePositiveNumber(maximumRollRate) then
+		return skip("configured roll limit is not finite and positive")
+	elseif not isFinitePositiveNumber(maximumPitchRate) then
+		return skip("configured pitch limit is not finite and positive")
+	end
+
+	local ownershipBefore = captureNetworkOwnership(root)
+	result.OwnerBefore = ownershipBefore.OwnerLabel
+	result.AutomaticBefore = ownershipBefore.AutomaticLabel
+	if ownershipBefore.OwnerReadFailure then
+		return skip("network owner unavailable: " .. ownershipBefore.OwnerReadFailure)
+	elseif ownershipBefore.OwnerIsServer ~= true then
+		return skip("network owner is " .. ownershipBefore.OwnerLabel)
+	end
+
+	-- Consumption happens before any correction calculation or write, so this
+	-- validated first-Airborne hook can never apply more than once per RunId.
+	session.rampExitRollGuardConsumed = true
+	local longitudinalAxis = capturedCFrame.LookVector.Unit
+	local bodyRightAxis = capturedCFrame.RightVector.Unit
+	local bodyUpAxis = capturedCFrame.UpVector.Unit
+	local linearVelocityBefore = root.AssemblyLinearVelocity
+	local rollRateBefore = angularVelocityBefore:Dot(longitudinalAxis)
+	local rollRateAfter = math.clamp(rollRateBefore, -maximumRollRate, maximumRollRate)
+	local rollCorrection = rollRateAfter - rollRateBefore
+	local pitchRateBefore = angularVelocityBefore:Dot(bodyRightAxis)
+	local pitchRateAfter = math.clamp(pitchRateBefore, -maximumPitchRate, maximumPitchRate)
+	local pitchCorrection = pitchRateAfter - pitchRateBefore
+	local applyRollCorrection = RUN.RampExitRollGuardEnabled
+		and math.abs(rollCorrection) > RAMP_EXIT_ROLL_WRITE_EPSILON
+	local applyPitchCorrection = RUN.RampExitPitchGuardEnabled
+		and math.abs(pitchCorrection) > RAMP_EXIT_ROLL_WRITE_EPSILON
+	local appliedRollCorrection = if applyRollCorrection then rollCorrection else 0
+	local appliedPitchCorrection = if applyPitchCorrection then pitchCorrection else 0
+	local combinedCorrection = longitudinalAxis * appliedRollCorrection
+		+ bodyRightAxis * appliedPitchCorrection
+
+	result.RollRateBefore = rollRateBefore
+	result.CorrectionMagnitude = math.abs(rollCorrection)
+	result.PitchRateBefore = pitchRateBefore
+	result.PitchCorrection = 0
+	result.LinearVelocityBefore = linearVelocityBefore
+	result.BodyRightRateBefore = angularVelocityBefore:Dot(bodyRightAxis)
+	result.BodyUpRateBefore = angularVelocityBefore:Dot(bodyUpAxis)
+
+	local angularVelocityAfter = angularVelocityBefore
+	if combinedCorrection.Magnitude > RAMP_EXIT_ROLL_WRITE_EPSILON then
+		local correctedAngularVelocity = angularVelocityBefore + combinedCorrection
+		local writeSucceeded, writeError = pcall(function()
+			root.AssemblyAngularVelocity = correctedAngularVelocity
+		end)
+		if not writeSucceeded then
+			return skip("AssemblyAngularVelocity correction failed: " .. tostring(writeError))
+		end
+		result.Applied = true
+		result.PitchCorrection = appliedPitchCorrection
+		result.PitchGuardApplied = applyPitchCorrection
+		session.rampExitRollGuardApplied = applyRollCorrection
+		angularVelocityAfter = correctedAngularVelocity
+	end
+
+	local linearVelocityAfter = root.AssemblyLinearVelocity
+	local ownershipAfter = captureNetworkOwnership(root)
+	result.RollRateAfter = angularVelocityAfter:Dot(longitudinalAxis)
+	result.PitchRateAfter = angularVelocityAfter:Dot(bodyRightAxis)
+	result.LinearVelocityAfter = linearVelocityAfter
+	result.BodyRightRateAfter = angularVelocityAfter:Dot(bodyRightAxis)
+	result.BodyUpRateAfter = angularVelocityAfter:Dot(bodyUpAxis)
+	result.OwnerAfter = ownershipAfter.OwnerLabel
+	result.AutomaticAfter = ownershipAfter.AutomaticLabel
+
+	if result.Applied then
+		local invariantFailures: { string } = {}
+		if (linearVelocityAfter - linearVelocityBefore).Magnitude > RAMP_EXIT_INVARIANT_EPSILON then
+			table.insert(invariantFailures, "linear velocity changed")
+		end
+		if math.abs(
+			(result.BodyRightRateAfter :: number)
+				- ((result.BodyRightRateBefore :: number) + appliedPitchCorrection)
+		)
+			> RAMP_EXIT_INVARIANT_EPSILON
+		then
+			table.insert(invariantFailures, "body-right angular rate did not match pitch correction")
+		end
+		if math.abs((result.BodyUpRateAfter :: number) - (result.BodyUpRateBefore :: number))
+			> RAMP_EXIT_INVARIANT_EPSILON
+		then
+			table.insert(invariantFailures, "body-up angular rate changed")
+		end
+		if ownershipAfter.OwnerIsServer ~= true then
+			table.insert(invariantFailures, "network ownership left the server")
+		end
+		if #invariantFailures > 0 then
+			result.InvariantFailure = table.concat(invariantFailures, ", ")
+		end
+	end
+
+	return result
 end
 
 local function sendState(session: Session)
@@ -217,13 +1085,18 @@ local function sendState(session: Session)
 		session.RunId,
 		session.TuckQueued,
 		session.Tucking,
-		session.Outcome
+		session.Outcome,
+		session.Phase == RunPhase.Descent
+			and not session.ReleaseInProgress
+			and session.TuckActivationReady
 	)
 end
 
-local function transitionTo(session: Session, nextPhase: Phase): boolean
+local function transitionTo(session: Session, nextPhase: Phase, deferStateDispatch: boolean?): boolean
 	if session.Phase == nextPhase then
-		sendState(session)
+		if not deferStateDispatch then
+			sendState(session)
+		end
 		return true
 	end
 
@@ -243,7 +1116,9 @@ local function transitionTo(session: Session, nextPhase: Phase): boolean
 	if nextPhase ~= RunPhase.Countdown then
 		session.CountdownValue = nil
 	end
-	sendState(session)
+	if not deferStateDispatch then
+		sendState(session)
+	end
 	return true
 end
 
@@ -1259,12 +2134,14 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		end
 		if sessions[player] ~= session or session.RunId ~= runId then
 			pendingReplays[player] = nil
+			refreshStartPrompt()
 			return
 		end
 
 		pendingReplays[player] = nil
 		if player.Parent ~= Players then
 			sessions[player] = nil
+			refreshStartPrompt()
 			return
 		end
 
@@ -1272,6 +2149,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		if not replay then
 			lifecycleLog(session, "replay-cancelled", "reason=trusted-replay-unavailable")
 			sessions[player] = nil
+			refreshStartPrompt()
 			return
 		end
 
@@ -1280,6 +2158,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		lifecycleLog(session, "replay-creation", "state=starting")
 		sessions[player] = nil
 		replay(player)
+		refreshStartPrompt()
 	end)
 end
 
@@ -1287,6 +2166,8 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 	if not isSameSession(session, runId) then
 		return
 	end
+	session.LastAirborneContactSnapshot = nil
+	session.LandingContactDiagnosticsConsumed = nil
 	if RESULT.LifecycleDiagnosticsEnabled then
 		lifecycleLog(session, "cleanup-started", string.format("reason=%s", reason))
 	end
@@ -1358,6 +2239,7 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 		if sessions[session.Player] == session then
 			sessions[session.Player] = nil
 		end
+		refreshStartPrompt()
 		return
 	end
 	local replayRequested = session.ReplayRequested and teleportVerified
@@ -1380,6 +2262,7 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 	elseif sessions[session.Player] == session then
 		sessions[session.Player] = nil
 	end
+	refreshStartPrompt()
 end
 
 local function formatTelemetryNumber(value: number?): string
@@ -1458,6 +2341,8 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 	-- This flag is deliberately first: changing Reset state, seating, or physics can fire callbacks.
 	session.CleanupStarted = true
 	session.FirstCleanupReason = reason
+	session.LastAirborneContactSnapshot = nil
+	session.LandingContactDiagnosticsConsumed = nil
 	if RESULT.LifecycleDiagnosticsEnabled then
 		print(string.format("[Frostline][Run] %s Cleanup requested firstReason=%s", runLabel(session), reason))
 		lifecycleLog(session, "cleanup-requested", string.format("reason=%s", reason))
@@ -1641,6 +2526,7 @@ local function finishLanding(session: Session, runId: number)
 		session.SeatSeparatedAfterAirborne = true
 	end
 	session.StopConfirmed = true
+	logLaunchStabilitySnapshot(session, "final-stop", nil, false)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 	root.Anchored = true
@@ -1723,6 +2609,7 @@ local function enterAirborne(session: Session, runId: number)
 	if not isSameSession(session, runId)
 		or session.CleanupStarted
 		or session.Phase ~= RunPhase.Descent
+		or session.EnteredAirborne
 		or not session.Sled.Root.Parent
 	then
 		return
@@ -1738,15 +2625,34 @@ local function enterAirborne(session: Session, runId: number)
 	clearTuckState(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
-	if transitionTo(session, RunPhase.Airborne) then
+	if transitionTo(session, RunPhase.Airborne, true) then
+		local guardResult = applyRampExitRollGuard(session, runId)
 		session.EnteredAirborne = true
+		local warningReason = guardResult.SkipReason or guardResult.InvariantFailure
+		local diagnosticReported = logLaunchStabilitySnapshot(
+			session,
+			"first-airborne",
+			guardResult,
+			warningReason ~= nil
+		)
+		if warningReason and not diagnosticReported then
+			warn(
+				string.format(
+					"[Frostline][LaunchStability] player=%s RunId=%d ramp-exit roll guard warning reason=%s",
+					session.Player.Name,
+					session.RunId,
+					warningReason
+				)
+			)
+		end
+		sendState(session)
 		if RESULT.LifecycleDiagnosticsEnabled then
 			print(string.format("[Frostline][Run] %s Airborne", runLabel(session)))
 		end
 	end
 end
 
-local function enterLanded(session: Session, runId: number)
+local function enterLanded(session: Session, runId: number, hitPart: BasePart)
 	if not isSameSession(session, runId)
 		or session.CleanupStarted
 		or session.Phase ~= RunPhase.Airborne
@@ -1755,10 +2661,35 @@ local function enterLanded(session: Session, runId: number)
 		return
 	end
 
+	local diagnosticsEnabled = RUN.LaunchStabilityDiagnosticsEnabled
+	local touchdownAt = 0
+	local triggerSnapshot: LandingContactTriggerSnapshot? = nil
+	local triggerCaptureError: string? = nil
+	if diagnosticsEnabled then
+		touchdownAt = os.clock()
+		triggerSnapshot, triggerCaptureError = safelyCaptureLandingContactTriggerSnapshot(
+			session,
+			runId,
+			hitPart,
+			touchdownAt,
+			LANDING_CONTACT_SOURCE,
+			LANDING_CONTACT_CONDITION
+		)
+	end
+
 	clearTuckState(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if transitionTo(session, RunPhase.Landed) then
+		if diagnosticsEnabled then
+			emitLandingContactDiagnostics(
+				session,
+				runId,
+				touchdownAt,
+				triggerSnapshot,
+				triggerCaptureError
+			)
+		end
 		session.TouchedFrozenLake = true
 		if session.Sled.DriverSeat.Occupant ~= session.Humanoid then
 			session.SeatSeparatedAfterAirborne = true
@@ -1772,6 +2703,7 @@ local function enterLanded(session: Session, runId: number)
 		session.TouchdownHorizontalSpeed = touchdownHorizontalSpeed
 		session.LandingSettledSince = nil
 		updateMaximumDistance(session)
+		logLaunchStabilitySnapshot(session, "first-touchdown", nil, false)
 		if RESULT.LifecycleDiagnosticsEnabled then
 			print(
 				string.format(
@@ -1812,6 +2744,9 @@ local function monitorSession(session: Session, runId: number)
 			updateRampFreedom(session, runId)
 			if session.Phase == RunPhase.Descent and root.Position.Z >= session.LaunchZ then
 				enterAirborne(session, runId)
+			end
+			if RUN.LaunchStabilityDiagnosticsEnabled then
+				retainLastAirborneContactSnapshot(session, runId, now)
 			end
 			updateAntiStall(session, runId)
 			updateGroundStability(session)
@@ -1874,7 +2809,7 @@ local function connectRunEvents(session: Session, references: WorldReferences, r
 					enterAirborne(session, runId)
 				end
 				if session.Phase == RunPhase.Airborne then
-					enterLanded(session, runId)
+					enterLanded(session, runId, otherPart)
 				end
 			end
 		end)
@@ -2029,6 +2964,7 @@ local function runCountdown(session: Session, runId: number)
 	end
 
 	local root = session.Sled.Root
+	logLaunchStabilitySnapshot(session, "pre-release", nil, false)
 	root.Anchored = false
 	local ownershipSucceeded, ownershipError = pcall(function()
 		root:SetNetworkOwner(nil)
@@ -2051,6 +2987,7 @@ local function runCountdown(session: Session, runId: number)
 	local releasePositionZ = root.Position.Z
 	session.DescentStartedAt = os.clock()
 	session.ReleasePositionZ = releasePositionZ
+	logLaunchStabilitySnapshot(session, "post-release", nil, false)
 	if RESULT.LifecycleDiagnosticsEnabled then
 		print(
 			string.format(
@@ -2180,6 +3117,7 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	if not trustedStart and (rootPart.Position - references.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
 		return
 	end
+	disableStartPrompt()
 
 	local triggerCenter = references.StartTrigger.Position
 	local sled = SledFactory.create(CFrame.lookAt(triggerCenter, triggerCenter + Vector3.zAxis))
@@ -2240,6 +3178,11 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 		StallRecoveryUsed = false,
 		LastStallRejectionAt = -math.huge,
 		EnteredAirborne = false,
+		rampExitRollGuardConsumed = false,
+		rampExitRollGuardApplied = false,
+		rampExitRollGuardSkipReason = nil,
+		LastAirborneContactSnapshot = nil,
+		LandingContactDiagnosticsConsumed = nil,
 		TouchedFrozenLake = false,
 		SeatSeparatedAfterAirborne = false,
 		MissedLaunchConfirmed = false,
@@ -2283,6 +3226,9 @@ end
 local function startRunSafely(player: Player, references: WorldReferences, trustedStart: boolean)
 	local ok, message = pcall(beginRun, player, references, trustedStart)
 	if ok then
+		if not sessions[player] then
+			refreshStartPrompt()
+		end
 		return
 	end
 
@@ -2301,6 +3247,7 @@ local function startRunSafely(player: Player, references: WorldReferences, trust
 		end
 	else
 		warn(string.format("[Frostline] Failed to create run for %s: %s", player.Name, tostring(message)))
+		refreshStartPrompt()
 	end
 end
 
@@ -2421,6 +3368,7 @@ local function configurePrompt(startTrigger: BasePart): ProximityPrompt
 	prompt.RequiresLineOfSight = false
 	prompt.HoldDuration = RUN.StartPromptHoldDuration
 	prompt.MaxActivationDistance = 14
+	prompt.Enabled = true
 	return prompt
 end
 
@@ -2531,6 +3479,7 @@ function RunManager.handlePlayerRemoving(player: Player)
 			end
 		end
 	end
+	refreshStartPrompt()
 	ResultService.removePlayer(player)
 end
 
@@ -2559,6 +3508,8 @@ function RunManager.start()
 	end
 
 	local prompt = configurePrompt(references.StartTrigger)
+	startPrompt = prompt
+	refreshStartPrompt()
 	prompt.Triggered:Connect(function(player: Player)
 		startRunSafely(player, references, false)
 	end)
