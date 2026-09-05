@@ -2,16 +2,22 @@
 
 export type PersistenceStatus = "Persistent" | "SessionOnly"
 
+export type OwnedSleds = { [string]: boolean }
+
 export type PlayerProgress = {
 	SchemaVersion: number,
 	FrostCoins: number,
 	BestDistance: number,
+	OwnedSleds: OwnedSleds,
+	EquippedSledId: string,
 }
 
 export type ProgressSnapshot = {
 	SchemaVersion: number,
 	FrostCoins: number,
 	BestDistance: number,
+	OwnedSleds: OwnedSleds,
+	EquippedSledId: string,
 	PersistenceStatus: PersistenceStatus,
 }
 

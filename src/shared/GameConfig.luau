@@ -1,5 +1,11 @@
 --!strict
 
+local knownSledIds: { [string]: boolean } = {
+	FrostlineClassic = true,
+	FrostRunner = true,
+}
+table.freeze(knownSledIds)
+
 local GameConfig = {
 	World = {
 		FolderName = "FrostlineWorld",
@@ -107,10 +113,12 @@ local GameConfig = {
 	},
 
 	PlayerData = {
-		SchemaVersion = 1,
+		SchemaVersion = 2,
 		ProductionStoreName = "Frostline_PlayerProgress_v1",
 		StudioStoreName = "Frostline_PlayerProgress_Studio_v1",
 		KeyPrefix = "Player_",
+		DefaultSledId = "FrostlineClassic",
+		KnownSledIds = knownSledIds,
 		AutosaveIntervalSeconds = 60,
 		SessionLeaseDurationSeconds = 180,
 		MaximumAttempts = 4,

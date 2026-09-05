@@ -11,9 +11,12 @@ local PlayerDataTypes = require(ReplicatedStorage.Shared.PlayerDataTypes)
 
 local DATA = GameConfig.PlayerData
 local PERSISTENCE = PlayerDataTypes.PersistenceStatuses
+local DEFAULT_SLED_ID = DATA.DefaultSledId
+local KNOWN_SLED_IDS = DATA.KnownSledIds
 local OPERATION_POLL_INTERVAL = 0.05
 
 type PersistenceStatus = PlayerDataTypes.PersistenceStatus
+type OwnedSleds = PlayerDataTypes.OwnedSleds
 type PlayerProgress = PlayerDataTypes.PlayerProgress
 type ProgressSnapshot = PlayerDataTypes.ProgressSnapshot
 type RewardUpdate = PlayerDataTypes.RewardUpdate
@@ -29,6 +32,8 @@ type StoredEnvelope = {
 	Data: {
 		FrostCoins: number,
 		BestDistance: number,
+		OwnedSleds: OwnedSleds,
+		EquippedSledId: string,
 	},
 	Session: StoredSession?,
 	UpdatedAt: number,
@@ -100,11 +105,55 @@ local function isNonNegativeInteger(value: any): boolean
 	return isFiniteNumber(value) and value >= 0 and value % 1 == 0
 end
 
+local function createDefaultOwnedSleds(): OwnedSleds
+	return {
+		[DEFAULT_SLED_ID] = true,
+	}
+end
+
+local function copyOwnedSleds(source: OwnedSleds): OwnedSleds
+	local copied: OwnedSleds = {}
+	for sledId in KNOWN_SLED_IDS do
+		if source[sledId] == true then
+			copied[sledId] = true
+		end
+	end
+	copied[DEFAULT_SLED_ID] = true
+	return copied
+end
+
+local function normalizeOwnedSleds(value: any): OwnedSleds
+	local normalized = createDefaultOwnedSleds()
+	if typeof(value) ~= "table" then
+		return normalized
+	end
+
+	for sledId in KNOWN_SLED_IDS do
+		if value[sledId] == true then
+			normalized[sledId] = true
+		end
+	end
+	normalized[DEFAULT_SLED_ID] = true
+	return normalized
+end
+
+local function normalizeEquippedSledId(value: any, ownedSleds: OwnedSleds): string
+	if typeof(value) == "string"
+		and KNOWN_SLED_IDS[value] == true
+		and ownedSleds[value] == true
+	then
+		return value
+	end
+	return DEFAULT_SLED_ID
+end
+
 local function createDefaultProgress(): PlayerProgress
 	return {
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = 0,
 		BestDistance = 0,
+		OwnedSleds = createDefaultOwnedSleds(),
+		EquippedSledId = DEFAULT_SLED_ID,
 	}
 end
 
@@ -113,6 +162,8 @@ local function copyProgress(progress: PlayerProgress): PlayerProgress
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = progress.FrostCoins,
 		BestDistance = progress.BestDistance,
+		OwnedSleds = copyOwnedSleds(progress.OwnedSleds),
+		EquippedSledId = progress.EquippedSledId,
 	}
 end
 
@@ -215,6 +266,12 @@ local function reconcileProfile(rawValue: any): (PlayerProgress?, StoredSession?
 	elseif not isFiniteNumber(bestDistance) or bestDistance < 0 then
 		return nil, nil, "stored Best Distance is invalid"
 	end
+	local ownedSleds = createDefaultOwnedSleds()
+	local equippedSledId = DEFAULT_SLED_ID
+	if schemaVersion == DATA.SchemaVersion then
+		ownedSleds = normalizeOwnedSleds(dataSource.OwnedSleds)
+		equippedSledId = normalizeEquippedSledId(dataSource.EquippedSledId, ownedSleds)
+	end
 
 	if rawValue.UpdatedAt ~= nil and not isNonNegativeInteger(rawValue.UpdatedAt) then
 		return nil, nil, "record timestamp is invalid"
@@ -228,6 +285,8 @@ local function reconcileProfile(rawValue: any): (PlayerProgress?, StoredSession?
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = frostCoins,
 		BestDistance = bestDistance,
+		OwnedSleds = ownedSleds,
+		EquippedSledId = equippedSledId,
 	}, storedSession, nil
 end
 
@@ -237,6 +296,8 @@ local function createEnvelope(progress: PlayerProgress, sessionId: string?, upda
 		Data = {
 			FrostCoins = progress.FrostCoins,
 			BestDistance = progress.BestDistance,
+			OwnedSleds = copyOwnedSleds(progress.OwnedSleds),
+			EquippedSledId = progress.EquippedSledId,
 		},
 		Session = nil,
 		UpdatedAt = updatedAt,
@@ -476,16 +537,36 @@ local function getPersistenceStatus(entry: ProfileSession): PersistenceStatus
 end
 
 local function createSnapshot(entry: ProfileSession): ProgressSnapshot
+	local ownedSleds = copyOwnedSleds(entry.Progress.OwnedSleds)
+	table.freeze(ownedSleds)
 	return table.freeze({
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = entry.Progress.FrostCoins,
 		BestDistance = entry.Progress.BestDistance,
+		OwnedSleds = ownedSleds,
+		EquippedSledId = entry.Progress.EquippedSledId,
 		PersistenceStatus = getPersistenceStatus(entry),
 	})
 end
 
+local function ownedSledsMatch(left: OwnedSleds, right: OwnedSleds): boolean
+	if left[DEFAULT_SLED_ID] ~= true or right[DEFAULT_SLED_ID] ~= true then
+		return false
+	end
+	for sledId in KNOWN_SLED_IDS do
+		if left[sledId] ~= right[sledId] then
+			return false
+		end
+	end
+	return true
+end
+
 local function profilesMatch(left: PlayerProgress, right: PlayerProgress): boolean
-	return left.FrostCoins == right.FrostCoins and left.BestDistance == right.BestDistance
+	return left.SchemaVersion == right.SchemaVersion
+		and left.FrostCoins == right.FrostCoins
+		and left.BestDistance == right.BestDistance
+		and ownedSledsMatch(left.OwnedSleds, right.OwnedSleds)
+		and left.EquippedSledId == right.EquippedSledId
 end
 
 local function saveWithRetries(
@@ -865,10 +946,14 @@ function PlayerDataService.applyRunReward(
 	entry.Revision += 1
 	entry.Dirty = true
 
+	local ownedSleds = copyOwnedSleds(entry.Progress.OwnedSleds)
+	table.freeze(ownedSleds)
 	return table.freeze({
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = entry.Progress.FrostCoins,
 		BestDistance = entry.Progress.BestDistance,
+		OwnedSleds = ownedSleds,
+		EquippedSledId = entry.Progress.EquippedSledId,
 		PersistenceStatus = getPersistenceStatus(entry),
 		IsNewBest = isNewBest,
 	}), nil
