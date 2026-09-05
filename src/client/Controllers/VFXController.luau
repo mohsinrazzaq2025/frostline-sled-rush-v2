@@ -4,6 +4,7 @@ local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
@@ -26,6 +27,14 @@ local NATIVE_PARTICLE_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds
 local SLED_RESOLVE_INTERVAL = 0.2
 local GROUND_CHECK_INTERVAL = 0.05
 local AMBIENT_UPDATE_INTERVAL = 1 / 15
+local RUNNER_GLOW_FILL_COLOR = Color3.fromRGB(55, 225, 255)
+local RUNNER_GLOW_OUTLINE_COLOR = Color3.fromRGB(215, 250, 255)
+local RUNNER_GLOW_ACTIVE_FILL_TRANSPARENCY = 0.22
+local RUNNER_GLOW_ACTIVE_OUTLINE_TRANSPARENCY = 0.2
+local RUNNER_GLOW_ACTIVE_BRIGHTNESS = 2.25
+local RUNNER_GLOW_RANGE = 9.5
+local RUNNER_GLOW_FADE_IN_SECONDS = 0.11
+local RUNNER_GLOW_FADE_OUT_SECONDS = 0.2
 
 type BloomSnapshot = {
 	Effect: BloomEffect,
@@ -52,6 +61,30 @@ type AmbientSnowLayer = {
 	CameraOffset: Vector3,
 }
 
+type RunnerGlowTargetSpec = {
+	PartName: string,
+	SideName: string,
+	SegmentName: string,
+	HasSurfaceLight: boolean,
+}
+
+type RunnerGlowTarget = {
+	Part: BasePart,
+	SideName: string,
+	SegmentName: string,
+	HasSurfaceLight: boolean,
+}
+
+type RunnerGlow = {
+	Runner: BasePart,
+	Highlight: Highlight,
+	Light: SurfaceLight?,
+	FillTween: Tween?,
+	OutlineTween: Tween?,
+	BrightnessTween: Tween?,
+	Active: boolean,
+}
+
 type SledEffects = {
 	RunId: number,
 	Model: Model,
@@ -60,6 +93,7 @@ type SledEffects = {
 	Sprays: { ParticleEmitter },
 	Streaks: ParticleEmitter,
 	Bursts: { ParticleEmitter },
+	RunnerGlows: { RunnerGlow },
 	CreatedInstances: { Instance },
 	Connections: { RBXScriptConnection },
 	RaycastParams: RaycastParams,
@@ -69,6 +103,46 @@ type SledEffects = {
 	LastTrailStrength: number,
 	LastSprayStrength: number,
 	LastStreakEnabled: boolean,
+	LastRunnerGlowActive: boolean,
+}
+
+local RUNNER_GLOW_TARGET_SPECS: { RunnerGlowTargetSpec } = {
+	{
+		PartName = "ClassicLeftRunnerRail",
+		SideName = "Left",
+		SegmentName = "Rail",
+		HasSurfaceLight = true,
+	},
+	{
+		PartName = "ClassicLeftRunnerUpturn",
+		SideName = "Left",
+		SegmentName = "Upturn",
+		HasSurfaceLight = false,
+	},
+	{
+		PartName = "ClassicLeftRunnerCurl",
+		SideName = "Left",
+		SegmentName = "Curl",
+		HasSurfaceLight = false,
+	},
+	{
+		PartName = "ClassicRightRunnerRail",
+		SideName = "Right",
+		SegmentName = "Rail",
+		HasSurfaceLight = true,
+	},
+	{
+		PartName = "ClassicRightRunnerUpturn",
+		SideName = "Right",
+		SegmentName = "Upturn",
+		HasSurfaceLight = false,
+	},
+	{
+		PartName = "ClassicRightRunnerCurl",
+		SideName = "Right",
+		SegmentName = "Curl",
+		HasSurfaceLight = false,
+	},
 }
 
 local VFXController = {}
@@ -109,6 +183,9 @@ local currentRunId: number? = nil
 local currentPhase: string = RunPhase.Idle
 local currentSpeed = 0
 local currentTucking = false
+local currentTuckQueued = false
+local currentGlowTucking = false
+local currentOutcome: string? = nil
 local currentReleaseAccepted = false
 local nextSledResolveAt = 0
 local nextAmbientUpdateAt = 0
@@ -147,6 +224,18 @@ local function isKnownPhase(value: string): boolean
 		or value == RunPhase.Landed
 		or value == RunPhase.Results
 		or value == RunPhase.Reset
+end
+
+local function isRunnerGlowPhase(value: string): boolean
+	return value == RunPhase.Countdown
+		or value == RunPhase.Descent
+		or value == RunPhase.Airborne
+end
+
+local function isCompletedOutcome(value: any): boolean
+	return value == ResultTypes.Outcomes.CleanLanding
+		or value == ResultTypes.Outcomes.Crashed
+		or value == ResultTypes.Outcomes.Stalled
 end
 
 local function disconnectAll(connections: { RBXScriptConnection })
@@ -453,8 +542,201 @@ local function findRunnerPair(model: Model, root: BasePart): (BasePart?, BasePar
 	return leftRunner, rightRunner
 end
 
+local function findExactRunnerGlowTargets(model: Model): { RunnerGlowTarget }?
+	local shell = model:FindFirstChild("FrostlineClassicVisual")
+	if not shell or not shell:IsA("Model") then
+		return nil
+	end
+
+	local targets: { RunnerGlowTarget } = {}
+	for _, spec in RUNNER_GLOW_TARGET_SPECS do
+		local instance = shell:FindFirstChild(spec.PartName)
+		if not instance or not instance:IsA("BasePart") then
+			return nil
+		end
+		table.insert(targets, {
+			Part = instance,
+			SideName = spec.SideName,
+			SegmentName = spec.SegmentName,
+			HasSurfaceLight = spec.HasSurfaceLight,
+		})
+	end
+
+	return targets
+end
+
 local function trackCreated(created: { Instance }, instance: Instance)
 	table.insert(created, instance)
+end
+
+local function createRunnerGlow(
+	target: RunnerGlowTarget,
+	created: { Instance }
+): RunnerGlow
+	local runner = target.Part
+	local highlight = Instance.new("Highlight")
+	highlight.Name = string.format(
+		"Frostline%sRunner%sTuckHighlight",
+		target.SideName,
+		target.SegmentName
+	)
+	highlight.Adornee = runner
+	highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+	highlight.FillColor = RUNNER_GLOW_FILL_COLOR
+	highlight.FillTransparency = 1
+	highlight.OutlineColor = RUNNER_GLOW_OUTLINE_COLOR
+	highlight.OutlineTransparency = 1
+	highlight.Enabled = true
+	highlight.Parent = runner
+	trackCreated(created, highlight)
+
+	local light: SurfaceLight? = nil
+	if target.HasSurfaceLight then
+		local surfaceLight = Instance.new("SurfaceLight")
+		surfaceLight.Name = string.format("Frostline%sRunnerTuckLight", target.SideName)
+		surfaceLight.Face = Enum.NormalId.Bottom
+		surfaceLight.Color = RUNNER_GLOW_FILL_COLOR
+		surfaceLight.Shadows = false
+		surfaceLight.Brightness = 0
+		surfaceLight.Range = RUNNER_GLOW_RANGE
+		surfaceLight.Enabled = true
+		surfaceLight.Parent = runner
+		trackCreated(created, surfaceLight)
+		light = surfaceLight
+	end
+
+	return {
+		Runner = runner,
+		Highlight = highlight,
+		Light = light,
+		FillTween = nil,
+		OutlineTween = nil,
+		BrightnessTween = nil,
+		Active = false,
+	}
+end
+
+local function createRunnerGlows(
+	targets: { RunnerGlowTarget },
+	created: { Instance }
+): { RunnerGlow }
+	local glows: { RunnerGlow } = {}
+	for _, target in targets do
+		table.insert(glows, createRunnerGlow(target, created))
+	end
+	return glows
+end
+
+local function cancelRunnerGlowTweens(glow: RunnerGlow)
+	local fillTween = glow.FillTween
+	glow.FillTween = nil
+	if fillTween then
+		fillTween:Cancel()
+	end
+
+	local outlineTween = glow.OutlineTween
+	glow.OutlineTween = nil
+	if outlineTween then
+		outlineTween:Cancel()
+	end
+
+	local brightnessTween = glow.BrightnessTween
+	glow.BrightnessTween = nil
+	if brightnessTween then
+		brightnessTween:Cancel()
+	end
+end
+
+local function setRunnerGlowActive(glow: RunnerGlow, active: boolean)
+	local light = glow.Light
+	if not glow.Runner:IsDescendantOf(Workspace)
+		or glow.Highlight.Parent ~= glow.Runner
+		or (light ~= nil and light.Parent ~= glow.Runner)
+	then
+		cancelRunnerGlowTweens(glow)
+		glow.Active = false
+		return
+	end
+	if glow.Active == active then
+		return
+	end
+
+	cancelRunnerGlowTweens(glow)
+
+	glow.Active = active
+	local duration = if active then RUNNER_GLOW_FADE_IN_SECONDS else RUNNER_GLOW_FADE_OUT_SECONDS
+	local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local fillTween = TweenService:Create(glow.Highlight, tweenInfo, {
+		FillTransparency = if active then RUNNER_GLOW_ACTIVE_FILL_TRANSPARENCY else 1,
+	})
+	local outlineTween = TweenService:Create(glow.Highlight, tweenInfo, {
+		OutlineTransparency = if active then RUNNER_GLOW_ACTIVE_OUTLINE_TRANSPARENCY else 1,
+	})
+	glow.FillTween = fillTween
+	glow.OutlineTween = outlineTween
+	fillTween:Play()
+	outlineTween:Play()
+
+	if light then
+		local brightnessTween = TweenService:Create(light, tweenInfo, {
+			Brightness = if active then RUNNER_GLOW_ACTIVE_BRIGHTNESS else 0,
+		})
+		glow.BrightnessTween = brightnessTween
+		brightnessTween:Play()
+	end
+end
+
+local function setRunnerGlowsActive(effects: SledEffects, active: boolean)
+	if effects.LastRunnerGlowActive == active then
+		return
+	end
+	effects.LastRunnerGlowActive = active
+	for _, glow in effects.RunnerGlows do
+		setRunnerGlowActive(glow, active)
+	end
+end
+
+local function forceRunnerGlowsInactive(effects: SledEffects)
+	effects.LastRunnerGlowActive = false
+	for _, glow in effects.RunnerGlows do
+		cancelRunnerGlowTweens(glow)
+		glow.Active = false
+		pcall(function()
+			glow.Highlight.FillTransparency = 1
+			glow.Highlight.OutlineTransparency = 1
+			local light = glow.Light
+			if light then
+				light.Brightness = 0
+			end
+		end)
+	end
+end
+
+local function shouldRunnerGlow(effects: SledEffects): boolean
+	if not started
+		or activeSledEffects ~= effects
+		or effects.RunId ~= currentRunId
+		or not effects.Model:IsDescendantOf(Workspace)
+		or not effects.Root:IsDescendantOf(Workspace)
+		or not isRunnerGlowPhase(currentPhase)
+		or isCompletedOutcome(currentOutcome)
+	then
+		return false
+	end
+
+	local currentModel, currentRoot = findActiveSledModel()
+	if currentModel ~= effects.Model or currentRoot ~= effects.Root then
+		return false
+	end
+
+	if currentPhase == RunPhase.Countdown then
+		return currentTuckQueued
+	end
+	return currentGlowTucking
+end
+
+local function reconcileRunnerGlows(effects: SledEffects)
+	setRunnerGlowsActive(effects, shouldRunnerGlow(effects))
 end
 
 local function createRunnerTrailLayer(
@@ -672,7 +954,12 @@ local function createBurstEmitter(
 	return emitter
 end
 
-local function createSledEffects(model: Model, root: BasePart, runId: number): (SledEffects?, string?)
+local function createSledEffects(
+	model: Model,
+	root: BasePart,
+	runId: number,
+	runnerGlowTargets: { RunnerGlowTarget }
+): (SledEffects?, string?)
 	local leftRunner, rightRunner = findRunnerPair(model, root)
 	if not leftRunner or not rightRunner then
 		return nil, "validated left/right runner pair was not available"
@@ -680,6 +967,7 @@ local function createSledEffects(model: Model, root: BasePart, runId: number): (
 
 	local created: { Instance } = {}
 	local succeeded, result = pcall(function(): SledEffects
+		local runnerGlows = createRunnerGlows(runnerGlowTargets, created)
 		local trails: { Trail } = {}
 		for _, trail in createRunnerTrails(leftRunner, root, "Left", created) do
 			table.insert(trails, trail)
@@ -719,6 +1007,7 @@ local function createSledEffects(model: Model, root: BasePart, runId: number): (
 				createBurstEmitter(leftContact, "Left", created),
 				createBurstEmitter(rightContact, "Right", created),
 			},
+			RunnerGlows = runnerGlows,
 			CreatedInstances = created,
 			Connections = {},
 			RaycastParams = raycastParams,
@@ -728,6 +1017,7 @@ local function createSledEffects(model: Model, root: BasePart, runId: number): (
 			LastTrailStrength = -1,
 			LastSprayStrength = -1,
 			LastStreakEnabled = false,
+			LastRunnerGlowActive = false,
 		}
 	end)
 
@@ -763,6 +1053,7 @@ local function destroyActiveSledEffects()
 		return
 	end
 
+	forceRunnerGlowsInactive(effects)
 	disconnectAll(effects.Connections)
 	pcall(function()
 		disableSledEffects(effects)
@@ -906,7 +1197,11 @@ local function tryResolveSled(): boolean
 	if not model or not root then
 		return false
 	end
-	local effects, failureReason = createSledEffects(model, root, runId)
+	local runnerGlowTargets = findExactRunnerGlowTargets(model)
+	if not runnerGlowTargets then
+		return false
+	end
+	local effects, failureReason = createSledEffects(model, root, runId, runnerGlowTargets)
 	if not effects then
 		sledEffectsDisabledRunId = currentRunId
 		warnOnce("sled-effects", string.format("Sled effects disabled: %s", failureReason or "unknown error"))
@@ -919,6 +1214,17 @@ local function tryResolveSled(): boolean
 			destroyActiveSledEffects()
 		end
 	end))
+	local currentModel, currentRoot = findActiveSledModel()
+	if not started
+		or currentRunId ~= runId
+		or activeSledEffects ~= effects
+		or currentModel ~= model
+		or currentRoot ~= root
+	then
+		destroyActiveSledEffects()
+		return false
+	end
+	reconcileRunnerGlows(effects)
 	flushPendingBursts(effects)
 	diagnostic(string.format("attached sled effects RunId=%s", tostring(currentRunId)))
 	return true
@@ -1073,6 +1379,9 @@ local function resetRunPresentation(runId: number)
 	currentPhase = RunPhase.Idle
 	currentSpeed = 0
 	currentTucking = false
+	currentTuckQueued = false
+	currentGlowTucking = false
+	currentOutcome = nil
 	currentReleaseAccepted = false
 	nextSledResolveAt = 0
 	nextAmbientUpdateAt = 0
@@ -1112,6 +1421,8 @@ function VFXController.start()
 		updateSledPresentation(now)
 	end))
 	table.insert(controllerConnections, localPlayer.CharacterRemoving:Connect(function()
+		currentTuckQueued = false
+		currentGlowTucking = false
 		destroyActiveSledEffects()
 	end))
 	table.insert(controllerConnections, script.Destroying:Connect(function()
@@ -1125,9 +1436,9 @@ function VFXController.presentRunState(
 	_countdown: any,
 	speed: any,
 	runId: any,
-	_tuckQueued: any,
+	tuckQueued: any,
 	tucking: any,
-	_outcome: any,
+	outcome: any,
 	releaseAccepted: any
 )
 	if not started then
@@ -1155,7 +1466,10 @@ function VFXController.presentRunState(
 	currentPhase = phase
 	currentSpeed = if typeof(speed) == "number" and isFiniteNumber(speed) then math.max(0, speed) else 0
 	currentReleaseAccepted = phase == RunPhase.Descent and releaseAccepted == true
-	currentTucking = phase == RunPhase.Descent and tucking == true
+	currentTuckQueued = tuckQueued == true
+	currentGlowTucking = tucking == true
+	currentTucking = phase == RunPhase.Descent and currentGlowTucking
+	currentOutcome = if typeof(outcome) == "string" then outcome else nil
 
 	if phase == RunPhase.Countdown or phase == RunPhase.Descent then
 		tryResolveSled()
@@ -1179,6 +1493,7 @@ function VFXController.presentRunState(
 	end
 	local resolvedEffects = activeSledEffects
 	if resolvedEffects then
+		reconcileRunnerGlows(resolvedEffects)
 		flushPendingBursts(resolvedEffects)
 	end
 
@@ -1210,10 +1525,16 @@ function VFXController.presentResult(payload: ResultTypes.Payload)
 	then
 		return
 	end
+	currentTuckQueued = false
+	currentGlowTucking = false
+	currentOutcome = payload.Outcome
+	local effects = activeSledEffects
+	if effects then
+		reconcileRunnerGlows(effects)
+	end
 
 	if payload.Outcome == ResultTypes.Outcomes.Crashed and crashBurstRunId ~= payload.RunId then
 		crashBurstRunId = payload.RunId
-		local effects = activeSledEffects
 		if effects then
 			emitCrashBurst(effects)
 		else
@@ -1224,8 +1545,11 @@ end
 
 function VFXController.clearResultPresentation()
 	pendingCrashBurst = false
+	currentTuckQueued = false
+	currentGlowTucking = false
 	local effects = activeSledEffects
 	if effects then
+		reconcileRunnerGlows(effects)
 		disableSledEffects(effects)
 		for _, burst in effects.Bursts do
 			burst:Clear()
@@ -1253,6 +1577,9 @@ function VFXController.destroy()
 	currentPhase = RunPhase.Idle
 	currentSpeed = 0
 	currentTucking = false
+	currentTuckQueued = false
+	currentGlowTucking = false
+	currentOutcome = nil
 	currentReleaseAccepted = false
 	nextAmbientUpdateAt = 0
 	landingBoostUntil = 0
