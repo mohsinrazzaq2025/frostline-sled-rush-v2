@@ -1,10 +1,36 @@
 --!strict
 
+type SledCatalogEntry = {
+	SledId: string,
+	DisplayName: string,
+	Price: number,
+	ForSale: boolean,
+	Description: string,
+}
+
 local knownSledIds: { [string]: boolean } = {
 	FrostlineClassic = true,
 	FrostRunner = true,
 }
 table.freeze(knownSledIds)
+
+local sledCatalog: { [string]: SledCatalogEntry } = {
+	FrostlineClassic = table.freeze({
+		SledId = "FrostlineClassic",
+		DisplayName = "FROSTLINE CLASSIC",
+		Price = 0,
+		ForSale = false,
+		Description = "THE ORIGINAL CHRISTMAS SLED. CLASSIC HANDLING.",
+	}),
+	FrostRunner = table.freeze({
+		SledId = "FrostRunner",
+		DisplayName = "FROST RUNNER",
+		Price = 250,
+		ForSale = true,
+		Description = "ARCTIC STYLE. CLASSIC HANDLING.\nA premium cosmetic sled with the same fair performance.",
+	}),
+}
+table.freeze(sledCatalog)
 
 local GameConfig = {
 	World = {
@@ -126,6 +152,21 @@ local GameConfig = {
 		LoadWaitTimeoutSeconds = 15,
 		ShutdownTimeoutSeconds = 25,
 		DiagnosticsEnabled = false,
+	},
+
+	Store = {
+		CatalogVersion = 1,
+		Catalog = sledCatalog,
+		TokenBucketCapacity = 4,
+		TokenRefillPerSecond = 2,
+		MutationMinimumIntervalSeconds = 0.5,
+		CompletedResponseLimit = 32,
+		CompletedResponseRetentionSeconds = 120,
+		CachedResponseMinimumIntervalSeconds = 0.1,
+		InvalidWarningIntervalSeconds = 5,
+		PendingTimeoutSeconds = 9,
+		MaximumRequestIdLength = 36,
+		MaximumSledIdLength = 64,
 	},
 
 	Audio = {

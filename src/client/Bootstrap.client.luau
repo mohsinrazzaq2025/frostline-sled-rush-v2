@@ -12,6 +12,19 @@ RunController.start()
 VFXController.start()
 ResultController.start()
 
+local storeStarted, storeFailure = pcall(function()
+	local StoreController = require(script.Parent.Controllers.StoreController)
+	StoreController.start()
+end)
+if not storeStarted then
+	warn(
+		string.format(
+			"[Frostline] StoreController failed to start; Store unavailable: %s",
+			tostring(storeFailure)
+		)
+	)
+end
+
 local cameraStarted, cameraFailure = pcall(function()
 	local CameraController = require(script.Parent.Controllers.CameraController)
 	CameraController.start()

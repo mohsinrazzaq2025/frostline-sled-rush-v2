@@ -8,6 +8,7 @@ local Workspace = game:GetService("Workspace")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
+local PlayerDataService = require(script.Parent.PlayerDataService)
 local ResultService = require(script.Parent.ResultService)
 local SledFactory = require(script.Parent.SledFactory)
 
@@ -208,6 +209,10 @@ type PendingReplay = {
 	RunId: number,
 }
 
+export type StoreOperationToken = {
+	_OpaqueStoreOperationToken: boolean,
+}
+
 type NetworkOwnershipSnapshot = {
 	OwnerLabel: string,
 	AutomaticLabel: string,
@@ -247,6 +252,7 @@ local resultRemote: RemoteEvent? = nil
 local startPrompt: ProximityPrompt? = nil
 local trustedReplay: ((Player) -> ())? = nil
 local pendingReplays: { [Player]: PendingReplay } = {}
+local storeOperations: { [Player]: StoreOperationToken } = {}
 local latestRunId = 0
 
 local function refreshStartPrompt()
@@ -3092,7 +3098,12 @@ local function seatPlayer(session: Session, runId: number): boolean
 end
 
 local function beginRun(player: Player, references: WorldReferences, trustedStart: boolean)
-	if sessions[player] then
+	if player.Parent ~= Players
+		or sessions[player]
+		or pendingReplays[player]
+		or storeOperations[player]
+		or PlayerDataService.hasUnresolvedStoreSave(player)
+	then
 		return
 	end
 	if not references.PlayerSpawn.Parent or not references.PlayerSpawn:IsDescendantOf(Workspace) then
@@ -3117,10 +3128,14 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	if not trustedStart and (rootPart.Position - references.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
 		return
 	end
+	local equippedSledId = PlayerDataService.getEquippedSledId(player)
 	disableStartPrompt()
 
 	local triggerCenter = references.StartTrigger.Position
-	local sled = SledFactory.create(CFrame.lookAt(triggerCenter, triggerCenter + Vector3.zAxis))
+	local sled = SledFactory.create(
+		CFrame.lookAt(triggerCenter, triggerCenter + Vector3.zAxis),
+		equippedSledId
+	)
 	local summitTopY = references.SummitPlatform.Position.Y + references.SummitPlatform.Size.Y * 0.5
 	local startPosition = Vector3.new(
 		triggerCenter.X,
@@ -3470,6 +3485,7 @@ end
 function RunManager.handlePlayerRemoving(player: Player)
 	local session = sessions[player]
 	pendingReplays[player] = nil
+	storeOperations[player] = nil
 	if session then
 		local runId = session.RunId
 		if isSameSession(session, runId) then
@@ -3481,6 +3497,47 @@ function RunManager.handlePlayerRemoving(player: Player)
 	end
 	refreshStartPrompt()
 	ResultService.removePlayer(player)
+end
+
+function RunManager.canAccessStore(player: Player): boolean
+	return started
+		and player.Parent == Players
+		and sessions[player] == nil
+		and pendingReplays[player] == nil
+end
+
+function RunManager.beginStoreOperation(player: Player): (StoreOperationToken?, string?)
+	if not started then
+		return nil, "run manager unavailable"
+	elseif player.Parent ~= Players then
+		return nil, "player unavailable"
+	elseif sessions[player] ~= nil then
+		return nil, "run active"
+	elseif pendingReplays[player] ~= nil then
+		return nil, "replay pending"
+	elseif storeOperations[player] ~= nil then
+		return nil, "store operation already reserved"
+	end
+
+	local token: StoreOperationToken = {
+		_OpaqueStoreOperationToken = true,
+	}
+	storeOperations[player] = token
+	return token, nil
+end
+
+function RunManager.isStoreOperationCurrent(player: Player, token: StoreOperationToken): boolean
+	return started
+		and player.Parent == Players
+		and storeOperations[player] == token
+		and sessions[player] == nil
+		and pendingReplays[player] == nil
+end
+
+function RunManager.endStoreOperation(player: Player, token: StoreOperationToken)
+	if storeOperations[player] == token then
+		storeOperations[player] = nil
+	end
 end
 
 function RunManager.start()

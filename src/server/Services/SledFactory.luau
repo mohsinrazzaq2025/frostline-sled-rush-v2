@@ -6,10 +6,20 @@ local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local PHYSICS = GameConfig.Physics
 local PALETTE = GameConfig.Palette
+
+export type SledId = "FrostlineClassic" | "FrostRunner"
+
 local CLASSIC_RED = Color3.fromRGB(148, 22, 39)
 local CLASSIC_RED_DARK = Color3.fromRGB(112, 16, 31)
 local CLASSIC_CREAM = Color3.fromRGB(250, 237, 207)
 local CLASSIC_CYAN = Color3.fromRGB(105, 226, 255)
+local CLASSIC_SLED_ID: SledId = "FrostlineClassic"
+local FROST_RUNNER_SLED_ID: SledId = "FrostRunner"
+local FROST_RUNNER_BODY = Color3.fromRGB(18, 52, 78)
+local FROST_RUNNER_SECONDARY = Color3.fromRGB(72, 210, 235)
+local FROST_RUNNER_RUNNER = Color3.fromRGB(190, 235, 245)
+local FROST_RUNNER_SEAT = Color3.fromRGB(20, 29, 42)
+local FROST_RUNNER_TRIM = Color3.fromRGB(90, 225, 255)
 
 local LEGACY_VISUAL_PART_NAMES = {
 	"RedDeck",
@@ -30,6 +40,143 @@ export type Sled = {
 	Root: Part,
 	DriverSeat: Seat,
 }
+
+type CosmeticAppearance = {
+	PartName: string,
+	Color: Color3,
+	Material: Enum.Material,
+}
+
+local FROST_RUNNER_APPEARANCE: { CosmeticAppearance } = {
+	{
+		PartName = "ClassicBodyFloor",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicLeftBodySide",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRightBodySide",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicLeftNoseCheek",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRightNoseCheek",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicFrontApron",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRearLowerSlat",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRearUpperSlat",
+		Color = FROST_RUNNER_BODY,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRearLeftPost",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRearRightPost",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftFrontRunnerSupport",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftRearRunnerSupport",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRightFrontRunnerSupport",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRightRearRunnerSupport",
+		Color = FROST_RUNNER_SECONDARY,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftRunnerRail",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftRunnerUpturn",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftRunnerCurl",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRightRunnerRail",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRightRunnerUpturn",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicRightRunnerCurl",
+		Color = FROST_RUNNER_RUNNER,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "ClassicLeftFrostTrim",
+		Color = FROST_RUNNER_TRIM,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicRightFrostTrim",
+		Color = FROST_RUNNER_TRIM,
+		Material = Enum.Material.SmoothPlastic,
+	},
+	{
+		PartName = "ClassicFrontGoldTrim",
+		Color = FROST_RUNNER_TRIM,
+		Material = Enum.Material.Metal,
+	},
+	{
+		PartName = "FrostlineBadge",
+		Color = FROST_RUNNER_TRIM,
+		Material = Enum.Material.SmoothPlastic,
+	},
+}
+table.freeze(FROST_RUNNER_APPEARANCE)
+
+local function normalizeSledId(value: string?): SledId
+	if typeof(value) == "string" and value == FROST_RUNNER_SLED_ID then
+		return FROST_RUNNER_SLED_ID
+	end
+	return CLASSIC_SLED_ID
+end
 
 local function weldToRoot(root: Part, part: BasePart)
 	local weld = Instance.new("WeldConstraint")
@@ -143,7 +290,7 @@ local function createFrostlineBadge(badge: Part)
 	label.Parent = surfaceGui
 end
 
-local function createClassicVisualShell(model: Model, root: Part)
+local function createClassicVisualShell(model: Model, root: Part): Model
 	local shell = Instance.new("Model")
 	shell.Name = "FrostlineClassicVisual"
 	shell.Parent = model
@@ -301,11 +448,28 @@ local function createClassicVisualShell(model: Model, root: Part)
 		Enum.Material.SmoothPlastic
 	)
 	createFrostlineBadge(badge)
+	return shell
 end
 
-function SledFactory.create(spawnCFrame: CFrame): Sled
+local function applyFrostRunnerAppearance(shell: Model, driverSeat: Seat)
+	for _, appearance in FROST_RUNNER_APPEARANCE do
+		local instance = shell:FindFirstChild(appearance.PartName)
+		if not instance or not instance:IsA("BasePart") then
+			error(string.format("Frost Runner cosmetic part unavailable: %s", appearance.PartName))
+		end
+		instance.Color = appearance.Color
+		instance.Material = appearance.Material
+	end
+
+	driverSeat.Color = FROST_RUNNER_SEAT
+	driverSeat.Material = Enum.Material.SmoothPlastic
+end
+
+function SledFactory.create(spawnCFrame: CFrame, equippedSledId: string?): Sled
+	local sledId = normalizeSledId(equippedSledId)
 	local model = Instance.new("Model")
 	model.Name = "ChristmasSled"
+	model:SetAttribute("SledId", sledId)
 
 	-- All physical mass and collision live in this low body. Everything visible is welded and massless.
 	local root = Instance.new("Part")
@@ -418,7 +582,10 @@ function SledFactory.create(spawnCFrame: CFrame): Sled
 			legacyPart.Transparency = 1
 		end
 	end
-	createClassicVisualShell(model, root)
+	local shell = createClassicVisualShell(model, root)
+	if sledId == FROST_RUNNER_SLED_ID then
+		applyFrostRunnerAppearance(shell, driverSeat)
+	end
 
 	model.PrimaryPart = root
 	return {

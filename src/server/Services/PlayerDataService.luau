@@ -8,19 +8,44 @@ local RunService = game:GetService("RunService")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local PlayerDataTypes = require(ReplicatedStorage.Shared.PlayerDataTypes)
+local StoreTypes = require(ReplicatedStorage.Shared.StoreTypes)
 
 local DATA = GameConfig.PlayerData
+local STORE = GameConfig.Store
 local PERSISTENCE = PlayerDataTypes.PersistenceStatuses
+local STORE_PERSISTENCE = StoreTypes.PersistenceStates
+local STORE_STATUS = StoreTypes.StatusCodes
 local DEFAULT_SLED_ID = DATA.DefaultSledId
 local KNOWN_SLED_IDS = DATA.KnownSledIds
 local OPERATION_POLL_INTERVAL = 0.05
+local MAXIMUM_SAFE_INTEGER = 9007199254740991
 
 type PersistenceStatus = PlayerDataTypes.PersistenceStatus
 type OwnedSleds = PlayerDataTypes.OwnedSleds
 type PlayerProgress = PlayerDataTypes.PlayerProgress
 type ProgressSnapshot = PlayerDataTypes.ProgressSnapshot
 type RewardUpdate = PlayerDataTypes.RewardUpdate
+type StorePersistenceState = StoreTypes.PersistenceState
+type StoreStatusCode = StoreTypes.StatusCode
+type CatalogEntry = StoreTypes.CatalogEntry
 type LoadState = "Loading" | "Persistent" | "SessionOnly" | "Releasing" | "Released"
+type StoreMutationAction = "Purchase" | "Equip"
+type ReservationValidator = () -> boolean
+
+export type StoreProfileSnapshot = {
+	Generation: number,
+	DataRevision: number,
+	PersistenceState: StorePersistenceState,
+	FrostCoins: number,
+	OwnedSleds: OwnedSleds,
+	EquippedSledId: string,
+}
+
+export type StoreMutationResult = {
+	StatusCode: StoreStatusCode,
+	Snapshot: StoreProfileSnapshot?,
+	InternalReason: string?,
+}
 
 type StoredSession = {
 	Id: string,
@@ -53,6 +78,7 @@ type ProfileSession = {
 	Player: Player,
 	Key: string,
 	SessionId: string,
+	Generation: number,
 	State: LoadState,
 	Progress: PlayerProgress,
 	Saveable: boolean,
@@ -64,6 +90,7 @@ type ProfileSession = {
 	ReleaseFinished: boolean,
 	ReleaseSucceeded: boolean,
 	SavePending: boolean,
+	StoreSaveUnresolved: boolean,
 	FallbackWarned: boolean,
 	OwnershipWarningEmitted: boolean,
 	ConsecutiveSaveFailures: number,
@@ -96,6 +123,7 @@ local removalCoordinated: { [Player]: boolean } = {}
 local beforePlayerRelease: BeforePlayerRelease? = nil
 local started = false
 local shuttingDown = false
+local latestProfileGeneration = 0
 
 local function isFiniteNumber(value: any): boolean
 	return typeof(value) == "number" and value == value and value > -math.huge and value < math.huge
@@ -103,6 +131,10 @@ end
 
 local function isNonNegativeInteger(value: any): boolean
 	return isFiniteNumber(value) and value >= 0 and value % 1 == 0
+end
+
+local function isSafeNonNegativeInteger(value: any): boolean
+	return isNonNegativeInteger(value) and value <= MAXIMUM_SAFE_INTEGER
 end
 
 local function createDefaultOwnedSleds(): OwnedSleds
@@ -165,6 +197,12 @@ local function copyProgress(progress: PlayerProgress): PlayerProgress
 		OwnedSleds = copyOwnedSleds(progress.OwnedSleds),
 		EquippedSledId = progress.EquippedSledId,
 	}
+end
+
+local function createFrozenProgressCopy(progress: PlayerProgress): PlayerProgress
+	local copied = copyProgress(progress)
+	table.freeze(copied.OwnedSleds)
+	return table.freeze(copied)
 end
 
 local function getPlayerKey(player: Player): string
@@ -465,6 +503,7 @@ local function installFallback(entry: ProfileSession, reason: string, shouldWarn
 	entry.Dirty = false
 	entry.Revision = 0
 	entry.LastSavedRevision = 0
+	entry.StoreSaveUnresolved = false
 	if shouldWarn then
 		warnFallback(entry, reason)
 	end
@@ -487,6 +526,7 @@ local function loadEntry(entry: ProfileSession)
 		entry.Dirty = false
 		entry.Revision = 0
 		entry.LastSavedRevision = 0
+		entry.StoreSaveUnresolved = false
 	else
 		local failureReason = if operationSucceeded then result.Reason else tostring(result)
 		local playerStillActive = entry.Player.Parent == Players and not entry.ReleaseStarted and not shuttingDown
@@ -507,10 +547,12 @@ local function beginLoading(player: Player)
 	if shuttingDown or profiles[player] then
 		return
 	end
+	latestProfileGeneration += 1
 	local entry: ProfileSession = {
 		Player = player,
 		Key = getPlayerKey(player),
 		SessionId = createSessionId(player),
+		Generation = latestProfileGeneration,
 		State = "Loading",
 		Progress = createDefaultProgress(),
 		Saveable = false,
@@ -522,6 +564,7 @@ local function beginLoading(player: Player)
 		ReleaseFinished = false,
 		ReleaseSucceeded = false,
 		SavePending = false,
+		StoreSaveUnresolved = false,
 		FallbackWarned = false,
 		OwnershipWarningEmitted = false,
 		ConsecutiveSaveFailures = 0,
@@ -547,6 +590,53 @@ local function createSnapshot(entry: ProfileSession): ProgressSnapshot
 		EquippedSledId = entry.Progress.EquippedSledId,
 		PersistenceStatus = getPersistenceStatus(entry),
 	})
+end
+
+local function getStorePersistenceState(entry: ProfileSession): StorePersistenceState
+	if entry.State == "Loading" then
+		return STORE_PERSISTENCE.Loading
+	elseif entry.ReleaseStarted or entry.State == "Releasing" or entry.State == "Released" then
+		return STORE_PERSISTENCE.Releasing
+	elseif entry.State == "SessionOnly" or not entry.Saveable then
+		return STORE_PERSISTENCE.SessionOnly
+	elseif entry.StoreSaveUnresolved or entry.SavePending then
+		return STORE_PERSISTENCE.SavePending
+	end
+	return STORE_PERSISTENCE.Persistent
+end
+
+local function createStoreProfileSnapshot(entry: ProfileSession): StoreProfileSnapshot
+	local ownedSleds = copyOwnedSleds(entry.Progress.OwnedSleds)
+	table.freeze(ownedSleds)
+	return table.freeze({
+		Generation = entry.Generation,
+		DataRevision = entry.Revision,
+		PersistenceState = getStorePersistenceState(entry),
+		FrostCoins = entry.Progress.FrostCoins,
+		OwnedSleds = ownedSleds,
+		EquippedSledId = entry.Progress.EquippedSledId,
+	})
+end
+
+local function createStoreMutationResult(
+	entry: ProfileSession?,
+	statusCode: StoreStatusCode,
+	internalReason: string?
+): StoreMutationResult
+	local snapshot: StoreProfileSnapshot? = nil
+	if entry and profiles[entry.Player] == entry then
+		snapshot = createStoreProfileSnapshot(entry)
+	end
+	return table.freeze({
+		StatusCode = statusCode,
+		Snapshot = snapshot,
+		InternalReason = internalReason,
+	})
+end
+
+local function reservationIsCurrent(validateReservation: ReservationValidator): boolean
+	local callSucceeded, reservationCurrent = pcall(validateReservation)
+	return callSucceeded and reservationCurrent == true
 end
 
 local function ownedSledsMatch(left: OwnedSleds, right: OwnedSleds): boolean
@@ -685,6 +775,166 @@ local function markUnsafeToSave(entry: ProfileSession, reason: string)
 	end
 end
 
+local function performStoreMutation(
+	player: Player,
+	action: StoreMutationAction,
+	sledId: string,
+	expectedRevision: number,
+	expectedGeneration: number,
+	validateReservation: ReservationValidator
+): StoreMutationResult
+	local catalog = STORE.Catalog :: { [string]: CatalogEntry }
+
+	local function validateContext(allowReservedSaveWorker: boolean): (
+		ProfileSession?,
+		CatalogEntry?,
+		StoreStatusCode?,
+		string?
+	)
+		if not started or shuttingDown or player.Parent ~= Players then
+			return nil, nil, STORE_STATUS.StoreUnavailable, "player or service lifecycle is unavailable"
+		elseif not isSafeNonNegativeInteger(expectedGeneration) then
+			return nil, nil, STORE_STATUS.StateChanged, "profile generation is invalid"
+		elseif not isSafeNonNegativeInteger(expectedRevision) then
+			return nil, nil, STORE_STATUS.StateChanged, "data revision is invalid"
+		elseif typeof(sledId) ~= "string" then
+			return nil, nil, STORE_STATUS.UnknownSled, "sled ID is invalid"
+		end
+
+		local entry = profiles[player]
+		if not entry then
+			return nil, nil, STORE_STATUS.ProfileLoading, "profile is unavailable"
+		elseif entry.Generation ~= expectedGeneration then
+			return entry, nil, STORE_STATUS.StateChanged, "profile generation changed"
+		elseif entry.ReleaseStarted or entry.State == "Releasing" or entry.State == "Released" then
+			return entry, nil, STORE_STATUS.StoreUnavailable, "profile release is in progress"
+		elseif entry.State == "Loading" then
+			return entry, nil, STORE_STATUS.ProfileLoading, "profile is still loading"
+		elseif entry.State == "SessionOnly" or not entry.Saveable then
+			return entry, nil, STORE_STATUS.PersistenceUnavailable, "persistent profile is unavailable"
+		elseif entry.StoreSaveUnresolved then
+			return entry, nil, STORE_STATUS.SavePending, "a Store save is unresolved"
+		elseif entry.SavePending and not allowReservedSaveWorker then
+			return entry, nil, STORE_STATUS.SavePending, "a profile save is already in progress"
+		elseif entry.Revision ~= expectedRevision then
+			return entry, nil, STORE_STATUS.StateChanged, "data revision changed"
+		elseif entry.Revision >= MAXIMUM_SAFE_INTEGER then
+			return entry, nil, STORE_STATUS.InternalError, "data revision cannot be incremented safely"
+		end
+
+		local catalogEntry = catalog[sledId]
+		if not catalogEntry or KNOWN_SLED_IDS[sledId] ~= true or catalogEntry.SledId ~= sledId then
+			return entry, nil, STORE_STATUS.UnknownSled, "sled ID is not in the authoritative catalog"
+		end
+
+		if action == "Purchase" then
+			if not catalogEntry.ForSale then
+				return entry, catalogEntry, STORE_STATUS.NotForSale, "sled is not for sale"
+			elseif not isNonNegativeInteger(catalogEntry.Price) then
+				return entry, catalogEntry, STORE_STATUS.InternalError, "catalog price is invalid"
+			elseif entry.Progress.OwnedSleds[sledId] == true then
+				return entry, catalogEntry, STORE_STATUS.AlreadyOwned, nil
+			elseif not isNonNegativeInteger(entry.Progress.FrostCoins) then
+				return entry, catalogEntry, STORE_STATUS.InternalError, "authoritative balance is invalid"
+			elseif entry.Progress.FrostCoins < catalogEntry.Price then
+				return entry, catalogEntry, STORE_STATUS.InsufficientFunds, nil
+			end
+		else
+			if entry.Progress.OwnedSleds[sledId] ~= true then
+				return entry, catalogEntry, STORE_STATUS.NotOwned, nil
+			elseif entry.Progress.EquippedSledId == sledId then
+				return entry, catalogEntry, STORE_STATUS.AlreadyEquipped, nil
+			end
+		end
+
+		if not reservationIsCurrent(validateReservation) then
+			return entry, catalogEntry, STORE_STATUS.Busy, "Store operation reservation changed"
+		end
+		return entry, catalogEntry, nil, nil
+	end
+
+	local entry, _, initialStatus, initialReason = validateContext(false)
+	if initialStatus then
+		return createStoreMutationResult(entry, initialStatus, initialReason)
+	end
+	if not entry then
+		return createStoreMutationResult(nil, STORE_STATUS.InternalError, "validated profile is unavailable")
+	end
+
+	-- This flag synchronously prevents autosave from entering the ordered queue
+	-- between validation and this Store operation's queue acquisition.
+	entry.SavePending = true
+	local queue, token = acquireKeyOperation(entry.Key)
+
+	local currentEntry, catalogEntry, queuedStatus, queuedReason = validateContext(true)
+	if queuedStatus or currentEntry ~= entry or not catalogEntry then
+		releaseKeyOperation(entry.Key, queue, token)
+		entry.SavePending = false
+		return createStoreMutationResult(
+			currentEntry,
+			queuedStatus or STORE_STATUS.StateChanged,
+			queuedReason or "profile changed while waiting for the ordered save queue"
+		)
+	end
+
+	-- The reservation validator above is the final operation before this
+	-- non-yielding candidate construction and coherent live-profile mutation.
+	local candidate = copyProgress(entry.Progress)
+	if action == "Purchase" then
+		candidate.FrostCoins -= catalogEntry.Price
+		candidate.OwnedSleds[sledId] = true
+	else
+		candidate.EquippedSledId = sledId
+	end
+	local capturedRevision = entry.Revision + 1
+	entry.Progress = candidate
+	entry.Revision = capturedRevision
+	entry.Dirty = true
+	entry.StoreSaveUnresolved = true
+
+	local capturedProgress = createFrozenProgressCopy(candidate)
+	local operationSucceeded, saveResult = pcall(function(): SaveAttemptResult
+		return saveWithRetries(entry, capturedProgress, false, "store-" .. string.lower(action))
+	end)
+	releaseKeyOperation(entry.Key, queue, token)
+	entry.SavePending = false
+
+	if operationSucceeded and saveResult.Saved then
+		entry.ConsecutiveSaveFailures = 0
+		entry.LastSavedRevision = math.max(entry.LastSavedRevision, capturedRevision)
+		local currentCandidateMatches = entry.Revision == capturedRevision
+			and profilesMatch(entry.Progress, capturedProgress)
+		if currentCandidateMatches then
+			entry.Dirty = false
+			entry.StoreSaveUnresolved = false
+		end
+		if profiles[player] ~= entry or entry.Generation ~= expectedGeneration then
+			return createStoreMutationResult(nil, STORE_STATUS.StoreUnavailable, "profile changed after Store save")
+		end
+		if not currentCandidateMatches then
+			entry.Dirty = true
+			entry.StoreSaveUnresolved = true
+			return createStoreMutationResult(
+				entry,
+				STORE_STATUS.SavePending,
+				"newer profile data remains unverified after Store save"
+			)
+		end
+		return createStoreMutationResult(entry, STORE_STATUS.Success, nil)
+	end
+
+	entry.ConsecutiveSaveFailures += 1
+	if operationSucceeded and saveResult.UnsafeToSave then
+		markUnsafeToSave(entry, saveResult.Reason)
+		return createStoreMutationResult(entry, STORE_STATUS.PersistenceUnavailable, saveResult.Reason)
+	end
+
+	local failureReason = if operationSucceeded
+		then saveResult.Reason
+		else "Store save worker failed"
+	return createStoreMutationResult(entry, STORE_STATUS.SavePending, failureReason)
+end
+
 local function runAutosave(entry: ProfileSession)
 	if profiles[entry.Player] ~= entry
 		or entry.State ~= "Persistent"
@@ -707,7 +957,7 @@ local function runAutosave(entry: ProfileSession)
 	end
 
 	local capturedRevision = entry.Revision
-	local capturedProgress = table.freeze(copyProgress(entry.Progress))
+	local capturedProgress = createFrozenProgressCopy(entry.Progress)
 	local operationSucceeded, result = pcall(function(): SaveAttemptResult
 		return saveWithRetries(entry, capturedProgress, false, "autosave")
 	end)
@@ -749,8 +999,9 @@ local function runAutosave(entry: ProfileSession)
 
 	entry.ConsecutiveSaveFailures = 0
 	entry.LastSavedRevision = math.max(entry.LastSavedRevision, capturedRevision)
-	if entry.Revision == capturedRevision then
+	if entry.Revision == capturedRevision and profilesMatch(entry.Progress, capturedProgress) then
 		entry.Dirty = false
+		entry.StoreSaveUnresolved = false
 	end
 	if DATA.DiagnosticsEnabled then
 		diagnostic(entry, "autosave-succeeded", string.format("revision=%d", capturedRevision))
@@ -760,6 +1011,7 @@ end
 local function finishRelease(entry: ProfileSession, succeeded: boolean)
 	entry.Saveable = false
 	entry.Dirty = false
+	entry.StoreSaveUnresolved = false
 	entry.State = "Released"
 	entry.ReleaseSucceeded = succeeded
 	entry.ReleaseFinished = true
@@ -791,7 +1043,7 @@ local function performRelease(entry: ProfileSession): boolean
 	entry.State = "Releasing"
 	local queue, token = acquireKeyOperation(entry.Key)
 	local capturedRevision = entry.Revision
-	local capturedProgress = table.freeze(copyProgress(entry.Progress))
+	local capturedProgress = createFrozenProgressCopy(entry.Progress)
 	local operationSucceeded, result = pcall(function(): SaveAttemptResult
 		return saveWithRetries(entry, capturedProgress, true, "final-save")
 	end)
@@ -910,6 +1162,84 @@ function PlayerDataService.getSnapshot(player: Player): ProgressSnapshot?
 		return nil
 	end
 	return createSnapshot(entry)
+end
+
+function PlayerDataService.getStoreSnapshot(player: Player): StoreProfileSnapshot?
+	local entry = profiles[player]
+	if not entry or entry.State == "Released" then
+		return nil
+	end
+	return createStoreProfileSnapshot(entry)
+end
+
+function PlayerDataService.isProfileGenerationCurrent(player: Player, expectedGeneration: number): boolean
+	if shuttingDown or player.Parent ~= Players or not isSafeNonNegativeInteger(expectedGeneration) then
+		return false
+	end
+	local entry = profiles[player]
+	return entry ~= nil
+		and entry.Generation == expectedGeneration
+		and not entry.ReleaseStarted
+		and entry.State ~= "Releasing"
+		and entry.State ~= "Released"
+end
+
+function PlayerDataService.purchaseSledAndSave(
+	player: Player,
+	sledId: string,
+	expectedRevision: number,
+	expectedGeneration: number,
+	validateReservation: ReservationValidator
+): StoreMutationResult
+	return performStoreMutation(
+		player,
+		"Purchase",
+		sledId,
+		expectedRevision,
+		expectedGeneration,
+		validateReservation
+	)
+end
+
+function PlayerDataService.equipSledAndSave(
+	player: Player,
+	sledId: string,
+	expectedRevision: number,
+	expectedGeneration: number,
+	validateReservation: ReservationValidator
+): StoreMutationResult
+	return performStoreMutation(
+		player,
+		"Equip",
+		sledId,
+		expectedRevision,
+		expectedGeneration,
+		validateReservation
+	)
+end
+
+function PlayerDataService.getEquippedSledId(player: Player): string?
+	local entry = profiles[player]
+	if shuttingDown
+		or player.Parent ~= Players
+		or not entry
+		or entry.State ~= "Persistent"
+		or not entry.Saveable
+		or entry.ReleaseStarted
+		or entry.StoreSaveUnresolved
+	then
+		return nil
+	end
+	return normalizeEquippedSledId(entry.Progress.EquippedSledId, entry.Progress.OwnedSleds)
+end
+
+function PlayerDataService.hasUnresolvedStoreSave(player: Player): boolean
+	local entry = profiles[player]
+	return entry ~= nil and entry.StoreSaveUnresolved
+end
+
+function PlayerDataService.isShuttingDown(): boolean
+	return shuttingDown
 end
 
 function PlayerDataService.applyRunReward(
