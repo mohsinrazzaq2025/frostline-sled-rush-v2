@@ -12,4 +12,17 @@ RunController.start()
 VFXController.start()
 ResultController.start()
 
+local cameraStarted, cameraFailure = pcall(function()
+	local CameraController = require(script.Parent.Controllers.CameraController)
+	CameraController.start()
+end)
+if not cameraStarted then
+	warn(
+		string.format(
+			"[Frostline] CameraController failed to start; using Roblox camera: %s",
+			tostring(cameraFailure)
+		)
+	)
+end
+
 print("[Frostline] Client bootstrap complete")
