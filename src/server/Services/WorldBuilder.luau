@@ -20,6 +20,53 @@ local START_CHUTE_BEND_RAISE = 0.25
 local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
 local START_PAD_THICKNESS = 0.12
 local START_PAD_SURFACE_GAP = 0.01
+local MILESTONE_SURFACE_GAP = 0.03
+local MINOR_MILESTONE_COLOR = Color3.fromRGB(83, 210, 238)
+local MILESTONE_STROKE_COLOR = Color3.fromRGB(11, 27, 48)
+
+type MajorMilestoneStyle = {
+	AccentColor: Color3,
+	BandSize: Vector3,
+	BandTransparency: number,
+	BeaconSize: Vector3,
+	BeaconTransparency: number,
+	LabelText: string,
+	LabelSize: Vector2,
+	LabelMaxDistance: number,
+}
+
+local MAJOR_MILESTONE_STYLES: { [number]: MajorMilestoneStyle } = {
+	[500] = {
+		AccentColor = Color3.fromRGB(72, 220, 255),
+		BandSize = Vector3.new(WORLD.LandingWidth - 16, 0.12, 3.5),
+		BandTransparency = 0.28,
+		BeaconSize = Vector3.new(2, 16, 2),
+		BeaconTransparency = 0.18,
+		LabelText = "500 m",
+		LabelSize = Vector2.new(180, 60),
+		LabelMaxDistance = 260,
+	},
+	[1000] = {
+		AccentColor = Color3.fromRGB(174, 120, 255),
+		BandSize = Vector3.new(WORLD.LandingWidth - 10, 0.14, 5),
+		BandTransparency = 0.22,
+		BeaconSize = Vector3.new(2.4, 21, 2.4),
+		BeaconTransparency = 0.12,
+		LabelText = "1 KM",
+		LabelSize = Vector2.new(210, 70),
+		LabelMaxDistance = 300,
+	},
+	[1500] = {
+		AccentColor = Color3.fromRGB(255, 205, 92),
+		BandSize = Vector3.new(WORLD.LandingWidth - 4, 0.16, 6.5),
+		BandTransparency = 0.16,
+		BeaconSize = Vector3.new(2.8, 26, 2.8),
+		BeaconTransparency = 0.08,
+		LabelText = "1.5 KM",
+		LabelSize = Vector2.new(240, 80),
+		LabelMaxDistance = 340,
+	},
+}
 
 local function disableTemplatePart(name: string)
 	local templatePart = Workspace:FindFirstChild(name)
@@ -364,57 +411,174 @@ local function createStartArch(parent: Instance)
 	label.Parent = surfaceGui
 end
 
-local function createDistanceMarker(parent: Instance, zPosition: number, metres: number, color: Color3)
-	local isMilestone = metres % 500 == 0
-	local band = createPart(
-		parent,
-		string.format("DistanceBand_%03dm_Center", metres),
-		Vector3.new(272, 0.16, 7),
-		CFrame.new(0, 0.08, zPosition),
-		color,
-		Enum.Material.Neon,
-		false
-	)
-	band.Transparency = 0.22
-	band.CanTouch = false
+local function setMilestoneAttributes(instance: Instance, metres: number)
+	instance:SetAttribute("DistanceMeters", metres)
+	instance:SetAttribute("VisualOnly", true)
+end
 
+local function createMilestonePart(
+	parent: Instance,
+	name: string,
+	size: Vector3,
+	cframe: CFrame,
+	color: Color3,
+	transparency: number,
+	metres: number
+): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Color = color
+	part.Material = Enum.Material.Neon
+	part.Transparency = transparency
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	setMilestoneAttributes(part, metres)
+	part.Parent = parent
+	return part
+end
+
+local function createMilestoneLabel(
+	parent: BasePart,
+	name: string,
+	text: string,
+	color: Color3,
+	size: Vector2,
+	worldOffset: Vector3,
+	maxDistance: number,
+	font: Enum.Font,
+	metres: number
+)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = name
+	billboard.Size = UDim2.fromOffset(size.X, size.Y)
+	billboard.StudsOffsetWorldSpace = worldOffset
+	billboard.MaxDistance = maxDistance
+	billboard.AlwaysOnTop = false
+	setMilestoneAttributes(billboard, metres)
+	billboard.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Text"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = font
+	label.Text = text
+	label.TextColor3 = color
+	label.TextScaled = true
+	label.TextStrokeColor3 = MILESTONE_STROKE_COLOR
+	label.TextStrokeTransparency = 0.12
+	setMilestoneAttributes(label, metres)
+	label.Parent = billboard
+end
+
+local function createMilestoneContainer(parent: Instance, metres: number, tierName: string): Folder
+	local container = Instance.new("Folder")
+	container.Name = string.format("Milestone_%04dm_%s", metres, tierName)
+	setMilestoneAttributes(container, metres)
+	container.Parent = parent
+	return container
+end
+
+local function createMinorMilestone(parent: Instance, zPosition: number, metres: number)
+	local container = createMilestoneContainer(parent, metres, "Minor")
+	local bandHeight = 0.08
+	local band = createMilestonePart(
+		container,
+		string.format("Band_%04dm", metres),
+		Vector3.new(WORLD.LandingWidth - 28, bandHeight, 1.4),
+		CFrame.new(0, WORLD.LandingTopY + MILESTONE_SURFACE_GAP + bandHeight * 0.5, zPosition),
+		MINOR_MILESTONE_COLOR,
+		0.5,
+		metres
+	)
+	createMilestoneLabel(
+		band,
+		string.format("Label_%04dm", metres),
+		string.format("%d m", metres),
+		MINOR_MILESTONE_COLOR,
+		Vector2.new(96, 34),
+		Vector3.new(WORLD.LandingWidth * 0.34, 6, 0),
+		120,
+		Enum.Font.GothamBold,
+		metres
+	)
+end
+
+local function createMajorMilestone(
+	parent: Instance,
+	zPosition: number,
+	metres: number,
+	style: MajorMilestoneStyle
+)
+	local container = createMilestoneContainer(parent, metres, "Major")
+	createMilestonePart(
+		container,
+		string.format("Band_%04dm", metres),
+		style.BandSize,
+		CFrame.new(
+			0,
+		WORLD.LandingTopY + MILESTONE_SURFACE_GAP + style.BandSize.Y * 0.5,
+			zPosition
+		),
+		style.AccentColor,
+		style.BandTransparency,
+		metres
+	)
+
+	local rightBeacon: Part? = nil
+	local beaconOffset = WORLD.LandingWidth * 0.5 - 7
 	for _, side in ipairs({ -1, 1 }) do
 		local sideName = if side == -1 then "Left" else "Right"
-		local post = createPart(
-			parent,
-			string.format("DistancePost_%03dm_%s", metres, sideName),
-			Vector3.new(3, 14, 3),
-			CFrame.new(side * 126, 7, zPosition),
-			if isMilestone then PALETTE.Gold else PALETTE.IceDeep,
-			Enum.Material.SmoothPlastic,
-			false
+		local beacon = createMilestonePart(
+			container,
+			string.format("Beacon_%04dm_%s", metres, sideName),
+			style.BeaconSize,
+			CFrame.new(
+				side * beaconOffset,
+				WORLD.LandingTopY + MILESTONE_SURFACE_GAP + style.BeaconSize.Y * 0.5,
+				zPosition
+			),
+			style.AccentColor,
+			style.BeaconTransparency,
+			metres
 		)
-		post.CanTouch = false
-
 		if side == 1 then
-			local billboard = Instance.new("BillboardGui")
-			billboard.Name = string.format("DistanceBillboard_%03dm_Right", metres)
-			billboard.Size = UDim2.fromOffset(100, 38)
-			billboard.StudsOffset = Vector3.new(0, 9, 0)
-			billboard.MaxDistance = 220
-			billboard.AlwaysOnTop = true
-			billboard.Parent = post
+			rightBeacon = beacon
+		end
+	end
 
-			local label = Instance.new("TextLabel")
-			label.Name = string.format("DistanceLabel_%03dm_Right", metres)
-			label.Size = UDim2.fromScale(1, 1)
-			label.BackgroundColor3 = Color3.fromRGB(18, 35, 58)
-			label.BackgroundTransparency = 0.16
-			label.Font = Enum.Font.GothamBold
-			label.Text = string.format("%dm", metres)
-			label.TextColor3 = PALETTE.White
-			label.TextScaled = true
-			label.Parent = billboard
+	local labelBeacon = rightBeacon
+	if not labelBeacon then
+		error(string.format("Missing right beacon for %dm milestone", metres))
+	end
+	createMilestoneLabel(
+		labelBeacon,
+		string.format("Label_%04dm", metres),
+		style.LabelText,
+		style.AccentColor,
+		style.LabelSize,
+		Vector3.new(0, style.BeaconSize.Y * 0.5 + 4, 0),
+		style.LabelMaxDistance,
+		Enum.Font.GothamBlack,
+		metres
+	)
+end
 
-			local corner = Instance.new("UICorner")
-			corner.Name = string.format("DistanceCorner_%03dm_Right", metres)
-			corner.CornerRadius = UDim.new(0, 9)
-			corner.Parent = label
+local function buildDistanceMilestones(parent: Instance, launchZ: number)
+	for metres = 100, WORLD.LandingMarkedDistanceMeters, 100 do
+		local zPosition = launchZ + metres * WORLD.StudsPerMeter
+		local majorStyle = MAJOR_MILESTONE_STYLES[metres]
+		if majorStyle then
+			createMajorMilestone(parent, zPosition, metres, majorStyle)
+		else
+			createMinorMilestone(parent, zPosition, metres)
 		end
 	end
 end
@@ -558,7 +722,7 @@ local function buildSummit(geometry: Folder, decor: Folder)
 	createStartArch(decor)
 end
 
-local function buildLandingField(geometry: Folder, decor: Folder, markers: Folder)
+local function buildLandingField(geometry: Folder, decor: Folder, milestones: Folder)
 	local launchZ = WORLD.PathPoints[#WORLD.PathPoints].Z
 	local markedEndZ = launchZ + WORLD.LandingMarkedDistanceMeters * WORLD.StudsPerMeter
 	local landingEndZ = markedEndZ + WORLD.LandingRunoffDistanceMeters * WORLD.StudsPerMeter
@@ -617,14 +781,7 @@ local function buildLandingField(geometry: Folder, decor: Folder, markers: Folde
 	createLakeSegment("FrozenLakeMarked_0000m_1500m", launchZ, markedEndZ + halfOverlap)
 	createLakeSegment("FrozenLakeRunoff_1500m_1800m", markedEndZ - halfOverlap, landingEndZ)
 
-	for metres = 100, WORLD.LandingMarkedDistanceMeters, 100 do
-		local markerIndex = metres / 100
-		local zPosition = launchZ + metres * WORLD.StudsPerMeter
-		local color = if metres % 500 == 0
-			then PALETTE.Gold
-			else Color3.fromRGB(83, math.max(80, 198 - markerIndex * 9), 224)
-		createDistanceMarker(markers, zPosition, metres, color)
-	end
+	buildDistanceMilestones(milestones, launchZ)
 
 	local landingTreeCount = math.max(16, math.floor((landingEndZ - 470) / 43))
 	for index = 1, landingTreeCount do
@@ -662,7 +819,17 @@ function WorldBuilder.build()
 	markers.Name = "Markers"
 	markers.Parent = world
 
-	buildLandingField(geometry, decor, markers)
+	local presentation = Instance.new("Folder")
+	presentation.Name = "Presentation"
+	presentation:SetAttribute("VisualOnly", true)
+	presentation.Parent = world
+
+	local frozenLakeMilestones = Instance.new("Folder")
+	frozenLakeMilestones.Name = "FrozenLakeMilestones"
+	frozenLakeMilestones:SetAttribute("VisualOnly", true)
+	frozenLakeMilestones.Parent = presentation
+
+	buildLandingField(geometry, decor, frozenLakeMilestones)
 	buildSummit(geometry, decor)
 	buildCourse(world, geometry, decor, markers)
 
