@@ -10,6 +10,17 @@ local WORLD = GameConfig.World
 local PHYSICS = GameConfig.Physics
 local PALETTE = GameConfig.Palette
 local RUN = GameConfig.Run
+local LEADERBOARD = GameConfig.Leaderboard
+local LEADERBOARD_BOARD = LEADERBOARD.Board
+local LEADERBOARD_DEEP_NAVY = Color3.fromRGB(6, 22, 43)
+local LEADERBOARD_DARK_NAVY = Color3.fromRGB(11, 31, 58)
+local LEADERBOARD_ROW_NAVY_A = Color3.fromRGB(9, 37, 58)
+local LEADERBOARD_ROW_NAVY_B = Color3.fromRGB(7, 31, 50)
+local LEADERBOARD_ICE_CYAN = Color3.fromRGB(115, 232, 255)
+local LEADERBOARD_PALE_CYAN = Color3.fromRGB(180, 231, 247)
+local LEADERBOARD_SNOW_WHITE = Color3.fromRGB(245, 251, 255)
+local LEADERBOARD_GOLD = Color3.fromRGB(255, 212, 90)
+local LEADERBOARD_TEXT_STROKE = Color3.fromRGB(6, 24, 44)
 
 local WorldBuilder = {}
 
@@ -409,6 +420,464 @@ local function createStartArch(parent: Instance)
 	label.TextColor3 = PALETTE.White
 	label.TextScaled = true
 	label.Parent = surfaceGui
+end
+
+local function createLeaderboardLabel(
+	parent: Instance,
+	name: string,
+	text: string,
+	position: UDim2,
+	size: UDim2,
+	textSize: number,
+	font: Enum.Font,
+	color: Color3,
+	alignment: Enum.TextXAlignment
+): TextLabel
+	local label = Instance.new("TextLabel")
+	label.Name = name
+	label.Position = position
+	label.Size = size
+	label.BackgroundTransparency = 1
+	label.BorderSizePixel = 0
+	label.Font = font
+	label.Text = text
+	label.TextColor3 = color
+	label.TextScaled = false
+	label.TextSize = textSize
+	label.TextWrapped = false
+	label.TextStrokeColor3 = LEADERBOARD_TEXT_STROKE
+	label.TextStrokeTransparency = 0.35
+	label.TextTruncate = Enum.TextTruncate.None
+	label.TextXAlignment = alignment
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.ZIndex = 10
+	label.Active = false
+	label.Selectable = false
+	label.Parent = parent
+	return label
+end
+
+local function buildLeaderboardBoard(presentation: Folder, geometry: Folder)
+	local summitPlatform = geometry:FindFirstChild("SummitPlatform")
+	if not summitPlatform or not summitPlatform:IsA("BasePart") then
+		error("Missing SummitPlatform for Frozen Lake leaderboard placement")
+	end
+
+	local playerSpawn = geometry:FindFirstChild("PlayerSpawn")
+	if not playerSpawn or not playerSpawn:IsA("BasePart") then
+		error("Missing PlayerSpawn for Frozen Lake leaderboard orientation")
+	end
+
+	local leaderboards = Instance.new("Folder")
+	leaderboards.Name = LEADERBOARD_BOARD.FolderName
+	leaderboards:SetAttribute("VisualOnly", true)
+	leaderboards.Parent = presentation
+
+	local boardModel = Instance.new("Model")
+	boardModel.Name = LEADERBOARD_BOARD.ModelName
+	boardModel:SetAttribute("BoardId", LEADERBOARD.BoardId)
+	boardModel:SetAttribute("CourseId", LEADERBOARD.CourseId)
+	boardModel:SetAttribute("VisualOnly", true)
+	boardModel.Parent = leaderboards
+
+	local boardPosition = summitPlatform.CFrame:PointToWorldSpace(LEADERBOARD_BOARD.LocalPosition)
+	local horizontalSpawnTarget = Vector3.new(playerSpawn.Position.X, boardPosition.Y, playerSpawn.Position.Z)
+	local backboard = createPart(
+		boardModel,
+		LEADERBOARD_BOARD.BackboardName,
+		LEADERBOARD_BOARD.Size,
+		CFrame.lookAt(boardPosition, horizontalSpawnTarget, Vector3.yAxis),
+		Color3.fromRGB(7, 14, 24),
+		Enum.Material.SmoothPlastic,
+		false
+	)
+	backboard.CanTouch = false
+	backboard.CanQuery = false
+	backboard.CastShadow = false
+	backboard:SetAttribute("VisualOnly", true)
+	boardModel.PrimaryPart = backboard
+
+	local surfaceGui = Instance.new("SurfaceGui")
+	surfaceGui.Name = LEADERBOARD_BOARD.SurfaceGuiName
+	surfaceGui.Face = Enum.NormalId.Front
+	surfaceGui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	surfaceGui.PixelsPerStud = LEADERBOARD_BOARD.PixelsPerStud
+	surfaceGui.AlwaysOnTop = false
+	surfaceGui.LightInfluence = 0
+	surfaceGui.Active = false
+	surfaceGui:SetAttribute("VisualOnly", true)
+	surfaceGui.Parent = backboard
+
+	local content = Instance.new("Frame")
+	content.Name = "Content"
+	content.Position = UDim2.fromOffset(0, 0)
+	content.Size = UDim2.fromOffset(1200, 800)
+	content.BackgroundColor3 = LEADERBOARD_DEEP_NAVY
+	content.BorderSizePixel = 0
+	content.ClipsDescendants = true
+	content.Active = false
+	content.Selectable = false
+	content.Parent = surfaceGui
+
+	local contentCorner = Instance.new("UICorner")
+	contentCorner.Name = "Corner"
+	contentCorner.CornerRadius = UDim.new(0, 18)
+	contentCorner.Parent = content
+
+	local themeDecor = Instance.new("Frame")
+	themeDecor.Name = "ThemeDecor"
+	themeDecor.Position = UDim2.fromOffset(0, 0)
+	themeDecor.Size = UDim2.fromOffset(1200, 800)
+	themeDecor.BackgroundTransparency = 1
+	themeDecor.BorderSizePixel = 0
+	themeDecor.ClipsDescendants = true
+	themeDecor.Active = false
+	themeDecor.Selectable = false
+	themeDecor.ZIndex = 0
+	themeDecor.Parent = content
+
+	local themeBase = Instance.new("Frame")
+	themeBase.Name = "Base"
+	themeBase.Position = UDim2.fromOffset(0, 0)
+	themeBase.Size = UDim2.fromOffset(1200, 800)
+	themeBase.BackgroundColor3 = LEADERBOARD_DEEP_NAVY
+	themeBase.BackgroundTransparency = 0
+	themeBase.BorderSizePixel = 0
+	themeBase.Active = false
+	themeBase.Selectable = false
+	themeBase.ZIndex = 0
+	themeBase.Parent = themeDecor
+
+	-- Keep the border subtree below SnowCapClip under the existing sibling
+	-- ZIndex behavior, while retaining the specified local border layers.
+	local borderLayer = Instance.new("Frame")
+	borderLayer.Name = "BorderLayer"
+	borderLayer.Position = UDim2.fromOffset(0, 0)
+	borderLayer.Size = UDim2.fromOffset(1200, 800)
+	borderLayer.BackgroundTransparency = 1
+	borderLayer.BorderSizePixel = 0
+	borderLayer.Active = false
+	borderLayer.Selectable = false
+	borderLayer.ZIndex = 0
+	borderLayer.Parent = themeDecor
+
+	local outerBorder = Instance.new("Frame")
+	outerBorder.Name = "OuterBorder"
+	outerBorder.Position = UDim2.fromOffset(6, 6)
+	outerBorder.Size = UDim2.fromOffset(1188, 788)
+	outerBorder.BackgroundTransparency = 1
+	outerBorder.BorderSizePixel = 0
+	outerBorder.Active = false
+	outerBorder.Selectable = false
+	outerBorder.ZIndex = 4
+	outerBorder.Parent = borderLayer
+
+	local outerBorderCorner = Instance.new("UICorner")
+	outerBorderCorner.Name = "Corner"
+	outerBorderCorner.CornerRadius = UDim.new(0, 24)
+	outerBorderCorner.Parent = outerBorder
+
+	local outerBorderStroke = Instance.new("UIStroke")
+	outerBorderStroke.Name = "Stroke"
+	outerBorderStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	outerBorderStroke.Color = LEADERBOARD_ICE_CYAN
+	outerBorderStroke.Thickness = 6
+	outerBorderStroke.Transparency = 0.12
+	outerBorderStroke.Parent = outerBorder
+
+	local innerHighlight = Instance.new("Frame")
+	innerHighlight.Name = "InnerHighlight"
+	innerHighlight.Position = UDim2.fromOffset(13, 13)
+	innerHighlight.Size = UDim2.fromOffset(1174, 774)
+	innerHighlight.BackgroundTransparency = 1
+	innerHighlight.BorderSizePixel = 0
+	innerHighlight.Active = false
+	innerHighlight.Selectable = false
+	innerHighlight.ZIndex = 3
+	innerHighlight.Parent = borderLayer
+
+	local innerHighlightCorner = Instance.new("UICorner")
+	innerHighlightCorner.Name = "Corner"
+	innerHighlightCorner.CornerRadius = UDim.new(0, 18)
+	innerHighlightCorner.Parent = innerHighlight
+
+	local innerHighlightStroke = Instance.new("UIStroke")
+	innerHighlightStroke.Name = "Stroke"
+	innerHighlightStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	innerHighlightStroke.Color = LEADERBOARD_SNOW_WHITE
+	innerHighlightStroke.Thickness = 2
+	innerHighlightStroke.Transparency = 0.62
+	innerHighlightStroke.Parent = innerHighlight
+
+	local snowCapClip = Instance.new("Frame")
+	snowCapClip.Name = "SnowCapClip"
+	snowCapClip.Position = UDim2.fromOffset(0, 0)
+	snowCapClip.Size = UDim2.fromOffset(1200, 18)
+	snowCapClip.BackgroundTransparency = 1
+	snowCapClip.BorderSizePixel = 0
+	snowCapClip.ClipsDescendants = true
+	snowCapClip.Active = false
+	snowCapClip.Selectable = false
+	snowCapClip.ZIndex = 1
+	snowCapClip.Parent = themeDecor
+
+	local snowTopStrip = Instance.new("Frame")
+	snowTopStrip.Name = "TopStrip"
+	snowTopStrip.Position = UDim2.fromOffset(18, 0)
+	snowTopStrip.Size = UDim2.fromOffset(1164, 6)
+	snowTopStrip.BackgroundColor3 = LEADERBOARD_SNOW_WHITE
+	snowTopStrip.BackgroundTransparency = 0
+	snowTopStrip.BorderSizePixel = 0
+	snowTopStrip.Active = false
+	snowTopStrip.Selectable = false
+	snowTopStrip.ZIndex = 1
+	snowTopStrip.Parent = snowCapClip
+
+	local snowScallop01 = Instance.new("Frame")
+	snowScallop01.Name = "Scallop_01"
+	snowScallop01.Position = UDim2.fromOffset(158, -40)
+	snowScallop01.Size = UDim2.fromOffset(56, 56)
+	snowScallop01.BackgroundColor3 = LEADERBOARD_SNOW_WHITE
+	snowScallop01.BackgroundTransparency = 0
+	snowScallop01.BorderSizePixel = 0
+	snowScallop01.Active = false
+	snowScallop01.Selectable = false
+	snowScallop01.ZIndex = 1
+	snowScallop01.Parent = snowCapClip
+
+	local snowScallop01Corner = Instance.new("UICorner")
+	snowScallop01Corner.Name = "Corner"
+	snowScallop01Corner.CornerRadius = UDim.new(1, 0)
+	snowScallop01Corner.Parent = snowScallop01
+
+	local snowScallop02 = Instance.new("Frame")
+	snowScallop02.Name = "Scallop_02"
+	snowScallop02.Position = UDim2.fromOffset(434, -40)
+	snowScallop02.Size = UDim2.fromOffset(56, 56)
+	snowScallop02.BackgroundColor3 = LEADERBOARD_SNOW_WHITE
+	snowScallop02.BackgroundTransparency = 0
+	snowScallop02.BorderSizePixel = 0
+	snowScallop02.Active = false
+	snowScallop02.Selectable = false
+	snowScallop02.ZIndex = 1
+	snowScallop02.Parent = snowCapClip
+
+	local snowScallop02Corner = Instance.new("UICorner")
+	snowScallop02Corner.Name = "Corner"
+	snowScallop02Corner.CornerRadius = UDim.new(1, 0)
+	snowScallop02Corner.Parent = snowScallop02
+
+	local snowScallop03 = Instance.new("Frame")
+	snowScallop03.Name = "Scallop_03"
+	snowScallop03.Position = UDim2.fromOffset(710, -40)
+	snowScallop03.Size = UDim2.fromOffset(56, 56)
+	snowScallop03.BackgroundColor3 = LEADERBOARD_SNOW_WHITE
+	snowScallop03.BackgroundTransparency = 0
+	snowScallop03.BorderSizePixel = 0
+	snowScallop03.Active = false
+	snowScallop03.Selectable = false
+	snowScallop03.ZIndex = 1
+	snowScallop03.Parent = snowCapClip
+
+	local snowScallop03Corner = Instance.new("UICorner")
+	snowScallop03Corner.Name = "Corner"
+	snowScallop03Corner.CornerRadius = UDim.new(1, 0)
+	snowScallop03Corner.Parent = snowScallop03
+
+	local snowScallop04 = Instance.new("Frame")
+	snowScallop04.Name = "Scallop_04"
+	snowScallop04.Position = UDim2.fromOffset(986, -40)
+	snowScallop04.Size = UDim2.fromOffset(56, 56)
+	snowScallop04.BackgroundColor3 = LEADERBOARD_SNOW_WHITE
+	snowScallop04.BackgroundTransparency = 0
+	snowScallop04.BorderSizePixel = 0
+	snowScallop04.Active = false
+	snowScallop04.Selectable = false
+	snowScallop04.ZIndex = 1
+	snowScallop04.Parent = snowCapClip
+
+	local snowScallop04Corner = Instance.new("UICorner")
+	snowScallop04Corner.Name = "Corner"
+	snowScallop04Corner.CornerRadius = UDim.new(1, 0)
+	snowScallop04Corner.Parent = snowScallop04
+
+	createLeaderboardLabel(
+		content,
+		"Title",
+		"GLOBAL TOP 10",
+		UDim2.fromOffset(48, 28),
+		UDim2.fromOffset(1104, 76),
+		72,
+		Enum.Font.GothamBlack,
+		LEADERBOARD_SNOW_WHITE,
+		Enum.TextXAlignment.Center
+	)
+
+	createLeaderboardLabel(
+		content,
+		"Subtitle",
+		"FROZEN LAKE DISTANCE",
+		UDim2.fromOffset(48, 104),
+		UDim2.fromOffset(1104, 42),
+		36,
+		Enum.Font.GothamBold,
+		LEADERBOARD_PALE_CYAN,
+		Enum.TextXAlignment.Center
+	)
+
+	local divider = Instance.new("Frame")
+	divider.Name = "Divider"
+	divider.Position = UDim2.fromOffset(48, 158)
+	divider.Size = UDim2.fromOffset(1104, 3)
+	divider.BackgroundColor3 = LEADERBOARD_ICE_CYAN
+	divider.BackgroundTransparency = 0.08
+	divider.BorderSizePixel = 0
+	divider.Active = false
+	divider.Selectable = false
+	divider.ZIndex = 4
+	divider.Parent = content
+
+	local header = Instance.new("Frame")
+	header.Name = "Header"
+	header.Position = UDim2.fromOffset(48, 170)
+	header.Size = UDim2.fromOffset(1104, 38)
+	header.BackgroundColor3 = LEADERBOARD_DARK_NAVY
+	header.BackgroundTransparency = 0.12
+	header.BorderSizePixel = 0
+	header.Visible = false
+	header.Active = false
+	header.Selectable = false
+	header.ZIndex = 2
+	header.Parent = content
+
+	local headerCorner = Instance.new("UICorner")
+	headerCorner.Name = "Corner"
+	headerCorner.CornerRadius = UDim.new(0, 8)
+	headerCorner.Parent = header
+
+	createLeaderboardLabel(
+		header,
+		"Rank",
+		"RANK",
+		UDim2.fromOffset(16, 0),
+		UDim2.fromOffset(96, 38),
+		30,
+		Enum.Font.GothamBold,
+		LEADERBOARD_SNOW_WHITE,
+		Enum.TextXAlignment.Left
+	)
+	createLeaderboardLabel(
+		header,
+		"PlayerName",
+		"PLAYER",
+		UDim2.fromOffset(128, 0),
+		UDim2.fromOffset(650, 38),
+		30,
+		Enum.Font.GothamBold,
+		LEADERBOARD_SNOW_WHITE,
+		Enum.TextXAlignment.Left
+	)
+	createLeaderboardLabel(
+		header,
+		"Distance",
+		"DISTANCE",
+		UDim2.fromOffset(792, 0),
+		UDim2.fromOffset(296, 38),
+		30,
+		Enum.Font.GothamBold,
+		LEADERBOARD_SNOW_WHITE,
+		Enum.TextXAlignment.Right
+	)
+
+	local rows = Instance.new("Frame")
+	rows.Name = "Rows"
+	rows.Position = UDim2.fromOffset(48, 216)
+	rows.Size = UDim2.fromOffset(1104, 536)
+	rows.BackgroundTransparency = 1
+	rows.BorderSizePixel = 0
+	rows.Active = false
+	rows.Selectable = false
+	rows.ZIndex = 2
+	rows.Parent = content
+
+	for index = 1, LEADERBOARD.PageSize do
+		local row = Instance.new("Frame")
+		row.Name = string.format("Row_%02d", index)
+		row.Position = UDim2.fromOffset(0, (index - 1) * 54)
+		row.Size = UDim2.fromOffset(1104, 50)
+		row.BackgroundColor3 = if index % 2 == 1
+			then LEADERBOARD_ROW_NAVY_A
+			else LEADERBOARD_ROW_NAVY_B
+		row.BackgroundTransparency = 0.18
+		row.BorderSizePixel = 0
+		row.Visible = false
+		row.Active = false
+		row.Selectable = false
+		row.ZIndex = 2
+		row.Parent = rows
+
+		local rowCorner = Instance.new("UICorner")
+		rowCorner.Name = "Corner"
+		rowCorner.CornerRadius = UDim.new(0, 7)
+		rowCorner.Parent = row
+
+		local rowStroke = Instance.new("UIStroke")
+		rowStroke.Name = "ThemeStroke"
+		rowStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		rowStroke.Color = LEADERBOARD_ICE_CYAN
+		rowStroke.Thickness = 1
+		rowStroke.Transparency = 0.72
+		rowStroke.Parent = row
+
+		createLeaderboardLabel(
+			row,
+			"Rank",
+			"",
+			UDim2.fromOffset(16, 0),
+			UDim2.fromOffset(96, 50),
+			34,
+			Enum.Font.GothamMedium,
+			if index == 1 then LEADERBOARD_GOLD else LEADERBOARD_ICE_CYAN,
+			Enum.TextXAlignment.Left
+		)
+		local usernameLabel = createLeaderboardLabel(
+			row,
+			"PlayerName",
+			"",
+			UDim2.fromOffset(128, 0),
+			UDim2.fromOffset(650, 50),
+			34,
+			Enum.Font.GothamMedium,
+			LEADERBOARD_SNOW_WHITE,
+			Enum.TextXAlignment.Left
+		)
+		usernameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+		createLeaderboardLabel(
+			row,
+			"Distance",
+			"",
+			UDim2.fromOffset(792, 0),
+			UDim2.fromOffset(296, 50),
+			38,
+			Enum.Font.GothamBold,
+			LEADERBOARD_PALE_CYAN,
+			Enum.TextXAlignment.Right
+		)
+	end
+
+	local status = createLeaderboardLabel(
+		content,
+		"Status",
+		"LOADING LEADERBOARD",
+		UDim2.fromOffset(90, 246),
+		UDim2.fromOffset(1020, 260),
+		56,
+		Enum.Font.GothamBold,
+		LEADERBOARD_PALE_CYAN,
+		Enum.TextXAlignment.Center
+	)
+	status.TextWrapped = true
+	status.ZIndex = 20
 end
 
 local function setMilestoneAttributes(instance: Instance, metres: number)
@@ -831,6 +1300,7 @@ function WorldBuilder.build()
 
 	buildLandingField(geometry, decor, frozenLakeMilestones)
 	buildSummit(geometry, decor)
+	buildLeaderboardBoard(presentation, geometry)
 	buildCourse(world, geometry, decor, markers)
 
 	print(string.format("[Frostline] V2 world generated (%d geometry parts)", #geometry:GetChildren()))

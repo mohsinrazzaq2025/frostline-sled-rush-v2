@@ -31,6 +31,7 @@ type CatalogEntry = StoreTypes.CatalogEntry
 type LoadState = "Loading" | "Persistent" | "SessionOnly" | "Releasing" | "Released"
 type StoreMutationAction = "Purchase" | "Equip"
 type ReservationValidator = () -> boolean
+type VerifiedBestObserver = (userId: number, verifiedBestDistance: number) -> ()
 
 export type StoreProfileSnapshot = {
 	Generation: number,
@@ -121,6 +122,8 @@ local profiles: { [Player]: ProfileSession } = {}
 local keyOperationQueues: { [string]: KeyOperationQueue } = {}
 local removalCoordinated: { [Player]: boolean } = {}
 local beforePlayerRelease: BeforePlayerRelease? = nil
+local verifiedBestObserver: VerifiedBestObserver? = nil
+local verifiedBestObserverFailureWarned = false
 local started = false
 local shuttingDown = false
 local latestProfileGeneration = 0
@@ -135,6 +138,26 @@ end
 
 local function isSafeNonNegativeInteger(value: any): boolean
 	return isNonNegativeInteger(value) and value <= MAXIMUM_SAFE_INTEGER
+end
+
+local function dispatchVerifiedBest(userId: number, verifiedBestDistance: number)
+	local observer = verifiedBestObserver
+	if not observer
+		or not isSafeNonNegativeInteger(userId)
+		or userId <= 0
+		or not isFiniteNumber(verifiedBestDistance)
+		or verifiedBestDistance <= 0
+	then
+		return
+	end
+
+	task.defer(function()
+		local succeeded, failureReason = pcall(observer, userId, verifiedBestDistance)
+		if not succeeded and not verifiedBestObserverFailureWarned then
+			verifiedBestObserverFailureWarned = true
+			warn(string.format("[Frostline][Data] Verified-best observer failed reason=%s", tostring(failureReason)))
+		end
+	end)
 end
 
 local function createDefaultOwnedSleds(): OwnedSleds
@@ -520,13 +543,15 @@ local function loadEntry(entry: ProfileSession)
 		return
 	end
 	if operationSucceeded and result.Loaded and result.Progress then
-		entry.Progress = result.Progress
+		local verifiedProgress = result.Progress
+		entry.Progress = verifiedProgress
 		entry.State = "Persistent"
 		entry.Saveable = true
 		entry.Dirty = false
 		entry.Revision = 0
 		entry.LastSavedRevision = 0
 		entry.StoreSaveUnresolved = false
+		dispatchVerifiedBest(entry.Player.UserId, verifiedProgress.BestDistance)
 	else
 		local failureReason = if operationSucceeded then result.Reason else tostring(result)
 		local playerStillActive = entry.Player.Parent == Players and not entry.ReleaseStarted and not shuttingDown
@@ -908,6 +933,7 @@ local function performStoreMutation(
 			entry.Dirty = false
 			entry.StoreSaveUnresolved = false
 		end
+		dispatchVerifiedBest(player.UserId, capturedProgress.BestDistance)
 		if profiles[player] ~= entry or entry.Generation ~= expectedGeneration then
 			return createStoreMutationResult(nil, STORE_STATUS.StoreUnavailable, "profile changed after Store save")
 		end
@@ -965,6 +991,9 @@ local function runAutosave(entry: ProfileSession)
 	entry.SavePending = false
 
 	if profiles[entry.Player] ~= entry or entry.State == "Released" then
+		if operationSucceeded and result.Saved then
+			dispatchVerifiedBest(entry.Player.UserId, capturedProgress.BestDistance)
+		end
 		return
 	end
 	if not operationSucceeded then
@@ -1006,6 +1035,7 @@ local function runAutosave(entry: ProfileSession)
 	if DATA.DiagnosticsEnabled then
 		diagnostic(entry, "autosave-succeeded", string.format("revision=%d", capturedRevision))
 	end
+	dispatchVerifiedBest(entry.Player.UserId, capturedProgress.BestDistance)
 end
 
 local function finishRelease(entry: ProfileSession, succeeded: boolean)
@@ -1076,6 +1106,9 @@ local function performRelease(entry: ProfileSession): boolean
 	end
 
 	finishRelease(entry, saved)
+	if saved then
+		dispatchVerifiedBest(entry.Player.UserId, capturedProgress.BestDistance)
+	end
 	return saved
 end
 
@@ -1367,6 +1400,14 @@ local function runShutdown()
 			)
 		)
 	end
+end
+
+function PlayerDataService.registerVerifiedBestObserver(observer: VerifiedBestObserver): boolean
+	if started or verifiedBestObserver ~= nil or typeof(observer) ~= "function" then
+		return false
+	end
+	verifiedBestObserver = observer
+	return true
 end
 
 function PlayerDataService.start(callback: BeforePlayerRelease?)
