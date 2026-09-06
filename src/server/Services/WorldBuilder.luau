@@ -31,6 +31,10 @@ local START_CHUTE_BEND_RAISE = 0.25
 local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
 local START_PAD_THICKNESS = 0.12
 local START_PAD_SURFACE_GAP = 0.01
+local START_PLATFORM_WALL_THICKNESS = 2
+local START_PLATFORM_WALL_HEIGHT = 16
+local START_PLATFORM_WALL_DECK_OVERLAP = 1
+local MINIMUM_HORIZONTAL_RAMP_DIRECTION_MAGNITUDE = 1e-4
 local MILESTONE_SURFACE_GAP = 0.03
 local MINOR_MILESTONE_COLOR = Color3.fromRGB(83, 210, 238)
 local MILESTONE_STROKE_COLOR = Color3.fromRGB(11, 27, 48)
@@ -1165,8 +1169,30 @@ local function buildCourse(world: Model, geometry: Folder, decor: Folder, marker
 	world:SetAttribute("LaunchZ", WORLD.PathPoints[#WORLD.PathPoints].Z)
 end
 
+local function createStartPlatformSafetyWall(
+	parent: Folder,
+	name: string,
+	size: Vector3,
+	cframe: CFrame
+): Part
+	local wall = createPart(
+		parent,
+		name,
+		size,
+		cframe,
+		PALETTE.Ice,
+		Enum.Material.SmoothPlastic,
+		true
+	)
+	wall.Transparency = 1
+	wall.CanTouch = false
+	wall.CanQuery = true
+	wall.CastShadow = false
+	return wall
+end
+
 local function buildSummit(geometry: Folder, decor: Folder)
-	createPart(
+	local summitPlatform = createPart(
 		geometry,
 		"SummitPlatform",
 		Vector3.new(120, 8, 110),
@@ -1176,10 +1202,26 @@ local function buildSummit(geometry: Folder, decor: Folder)
 		true
 	)
 
+	local spawnPosition = Vector3.new(0, 126.5, -325)
+	local rampTarget = WORLD.PathPoints[1]
+	local horizontalRampOffset = Vector3.new(
+		rampTarget.X - spawnPosition.X,
+		0,
+		rampTarget.Z - spawnPosition.Z
+	)
+	if horizontalRampOffset.Magnitude <= MINIMUM_HORIZONTAL_RAMP_DIRECTION_MAGNITUDE then
+		error("Cannot derive a safe horizontal ramp direction for PlayerSpawn")
+	end
+	local horizontalRampDirection = horizontalRampOffset.Unit
+
 	local spawn = Instance.new("SpawnLocation")
 	spawn.Name = "PlayerSpawn"
 	spawn.Size = Vector3.new(12, 1, 12)
-	spawn.CFrame = CFrame.new(0, 126.5, -325)
+	spawn.CFrame = CFrame.lookAt(
+		spawnPosition,
+		spawnPosition + horizontalRampDirection,
+		Vector3.yAxis
+	)
 	spawn.Anchored = true
 	spawn.CanCollide = true
 	spawn.Neutral = true
@@ -1187,6 +1229,53 @@ local function buildSummit(geometry: Folder, decor: Folder)
 	spawn.Color = PALETTE.Ice
 	spawn.Material = Enum.Material.Ice
 	spawn.Parent = geometry
+
+	local safety = Instance.new("Folder")
+	safety.Name = "StartPlatformSafety"
+	safety.Parent = geometry
+
+	local wallHalfThickness = START_PLATFORM_WALL_THICKNESS * 0.5
+	local wallHalfHeight = START_PLATFORM_WALL_HEIGHT * 0.5
+	local platformHalfWidth = summitPlatform.Size.X * 0.5
+	local platformHalfHeight = summitPlatform.Size.Y * 0.5
+	local platformHalfDepth = summitPlatform.Size.Z * 0.5
+	local wallCenterHeight = platformHalfHeight + wallHalfHeight - START_PLATFORM_WALL_DECK_OVERLAP
+	local sideOffset = platformHalfWidth + wallHalfThickness
+	local rearOffset = platformHalfDepth + wallHalfThickness
+	local sideWallSize = Vector3.new(
+		START_PLATFORM_WALL_THICKNESS,
+		START_PLATFORM_WALL_HEIGHT,
+		summitPlatform.Size.Z + START_PLATFORM_WALL_THICKNESS
+	)
+	local rearWallSize = Vector3.new(
+		summitPlatform.Size.X + START_PLATFORM_WALL_THICKNESS * 2,
+		START_PLATFORM_WALL_HEIGHT,
+		START_PLATFORM_WALL_THICKNESS
+	)
+	local platformFacingFrame = CFrame.lookAt(
+		summitPlatform.Position,
+		summitPlatform.Position + horizontalRampDirection,
+		Vector3.yAxis
+	)
+
+	createStartPlatformSafetyWall(
+		safety,
+		"LeftWall",
+		sideWallSize,
+		platformFacingFrame * CFrame.new(-sideOffset, wallCenterHeight, wallHalfThickness)
+	)
+	createStartPlatformSafetyWall(
+		safety,
+		"RightWall",
+		sideWallSize,
+		platformFacingFrame * CFrame.new(sideOffset, wallCenterHeight, wallHalfThickness)
+	)
+	createStartPlatformSafetyWall(
+		safety,
+		"RearWall",
+		rearWallSize,
+		platformFacingFrame * CFrame.new(0, wallCenterHeight, rearOffset)
+	)
 
 	createStartArch(decor)
 end
