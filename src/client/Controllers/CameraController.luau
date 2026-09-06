@@ -5,11 +5,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
-local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
 
 local REMOTES_FOLDER_NAME = "FrostlineRemotes"
 local STATE_REMOTE_NAME = "RunState"
+local PRESENTATION_COURSE_ATTRIBUTE_NAME = "FrostlinePresentationCourseId"
+local FROZEN_LAKE_COURSE_ID = "FrozenLakeV2"
+local FROST_TRAIL_COURSE_ID = "FrostTrailV1"
 local ACTIVE_SLEDS_FOLDER_NAME = "ActiveSleds"
 local SLED_MODEL_NAME = "ChristmasSled"
 local SLED_ROOT_NAME = "SledRoot"
@@ -29,8 +31,24 @@ local READY_ALIGNMENT_ROOT_VERTICAL_OFFSET = Vector3.new(0, 4, 0)
 
 type ColdJoinHandoffStage = "Readiness" | "Acquiring" | "Release"
 type ColdJoinAttemptResult = "Acquired" | "AlreadyAligned" | "Retry" | "Cancel"
-type ReadyAlignmentReason = "ColdJoin" | "CharacterAdded" | "ReturnToStart"
+type ReadyAlignmentReason = "ColdJoin" | "CharacterAdded" | "CoursePrepared" | "ReturnToStart"
 type ReadyAlignmentValidation = "Ready" | "Retry" | "Cancel"
+
+type PresentationCourseDefinition = {
+	CourseId: string,
+	WorldModelName: string,
+	PlayerSpawnEnabled: boolean,
+	ForwardDirection: Vector3,
+}
+
+type ResolvedPresentationCourse = {
+	Definition: PresentationCourseDefinition,
+	World: Model,
+	Geometry: Folder,
+	PlayerSpawn: SpawnLocation,
+	ActiveSleds: Folder,
+	ForwardDirection: Vector3,
+}
 
 type CameraSnapshot = {
 	Camera: Camera,
@@ -42,6 +60,7 @@ type CameraSnapshot = {
 }
 
 type SledIdentity = {
+	CourseId: string,
 	World: Model,
 	ActiveSleds: Folder,
 	Character: Model,
@@ -64,6 +83,28 @@ type PendingRestoration = {
 }
 
 local CameraController = {}
+
+local frozenLakePresentation: PresentationCourseDefinition = {
+	CourseId = FROZEN_LAKE_COURSE_ID,
+	WorldModelName = "FrostlineWorld",
+	PlayerSpawnEnabled = true,
+	ForwardDirection = Vector3.zAxis,
+}
+table.freeze(frozenLakePresentation)
+
+local frostTrailPresentation: PresentationCourseDefinition = {
+	CourseId = FROST_TRAIL_COURSE_ID,
+	WorldModelName = "FrostTrailWorld",
+	PlayerSpawnEnabled = false,
+	ForwardDirection = Vector3.zAxis,
+}
+table.freeze(frostTrailPresentation)
+
+local presentationCourses: { [string]: PresentationCourseDefinition } = {
+	[FROZEN_LAKE_COURSE_ID] = frozenLakePresentation,
+	[FROST_TRAIL_COURSE_ID] = frostTrailPresentation,
+}
+table.freeze(presentationCourses)
 
 local localPlayer = Players.LocalPlayer
 local started = false
@@ -112,6 +153,7 @@ local coldJoinCameraAncestryConnection: RBXScriptConnection? = nil
 local coldJoinCameraTypeConnection: RBXScriptConnection? = nil
 local coldJoinCameraSubjectConnection: RBXScriptConnection? = nil
 local evaluateColdJoinReadiness: () -> ()
+local observedPresentationCourseId: string? = nil
 
 local function isFiniteNumber(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
@@ -210,10 +252,102 @@ local function warnRuntimeOnce(message: string)
 	warn(string.format("[Frostline] Native sled camera restored Roblox camera: %s", message))
 end
 
+local function selectedPresentationDefinition(): PresentationCourseDefinition?
+	local attributeValue = localPlayer:GetAttribute(PRESENTATION_COURSE_ATTRIBUTE_NAME)
+	if attributeValue == nil or attributeValue == FROZEN_LAKE_COURSE_ID then
+		return presentationCourses[FROZEN_LAKE_COURSE_ID]
+	elseif attributeValue == FROST_TRAIL_COURSE_ID then
+		return presentationCourses[FROST_TRAIL_COURSE_ID]
+	end
+	return nil
+end
+
+local function selectedPresentationCourseId(): string?
+	local definition = selectedPresentationDefinition()
+	return if definition then definition.CourseId else nil
+end
+
+local function resolvePresentationCourse(): (ResolvedPresentationCourse?, ReadyAlignmentValidation)
+	local definition = selectedPresentationDefinition()
+	if not definition then
+		return nil, "Cancel"
+	end
+
+	local worldInstance = Workspace:FindFirstChild(definition.WorldModelName)
+	if not worldInstance then
+		return nil, "Retry"
+	end
+	if not worldInstance:IsA("Model") or worldInstance.Parent ~= Workspace then
+		return nil, "Cancel"
+	end
+	local modelCourseId = worldInstance:GetAttribute("CourseId")
+	if modelCourseId == nil then
+		return nil, "Retry"
+	end
+	if modelCourseId ~= definition.CourseId then
+		return nil, "Cancel"
+	end
+
+	local geometryInstance = worldInstance:FindFirstChild(GEOMETRY_FOLDER_NAME)
+	if not geometryInstance then
+		return nil, "Retry"
+	end
+	if not geometryInstance:IsA("Folder") or geometryInstance.Parent ~= worldInstance then
+		return nil, "Cancel"
+	end
+	local spawnInstance = geometryInstance:FindFirstChild(PLAYER_SPAWN_NAME)
+	if not spawnInstance then
+		return nil, "Retry"
+	end
+	if not spawnInstance:IsA("SpawnLocation")
+		or spawnInstance.Parent ~= geometryInstance
+		or spawnInstance.Enabled ~= definition.PlayerSpawnEnabled
+	then
+		return nil, "Cancel"
+	end
+
+	local activeSledsInstance = worldInstance:FindFirstChild(ACTIVE_SLEDS_FOLDER_NAME)
+	if not activeSledsInstance then
+		return nil, "Retry"
+	end
+	if not activeSledsInstance:IsA("Folder") or activeSledsInstance.Parent ~= worldInstance then
+		return nil, "Cancel"
+	end
+
+	local spawnLook = spawnInstance.CFrame.LookVector
+	local horizontalSpawnLook = Vector3.new(spawnLook.X, 0, spawnLook.Z)
+	local horizontalMagnitude = horizontalSpawnLook.Magnitude
+	local expectedForward = definition.ForwardDirection
+	if not isFiniteVector3(spawnLook)
+		or not isFiniteVector3(horizontalSpawnLook)
+		or not isFiniteNumber(horizontalMagnitude)
+		or horizontalMagnitude <= COLD_JOIN_MINIMUM_HORIZONTAL_MAGNITUDE
+		or not isFiniteVector3(expectedForward)
+		or math.abs(expectedForward.Magnitude - 1) > COLD_JOIN_MINIMUM_HORIZONTAL_MAGNITUDE
+	then
+		return nil, "Cancel"
+	end
+	local forwardDirection = horizontalSpawnLook.Unit
+	if not isFiniteVector3(forwardDirection)
+		or forwardDirection:Dot(expectedForward) < COLD_JOIN_MINIMUM_ROOT_ALIGNMENT_DOT
+	then
+		return nil, "Cancel"
+	end
+
+	return {
+		Definition = definition,
+		World = worldInstance,
+		Geometry = geometryInstance,
+		PlayerSpawn = spawnInstance,
+		ActiveSleds = activeSledsInstance,
+		ForwardDirection = forwardDirection,
+	}, "Ready"
+end
+
 local function isReadyAlignmentPhaseEligible(reason: ReadyAlignmentReason, requestRunId: number?): boolean
 	if reason == "ColdJoin" then
 		return currentRunId == nil and currentPhase == RunPhase.Idle
-	elseif reason == "CharacterAdded" then
+	elseif reason == "CharacterAdded" or reason == "CoursePrepared" then
 		if requestRunId == nil then
 			return currentRunId == nil and currentPhase == RunPhase.Idle
 		end
@@ -229,40 +363,16 @@ local function isReadyAlignmentPhaseEligible(reason: ReadyAlignmentReason, reque
 	return false
 end
 
-local function resolveReadyPlayerSpawn(): (SpawnLocation?, ReadyAlignmentValidation)
-	local worldInstance = Workspace:FindFirstChild(GameConfig.World.FolderName)
-	if not worldInstance then
-		return nil, "Retry"
-	end
-	if not worldInstance:IsA("Model") or worldInstance.Parent ~= Workspace then
-		return nil, "Cancel"
-	end
-	local geometryInstance = worldInstance:FindFirstChild(GEOMETRY_FOLDER_NAME)
-	if not geometryInstance then
-		return nil, "Retry"
-	end
-	if not geometryInstance:IsA("Folder") or geometryInstance.Parent ~= worldInstance then
-		return nil, "Cancel"
-	end
-	local spawnInstance = geometryInstance:FindFirstChild(PLAYER_SPAWN_NAME)
-	if not spawnInstance then
-		return nil, "Retry"
-	end
-	if not spawnInstance:IsA("SpawnLocation") or spawnInstance.Parent ~= geometryInstance then
-		return nil, "Cancel"
-	end
-	return spawnInstance, "Ready"
-end
-
 local function validateReadyAlignmentPosition(
 	root: BasePart,
 	reason: ReadyAlignmentReason,
 	reportFacingMismatch: boolean
 ): (ReadyAlignmentValidation, Vector3?, Vector3?)
-	local playerSpawn, spawnStatus = resolveReadyPlayerSpawn()
-	if not playerSpawn then
-		return spawnStatus, nil, nil
+	local course, courseStatus = resolvePresentationCourse()
+	if not course then
+		return courseStatus, nil, nil
 	end
+	local playerSpawn = course.PlayerSpawn
 
 	local rootPosition = root.Position
 	local expectedRootPosition = playerSpawn.Position + READY_ALIGNMENT_ROOT_VERTICAL_OFFSET
@@ -271,21 +381,19 @@ local function validateReadyAlignmentPosition(
 	end
 	local spawnDistance = (rootPosition - expectedRootPosition).Magnitude
 	if not isFiniteNumber(spawnDistance) or spawnDistance > READY_ALIGNMENT_MAXIMUM_SPAWN_DISTANCE then
+		if reason == "CoursePrepared"
+			or (reason == "CharacterAdded" and course.Definition.CourseId == FROST_TRAIL_COURSE_ID)
+		then
+			return "Retry", nil, nil
+		end
 		return "Cancel", nil, nil
 	end
 
-	local rampTarget = GameConfig.World.PathPoints[1]
-	local toRamp = rampTarget - rootPosition
-	local flatToRamp = Vector3.new(toRamp.X, 0, toRamp.Z)
-	local flatToRampMagnitude = flatToRamp.Magnitude
+	local rampDirection = course.ForwardDirection
 	local rootLook = root.CFrame.LookVector
 	local flatRootLook = Vector3.new(rootLook.X, 0, rootLook.Z)
 	local flatRootLookMagnitude = flatRootLook.Magnitude
-	if not isFiniteVector3(rampTarget)
-		or not isFiniteVector3(toRamp)
-		or not isFiniteVector3(flatToRamp)
-		or not isFiniteNumber(flatToRampMagnitude)
-		or flatToRampMagnitude <= COLD_JOIN_MINIMUM_HORIZONTAL_MAGNITUDE
+	if not isFiniteVector3(rampDirection)
 		or not isFiniteVector3(rootLook)
 		or not isFiniteVector3(flatRootLook)
 		or not isFiniteNumber(flatRootLookMagnitude)
@@ -294,7 +402,6 @@ local function validateReadyAlignmentPosition(
 		return "Cancel", nil, nil
 	end
 
-	local rampDirection = flatToRamp.Unit
 	local forward = flatRootLook.Unit
 	local rootAlignment = forward:Dot(rampDirection)
 	if not isFiniteVector3(rampDirection)
@@ -1110,14 +1217,11 @@ local function resolveCurrentSledIdentity(): SledIdentity?
 		return nil
 	end
 
-	local worldInstance = Workspace:FindFirstChild(GameConfig.World.FolderName)
-	if not worldInstance or not worldInstance:IsA("Model") then
+	local course, courseStatus = resolvePresentationCourse()
+	if not course or courseStatus ~= "Ready" then
 		return nil
 	end
-	local activeSledsInstance = worldInstance:FindFirstChild(ACTIVE_SLEDS_FOLDER_NAME)
-	if not activeSledsInstance or not activeSledsInstance:IsA("Folder") then
-		return nil
-	end
+	local activeSledsInstance = course.ActiveSleds
 	local sledInstance = seatPart.Parent
 	if not sledInstance
 		or not sledInstance:IsA("Model")
@@ -1137,7 +1241,8 @@ local function resolveCurrentSledIdentity(): SledIdentity?
 	end
 
 	return {
-		World = worldInstance,
+		CourseId = course.Definition.CourseId,
+		World = course.World,
 		ActiveSleds = activeSledsInstance,
 		Character = character,
 		Humanoid = humanoid,
@@ -1148,6 +1253,15 @@ local function resolveCurrentSledIdentity(): SledIdentity?
 end
 
 local function isActiveSessionValid(session: ActiveCameraSession): boolean
+	local course, courseStatus = resolvePresentationCourse()
+	if not course
+		or courseStatus ~= "Ready"
+		or course.Definition.CourseId ~= session.CourseId
+		or course.World ~= session.World
+		or course.ActiveSleds ~= session.ActiveSleds
+	then
+		return false
+	end
 	if not started
 		or destroyed
 		or activeSession ~= session
@@ -1167,7 +1281,6 @@ local function isActiveSessionValid(session: ActiveCameraSession): boolean
 		or session.Humanoid.SeatPart ~= session.DriverSeat
 		or session.DriverSeat.Occupant ~= session.Humanoid
 		or session.World.Parent ~= Workspace
-		or Workspace:FindFirstChild(GameConfig.World.FolderName) ~= session.World
 		or session.ActiveSleds.Parent ~= session.World
 		or session.World:FindFirstChild(ACTIVE_SLEDS_FOLDER_NAME) ~= session.ActiveSleds
 		or session.Sled.Parent ~= session.ActiveSleds
@@ -1264,6 +1377,7 @@ local function activateForCurrentState()
 	}
 
 	local session: ActiveCameraSession = {
+		CourseId = identity.CourseId,
 		World = identity.World,
 		ActiveSleds = identity.ActiveSleds,
 		Character = identity.Character,
@@ -1469,6 +1583,38 @@ local function onCurrentCameraChanged()
 	evaluateColdJoinReadiness()
 end
 
+local function onPresentationCourseChanged()
+	local nextCourseId = selectedPresentationCourseId()
+	local courseChanged = nextCourseId ~= observedPresentationCourseId
+	observedPresentationCourseId = nextCourseId
+
+	local session = activeSession
+	if session and not isActiveSessionValid(session) then
+		invalidateActiveRun(session.RunId, nil)
+	end
+
+	if not courseChanged then
+		evaluateColdJoinReadiness()
+		return
+	end
+	if not coldJoinTerminal then
+		terminateColdJoinAlignment(coldJoinGeneration)
+	end
+	if nextCourseId == nil
+		or not started
+		or destroyed
+		or currentPhase ~= RunPhase.Idle
+		or activeSession ~= nil
+	then
+		return
+	end
+
+	local character = localPlayer.Character
+	if character and character:IsA("Model") then
+		requestReadyAlignment("CoursePrepared", character, currentRunId)
+	end
+end
+
 function CameraController.start()
 	if started then
 		return
@@ -1492,6 +1638,7 @@ function CameraController.start()
 	currentPhaseRank = 0
 	terminalRunId = nil
 	invalidatedRunId = nil
+	observedPresentationCourseId = selectedPresentationCourseId()
 	clearPendingRestoration()
 	sessionGeneration += 1
 	resetReadyAlignmentLifecycle()
@@ -1502,6 +1649,10 @@ function CameraController.start()
 	table.insert(
 		controllerConnections,
 		Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(onCurrentCameraChanged)
+	)
+	table.insert(
+		controllerConnections,
+		localPlayer:GetAttributeChangedSignal(PRESENTATION_COURSE_ATTRIBUTE_NAME):Connect(onPresentationCourseChanged)
 	)
 	table.insert(controllerConnections, script.Destroying:Connect(CameraController.destroy))
 
@@ -1533,6 +1684,7 @@ function CameraController.destroy()
 	terminalRunId = nil
 	invalidatedRunId = nil
 	latestRunId = 0
+	observedPresentationCourseId = nil
 	started = false
 end
 

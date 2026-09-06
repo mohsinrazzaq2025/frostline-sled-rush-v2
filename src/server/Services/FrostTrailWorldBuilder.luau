@@ -31,28 +31,7 @@ local LOCAL_BOUNDS_MIN = Vector3.new(-700, -20, -500)
 local LOCAL_BOUNDS_MAX = Vector3.new(700, 850, 8800)
 local MINIMUM_CLASSIC_SEPARATION_X = 1000
 local START_SLOT_OFFSETS = table.freeze({ -27, -9, 9, 27 })
-local GEOMETRY_SPLIT_LONGITUDINALS = table.freeze({
-	3050,
-	3075,
-	3100,
-	3125,
-	3150,
-	3600,
-	3625,
-	3650,
-	3675,
-	3700,
-	3950,
-	3975,
-	4000,
-	4025,
-	4050,
-	4500,
-	4525,
-	4550,
-	4575,
-	4600,
-})
+local GEOMETRY_SPLIT_LONGITUDINALS = FrostTrailConfig.RouteData.GeometrySplitLongitudinals
 
 local REQUIRED_PATH_POINTS = table.freeze({
 	Vector3.new(0, 560, -250),
@@ -86,10 +65,7 @@ local REQUIRED_SECTIONS = table.freeze({
 
 local RIGHT_DIRECTION = FrostTrailConfig.ForwardDirection:Cross(Vector3.yAxis).Unit
 
-type Widths = {
-	Track: number,
-	Clear: number,
-}
+type RouteGeometryPoint = FrostTrailConfig.RouteGeometryPoint
 
 type SegmentPlan = {
 	PointA: Vector3,
@@ -98,6 +74,8 @@ type SegmentPlan = {
 	Length: number,
 	TrackWidth: number,
 	ClearWidth: number,
+	StartTrackWidth: number,
+	EndTrackWidth: number,
 	StartExtension: number,
 	EndExtension: number,
 }
@@ -108,7 +86,7 @@ type Bounds = {
 }
 
 local function fail(message: string): never
-	error("Frost Trail static world: " .. message, 0)
+	error("Frost Trail world: " .. message, 0)
 end
 
 local function requireCondition(condition: boolean, message: string)
@@ -145,8 +123,12 @@ local function validateConfiguration()
 	requireCondition(FrostTrailConfig.DisplayName == "FROST TRAIL", "DisplayName mismatch")
 	requireCondition(FrostTrailConfig.WorldModelName == "FrostTrailWorld", "WorldModelName mismatch")
 	requireCondition(FrostTrailConfig.WorldVersion == 1, "WorldVersion mismatch")
-	requireCondition(FrostTrailConfig.StaticFoundationOnly == true, "static-foundation flag must be true")
+	requireCondition(FrostTrailConfig.StaticFoundationOnly == false, "static-foundation flag must be false")
 	requireCondition(FrostTrailConfig.Playable == false, "playable flag must be false")
+	requireCondition(
+		FrostTrailConfig.ActivationMode == "StudioControlledTest",
+		"ActivationMode must equal StudioControlledTest"
+	)
 	validateExactVector(FrostTrailConfig.WorldOrigin, Vector3.new(3200, 0, 0), "WorldOrigin")
 	validateExactVector(FrostTrailConfig.ForwardDirection, Vector3.zAxis, "ForwardDirection")
 	requireCondition(isFiniteVector3(FrostTrailConfig.WorldOrigin), "WorldOrigin must be finite")
@@ -237,6 +219,46 @@ local function validateConfiguration()
 	end
 	requireCondition(FrostTrailConfig.PathPoints[1] == Vector3.new(0, 560, -250), "first path point mismatch")
 	requireCondition(FrostTrailConfig.PathPoints[15] == Vector3.new(0, 82, 6350), "final path point mismatch")
+
+	local routeData = FrostTrailConfig.RouteData
+	requireCondition(table.isfrozen(routeData), "RouteData must be frozen")
+	requireCondition(
+		table.isfrozen(routeData.SampledCenterlinePoints),
+		"SampledCenterlinePoints must be frozen"
+	)
+	requireCondition(table.isfrozen(routeData.GeometryPoints), "GeometryPoints must be frozen")
+	requireCondition(
+		table.isfrozen(routeData.GeometrySplitLongitudinals),
+		"GeometrySplitLongitudinals must be frozen"
+	)
+	requireCondition(
+		routeData.GeometrySplitLongitudinals == GEOMETRY_SPLIT_LONGITUDINALS,
+		"builder must use the configured geometry splits"
+	)
+	requireCondition(#routeData.SampledCenterlinePoints == EXPECTED_BASE_SAMPLES, "sampled point count mismatch")
+	requireCondition(#routeData.GeometryPoints == EXPECTED_GEOMETRY_POINTS, "geometry point count mismatch")
+	requireCondition(#routeData.GeometrySplitLongitudinals == 20, "geometry split count mismatch")
+	requireCondition(
+		isFiniteNumber(routeData.AuthoredPathLengthStuds)
+			and math.abs(routeData.AuthoredPathLengthStuds - EXPECTED_AUTHORED_LENGTH) <= 0.01,
+		"configured authored path length mismatch"
+	)
+	for index, point in ipairs(routeData.GeometryPoints) do
+		requireCondition(table.isfrozen(point), string.format("GeometryPoints[%d] must be frozen", index))
+		requireCondition(isFiniteVector3(point.LocalPosition), "geometry route point must be finite")
+		validatePositiveFinite(point.TrackWidth, "geometry route TrackWidth")
+		validatePositiveFinite(point.ClearPlayableWidth, "geometry route ClearPlayableWidth")
+		requireCondition(
+			point.ClearPlayableWidth <= point.TrackWidth,
+			"geometry route clear width must fit inside track width"
+		)
+		if index > 1 then
+			requireCondition(
+				point.LocalPosition.Z > routeData.GeometryPoints[index - 1].LocalPosition.Z,
+				"geometry route local Z must increase strictly"
+			)
+		end
+	end
 
 	requireCondition(table.isfrozen(FrostTrailConfig.LaneCenterOffsets), "lane offsets must be frozen")
 	requireCondition(#FrostTrailConfig.LaneCenterOffsets == 3, "exactly three lane offsets are required")
@@ -414,35 +436,6 @@ local function courseAlignedFrame(localPoint: Vector3): CFrame
 	return CFrame.lookAt(worldPoint, worldPoint + FrostTrailConfig.ForwardDirection, Vector3.yAxis)
 end
 
-local function catmullRom(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, t: number): Vector3
-	local t2 = t * t
-	local t3 = t2 * t
-	return 0.5
-		* (
-			(2 * p1)
-			+ ((-p0 + p2) * t)
-			+ ((2 * p0 - 5 * p1 + 4 * p2 - p3) * t2)
-			+ ((-p0 + 3 * p1 - 3 * p2 + p3) * t3)
-		)
-end
-
-local function samplePath(): { Vector3 }
-	local sampled: { Vector3 } = {}
-	local controlPoints = FrostTrailConfig.PathPoints
-	for index = 1, #controlPoints - 1 do
-		local p0 = controlPoints[math.max(1, index - 1)]
-		local p1 = controlPoints[index]
-		local p2 = controlPoints[index + 1]
-		local p3 = controlPoints[math.min(#controlPoints, index + 2)]
-		for sampleIndex = 0, FrostTrailConfig.SamplesPerCurve - 1 do
-			local alpha = sampleIndex / FrostTrailConfig.SamplesPerCurve
-			table.insert(sampled, catmullRom(p0, p1, p2, p3, alpha))
-		end
-	end
-	table.insert(sampled, controlPoints[#controlPoints])
-	return sampled
-end
-
 local function validateAndMeasureSampledPath(sampled: { Vector3 }): number
 	requireCondition(#sampled == EXPECTED_BASE_SAMPLES, "sampled centerline must contain exactly 57 points")
 	local authoredLength = 0
@@ -466,74 +459,36 @@ local function validateAndMeasureSampledPath(sampled: { Vector3 }): number
 		math.abs(authoredLength - EXPECTED_AUTHORED_LENGTH) <= 0.01,
 		"authored path length does not match the required spline convention"
 	)
+	requireCondition(
+		math.abs(authoredLength - FrostTrailConfig.RouteData.AuthoredPathLengthStuds)
+			<= FrostTrailConfig.ValidationEpsilon,
+		"configured authored path length does not match its sampled centerline"
+	)
 	return authoredLength
 end
 
-local function smoothstep(alpha: number): number
-	local clamped = math.clamp(alpha, 0, 1)
-	return clamped * clamped * (3 - 2 * clamped)
-end
-
-local function widthsAt(longitudinal: number): Widths
-	for _, taper in ipairs(FrostTrailConfig.TaperZones) do
-		if longitudinal >= taper.StartLongitudinal and longitudinal <= taper.EndLongitudinal then
-			local alpha = (longitudinal - taper.StartLongitudinal)
-				/ (taper.EndLongitudinal - taper.StartLongitudinal)
-			local eased = smoothstep(alpha)
-			if taper.Widens then
-				return {
-					Track = FrostTrailConfig.TrackWidth
-						+ (FrostTrailConfig.WidenedTrackWidth - FrostTrailConfig.TrackWidth) * eased,
-					Clear = FrostTrailConfig.ClearPlayableWidth
-						+ (FrostTrailConfig.WidenedClearPlayableWidth - FrostTrailConfig.ClearPlayableWidth) * eased,
-				}
-			end
-			return {
-				Track = FrostTrailConfig.WidenedTrackWidth
-					+ (FrostTrailConfig.TrackWidth - FrostTrailConfig.WidenedTrackWidth) * eased,
-				Clear = FrostTrailConfig.WidenedClearPlayableWidth
-					+ (FrostTrailConfig.ClearPlayableWidth - FrostTrailConfig.WidenedClearPlayableWidth) * eased,
-			}
-		end
-	end
-	for _, zone in ipairs(FrostTrailConfig.WidenedRouteZones) do
-		if longitudinal >= zone.StartLongitudinal and longitudinal <= zone.EndLongitudinal then
-			return {
-				Track = FrostTrailConfig.WidenedTrackWidth,
-				Clear = FrostTrailConfig.WidenedClearPlayableWidth,
-			}
-		end
-	end
-	return {
-		Track = FrostTrailConfig.TrackWidth,
-		Clear = FrostTrailConfig.ClearPlayableWidth,
-	}
-end
-
-local function splitSampledPath(sampled: { Vector3 }): { Vector3 }
-	local geometryPoints: { Vector3 } = { sampled[1] }
-	for index = 1, #sampled - 1 do
-		local pointA = sampled[index]
-		local pointB = sampled[index + 1]
-		for _, splitLongitudinal in ipairs(GEOMETRY_SPLIT_LONGITUDINALS) do
-			if splitLongitudinal > pointA.Z and splitLongitudinal < pointB.Z then
-				local alpha = (splitLongitudinal - pointA.Z) / (pointB.Z - pointA.Z)
-				table.insert(geometryPoints, pointA:Lerp(pointB, alpha))
-			end
-		end
-		table.insert(geometryPoints, pointB)
-	end
+local function validateGeometryPoints(geometryPoints: { RouteGeometryPoint })
 	requireCondition(#geometryPoints == EXPECTED_GEOMETRY_POINTS, "geometry split must create exactly 75 points")
 	for index = 1, #geometryPoints - 1 do
+		local pointA = geometryPoints[index]
+		local pointB = geometryPoints[index + 1]
 		requireCondition(
-			geometryPoints[index + 1].Z > geometryPoints[index].Z,
+			pointB.LocalPosition.Z > pointA.LocalPosition.Z,
 			"split geometry path must progress positively"
+		)
+		requireCondition(
+			(pointB.LocalPosition - pointA.LocalPosition).Magnitude > FrostTrailConfig.ValidationEpsilon,
+			"split geometry chord must be nonzero"
 		)
 	end
 	for _, requiredLongitudinal in ipairs(GEOMETRY_SPLIT_LONGITUDINALS) do
 		local found = false
 		for _, point in ipairs(geometryPoints) do
-			if approximatelyEqual(point.Z, requiredLongitudinal, FrostTrailConfig.ValidationEpsilon) then
+			if approximatelyEqual(
+				point.LocalPosition.Z,
+				requiredLongitudinal,
+				FrostTrailConfig.ValidationEpsilon
+			) then
 				found = true
 				break
 			end
@@ -542,8 +497,8 @@ local function splitSampledPath(sampled: { Vector3 }): { Vector3 }
 	end
 	for _, taper in ipairs(FrostTrailConfig.TaperZones) do
 		for index = 1, #geometryPoints - 1 do
-			local overlapStart = math.max(geometryPoints[index].Z, taper.StartLongitudinal)
-			local overlapEnd = math.min(geometryPoints[index + 1].Z, taper.EndLongitudinal)
+			local overlapStart = math.max(geometryPoints[index].LocalPosition.Z, taper.StartLongitudinal)
+			local overlapEnd = math.min(geometryPoints[index + 1].LocalPosition.Z, taper.EndLongitudinal)
 			if overlapEnd > overlapStart then
 				requireCondition(
 					overlapEnd - overlapStart <= 25 + FrostTrailConfig.ValidationEpsilon,
@@ -552,7 +507,6 @@ local function splitSampledPath(sampled: { Vector3 }): { Vector3 }
 			end
 		end
 	end
-	return geometryPoints
 end
 
 local function angleBetween(directionA: Vector3, directionB: Vector3): number
@@ -566,16 +520,16 @@ local function requiredJoinExtension(width: number, turnAngle: number): number
 	)
 end
 
-local function createSegmentPlans(geometryPoints: { Vector3 }): { SegmentPlan }
+local function createSegmentPlans(geometryPoints: { RouteGeometryPoint }): { SegmentPlan }
 	local plans: { SegmentPlan } = {}
 	for index = 1, #geometryPoints - 1 do
-		local pointA = geometryPoints[index]
-		local pointB = geometryPoints[index + 1]
+		local routePointA = geometryPoints[index]
+		local routePointB = geometryPoints[index + 1]
+		local pointA = routePointA.LocalPosition
+		local pointB = routePointB.LocalPosition
 		local chord = pointB - pointA
-		local startWidths = widthsAt(pointA.Z)
-		local endWidths = widthsAt(pointB.Z)
-		local trackWidth = math.max(startWidths.Track, endWidths.Track)
-		local clearWidth = math.max(startWidths.Clear, endWidths.Clear)
+		local trackWidth = math.max(routePointA.TrackWidth, routePointB.TrackWidth)
+		local clearWidth = math.max(routePointA.ClearPlayableWidth, routePointB.ClearPlayableWidth)
 		requireCondition(chord.Magnitude > FrostTrailConfig.ValidationEpsilon, "geometry chord must be nonzero")
 		requireCondition(chord.Z > 0, "geometry chord must not reverse forward progress")
 		requireCondition(trackWidth >= clearWidth, "geometry piece must cover the clear width")
@@ -586,6 +540,8 @@ local function createSegmentPlans(geometryPoints: { Vector3 }): { SegmentPlan }
 			Length = chord.Magnitude,
 			TrackWidth = trackWidth,
 			ClearWidth = clearWidth,
+			StartTrackWidth = routePointA.TrackWidth,
+			EndTrackWidth = routePointB.TrackWidth,
 			StartExtension = FrostTrailConfig.TrackSegmentOverlap * 0.5,
 			EndExtension = FrostTrailConfig.TrackSegmentOverlap * 0.5,
 		})
@@ -616,11 +572,14 @@ local function createSegmentPlans(geometryPoints: { Vector3 }): { SegmentPlan }
 		requireCondition(first.EndExtension >= required, "outgoing join coverage is insufficient")
 		requireCondition(second.StartExtension >= required, "incoming join coverage is insufficient")
 		requireCondition(
-			first.TrackWidth >= math.max(widthsAt(first.PointA.Z).Track, widthsAt(first.PointB.Z).Track),
+			first.TrackWidth >= math.max(first.StartTrackWidth, first.EndTrackWidth),
 			"track piece under-covers its endpoint width"
 		)
 		requireCondition(
-			first.ClearWidth >= math.max(widthsAt(first.PointA.Z).Clear, widthsAt(first.PointB.Z).Clear),
+			first.ClearWidth >= math.max(
+				geometryPoints[index].ClearPlayableWidth,
+				geometryPoints[index + 1].ClearPlayableWidth
+			),
 			"clear-width coverage is discontinuous"
 		)
 	end
@@ -782,12 +741,14 @@ local function buildTrack(track: Folder, safety: Folder, plans: { SegmentPlan })
 		surface:SetAttribute(TRACK_SURFACE_ATTRIBUTE, true)
 
 		for _, side in ipairs({ -1, 1 }) do
-			local startTrackWidth = widthsAt(plan.PointA.Z).Track
-			local endTrackWidth = widthsAt(plan.PointB.Z).Track
 			local startOffset = side
-				* (startTrackWidth * 0.5 + FrostTrailConfig.SnowBankWidth + FrostTrailConfig.SafetyWallThickness * 0.5)
+				* (plan.StartTrackWidth * 0.5
+					+ FrostTrailConfig.SnowBankWidth
+					+ FrostTrailConfig.SafetyWallThickness * 0.5)
 			local endOffset = side
-				* (endTrackWidth * 0.5 + FrostTrailConfig.SnowBankWidth + FrostTrailConfig.SafetyWallThickness * 0.5)
+				* (plan.EndTrackWidth * 0.5
+					+ FrostTrailConfig.SnowBankWidth
+					+ FrostTrailConfig.SafetyWallThickness * 0.5)
 			local wallPointA = plan.PointA + Vector3.new(startOffset, 0, 0)
 			local wallPointB = plan.PointB + Vector3.new(endOffset, 0, 0)
 			local wallFrame, wallLength = segmentFrame(
@@ -951,6 +912,7 @@ local function buildMarkers(markers: Folder, sampled: { Vector3 })
 
 	local launchPosition = FrostTrailConfig.PathPoints[#FrostTrailConfig.PathPoints] + Vector3.new(0, 1, 0)
 	local launchEdge = createInvisibleMarker(markers, "LaunchEdge", FrostTrailConfig.LaunchMarkerSize, launchPosition)
+	launchEdge.CanTouch = true
 	launchEdge:SetAttribute("AuthoringMarkerOnly", true)
 
 	local startSlots = createFolder(markers, "StartSlots")
@@ -1022,6 +984,7 @@ local function buildLandingLake(geometry: Folder): Folder
 		)
 		part.CustomPhysicalProperties = lakePhysicalProperties()
 		part.Reflectance = 0.08
+		part.CanTouch = true
 		return part
 	end
 
@@ -1858,13 +1821,14 @@ local function validateSummitAndMarkers(candidate: Model, sampled: { Vector3 })
 		requireCondition(
 			marker.Anchored
 				and not marker.CanCollide
-				and not marker.CanTouch
 				and not marker.CanQuery
 				and not marker.CastShadow
 				and marker.Transparency == 1,
 			"authoring marker flags mismatch"
 		)
 	end
+	requireCondition(not startTrigger.CanTouch, "StartTrigger must remain non-touchable")
+	requireCondition(launchEdge.CanTouch, "LaunchEdge must be touchable")
 	requireCondition(startTrigger.Size == FrostTrailConfig.StartTriggerSize, "StartTrigger size mismatch")
 	requireCondition(
 		(worldToLocalPoint(startTrigger.Position) - FrostTrailConfig.StartTriggerCenter).Magnitude
@@ -1934,7 +1898,7 @@ local function validateLake(candidate: Model)
 	)
 	local expectedProperties = lakePhysicalProperties()
 	for _, part in ipairs({ marked, runoff }) do
-		requireCondition(part.Anchored and part.CanCollide and part.CanQuery and not part.CanTouch, "landing part flags mismatch")
+		requireCondition(part.Anchored and part.CanCollide and part.CanQuery and part.CanTouch, "landing part flags mismatch")
 		requireCondition(part.CustomPhysicalProperties ~= nil, "landing physical properties missing")
 		requireCondition(
 			physicalPropertiesMatch(part.CustomPhysicalProperties :: PhysicalProperties, expectedProperties),
@@ -2015,9 +1979,19 @@ local FORBIDDEN_DESCENDANT_CLASSES: { [string]: boolean } = table.freeze({
 })
 
 local function validateBudgetsAndAllowedInstances(candidate: Model)
+	local geometry = candidate.Geometry :: Folder
+	local markers = candidate.Markers :: Folder
+	local lake = geometry.FrostTrailLake :: Folder
+	local allowedTouchableParts: { [BasePart]: boolean } = {
+		[markers.LaunchEdge :: BasePart] = true,
+		[lake.FrostTrailLakeMarked_0000m_1500m :: BasePart] = true,
+		[lake.FrostTrailLakeRunoff_1500m_1800m :: BasePart] = true,
+	}
+	table.freeze(allowedTouchableParts)
 	local basePartCount = 0
 	local collidableCount = 0
 	local shadowCount = 0
+	local touchableCount = 0
 	local spawnCount = 0
 	local promptCount = 0
 	local prohibitedCount = 0
@@ -2035,7 +2009,13 @@ local function validateBudgetsAndAllowedInstances(candidate: Model)
 		if descendant:IsA("BasePart") then
 			basePartCount += 1
 			requireCondition(descendant.Anchored, descendant.Name .. " must be anchored")
-			requireCondition(not descendant.CanTouch, descendant.Name .. " must be non-touchable")
+			if descendant.CanTouch then
+				touchableCount += 1
+				requireCondition(
+					allowedTouchableParts[descendant] == true,
+					descendant.Name .. " is not an allowed touch detector"
+				)
+			end
 			if descendant.CanCollide then
 				collidableCount += 1
 			end
@@ -2050,6 +2030,10 @@ local function validateBudgetsAndAllowedInstances(candidate: Model)
 	requireCondition(collidableCount <= 230, "collidable-part budget exceeded")
 	requireCondition(shadowCount == EXPECTED_SHADOW_COUNT, "shadow count must equal the authored 68")
 	requireCondition(shadowCount <= 170, "shadow-caster budget exceeded")
+	requireCondition(touchableCount == 3, "exactly LaunchEdge and two lake parts must be touchable")
+	for part in allowedTouchableParts do
+		requireCondition(part.CanTouch, part.Name .. " must remain touchable")
+	end
 	requireCondition(spawnCount == 1, "exactly one disabled SpawnLocation is required")
 	requireCondition(promptCount == 0, "Frost Trail must contain zero ProximityPrompts")
 	requireCondition(prohibitedCount == 0, "Frost Trail contains a prohibited or asset-backed instance")
@@ -2072,8 +2056,12 @@ local function validateAttributes(candidate: Model, authoredLength: number)
 	requireCondition(candidate:GetAttribute("CourseId") == "FrostTrailV1", "CourseId attribute mismatch")
 	requireCondition(candidate:GetAttribute("DisplayName") == "FROST TRAIL", "DisplayName attribute mismatch")
 	requireCondition(candidate:GetAttribute("WorldVersion") == 1, "WorldVersion attribute mismatch")
-	requireCondition(candidate:GetAttribute("StaticFoundationOnly") == true, "static attribute mismatch")
+	requireCondition(candidate:GetAttribute("StaticFoundationOnly") == false, "static attribute mismatch")
 	requireCondition(candidate:GetAttribute("Playable") == false, "playable attribute mismatch")
+	requireCondition(
+		candidate:GetAttribute("ActivationMode") == "StudioControlledTest",
+		"activation-mode attribute mismatch"
+	)
 	requireCondition(candidate:GetAttribute("ForwardX") == 0, "ForwardX attribute mismatch")
 	requireCondition(candidate:GetAttribute("ForwardY") == 0, "ForwardY attribute mismatch")
 	requireCondition(candidate:GetAttribute("ForwardZ") == 1, "ForwardZ attribute mismatch")
@@ -2123,6 +2111,7 @@ local function setWorldAttributes(candidate: Model, authoredLength: number)
 	candidate:SetAttribute("WorldVersion", FrostTrailConfig.WorldVersion)
 	candidate:SetAttribute("StaticFoundationOnly", FrostTrailConfig.StaticFoundationOnly)
 	candidate:SetAttribute("Playable", FrostTrailConfig.Playable)
+	candidate:SetAttribute("ActivationMode", FrostTrailConfig.ActivationMode)
 	candidate:SetAttribute("ForwardX", FrostTrailConfig.ForwardDirection.X)
 	candidate:SetAttribute("ForwardY", FrostTrailConfig.ForwardDirection.Y)
 	candidate:SetAttribute("ForwardZ", FrostTrailConfig.ForwardDirection.Z)
@@ -2137,9 +2126,11 @@ end
 
 local function constructCandidate(candidate: Model)
 	validateConfiguration()
-	local sampled = samplePath()
+	local routeData = FrostTrailConfig.RouteData
+	local sampled = routeData.SampledCenterlinePoints
 	local authoredLength = validateAndMeasureSampledPath(sampled)
-	local geometryPoints = splitSampledPath(sampled)
+	local geometryPoints = routeData.GeometryPoints
+	validateGeometryPoints(geometryPoints)
 	local plans = createSegmentPlans(geometryPoints)
 
 	local geometry = createFolder(candidate, "Geometry")

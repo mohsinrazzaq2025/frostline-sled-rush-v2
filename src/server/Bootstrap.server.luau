@@ -34,26 +34,6 @@ else
 	warn(string.format("[Frostline][Leaderboard] Service failed to load reason=%s", tostring(requiredService)))
 end
 
-local frostTrailWorldBuilder: FrostTrailWorldBuilderApi? = nil
-local frostTrailRequireSucceeded, requiredFrostTrailBuilder = pcall(function(): any
-	return require(script.Parent.Services.FrostTrailWorldBuilder)
-end)
-if frostTrailRequireSucceeded then
-	local candidate: any = requiredFrostTrailBuilder
-	if type(candidate) == "table" and type(candidate.build) == "function" then
-		frostTrailWorldBuilder = candidate :: FrostTrailWorldBuilderApi
-	else
-		warn("[Frostline][FrostTrail] Static world builder has an invalid API")
-	end
-else
-	warn(
-		string.format(
-			"[Frostline][FrostTrail] Static world builder failed to load reason=%s",
-			tostring(requiredFrostTrailBuilder)
-		)
-	)
-end
-
 if leaderboardService then
 	local service = leaderboardService
 	local registrationSucceeded, observerRegistered = pcall(function(): boolean
@@ -92,20 +72,37 @@ if leaderboardService then
 	end
 end
 
-RunManager.start()
-StoreService.start()
+local frostTrailWorldBuilder: FrostTrailWorldBuilderApi? = nil
+local frostTrailRequireSucceeded, requiredFrostTrailBuilder = pcall(function(): any
+	return require(script.Parent.Services.FrostTrailWorldBuilder)
+end)
+if frostTrailRequireSucceeded then
+	local candidate: any = requiredFrostTrailBuilder
+	if type(candidate) == "table" and type(candidate.build) == "function" then
+		frostTrailWorldBuilder = candidate :: FrostTrailWorldBuilderApi
+	else
+		warn("[Frostline][FrostTrail] World builder has an invalid API")
+	end
+else
+	warn(
+		string.format(
+			"[Frostline][FrostTrail] World builder failed to load reason=%s",
+			tostring(requiredFrostTrailBuilder)
+		)
+	)
+end
 
 if frostTrailWorldBuilder then
 	local builder = frostTrailWorldBuilder
 	local buildSucceeded, buildResult = pcall(builder.build)
 	if not buildSucceeded then
-		warn(string.format("[Frostline][FrostTrail] Static world build failed reason=%s", tostring(buildResult)))
+		warn(string.format("[Frostline][FrostTrail] World build failed reason=%s", tostring(buildResult)))
 	elseif typeof(buildResult) ~= "Instance"
 		or not buildResult:IsA("Model")
 		or buildResult.Name ~= "FrostTrailWorld"
 		or buildResult.Parent ~= workspace
 	then
-		warn("[Frostline][FrostTrail] Static world builder returned an invalid model")
+		warn("[Frostline][FrostTrail] World builder returned an invalid model")
 	else
 		local builtWorld = buildResult :: Model
 		local basePartCount = builtWorld:GetAttribute("BasePartCount")
@@ -115,16 +112,16 @@ if frostTrailWorldBuilder then
 				verifiedPartCount += 1
 			end
 		end
-		if type(basePartCount) ~= "number"
-			or basePartCount % 1 ~= 0
-			or basePartCount <= 0
-			or basePartCount ~= verifiedPartCount
+		if basePartCount ~= 447 or verifiedPartCount ~= 447
 		then
-			warn("[Frostline][FrostTrail] Static world model has an invalid BasePartCount")
+			warn("[Frostline][FrostTrail] World model does not contain the validated 447 parts")
 		else
-			print(string.format("[Frostline] Frost Trail static world generated (%d parts)", basePartCount))
+			print(string.format("[Frostline] Frost Trail controlled test world generated (%d parts)", basePartCount))
 		end
 	end
 end
+
+RunManager.start()
+StoreService.start()
 
 print("[Frostline] Server bootstrap complete")

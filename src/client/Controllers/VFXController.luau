@@ -23,6 +23,15 @@ local WINTER_GRADE = PRESENTATION.WinterGrade
 local EFFECTS_FOLDER_NAME = "FrostlineClientVFX"
 local COLOR_GRADE_NAME = "FrostlineClientColorCorrection"
 local BLOOM_NAME = "FrostlineBloom"
+local PRESENTATION_COURSE_ATTRIBUTE_NAME = "FrostlinePresentationCourseId"
+local FROZEN_LAKE_COURSE_ID = "FrozenLakeV2"
+local FROST_TRAIL_COURSE_ID = "FrostTrailV1"
+local GEOMETRY_FOLDER_NAME = "Geometry"
+local PLAYER_SPAWN_NAME = "PlayerSpawn"
+local ACTIVE_SLEDS_FOLDER_NAME = "ActiveSleds"
+local SLED_MODEL_NAME = "ChristmasSled"
+local SLED_ROOT_NAME = "SledRoot"
+local DRIVER_SEAT_NAME = "DriverSeat"
 local NATIVE_PARTICLE_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds"
 local SLED_RESOLVE_INTERVAL = 0.2
 local GROUND_CHECK_INTERVAL = 0.05
@@ -59,6 +68,18 @@ type AmbientSnowLayer = {
 	Part: Part,
 	Emitter: ParticleEmitter,
 	CameraOffset: Vector3,
+}
+
+type PresentationCourseDefinition = {
+	CourseId: string,
+	WorldModelName: string,
+	PlayerSpawnEnabled: boolean,
+}
+
+type ResolvedPresentationCourse = {
+	Definition: PresentationCourseDefinition,
+	World: Model,
+	ActiveSleds: Folder,
 }
 
 type RunnerGlowTargetSpec = {
@@ -147,6 +168,26 @@ local RUNNER_GLOW_TARGET_SPECS: { RunnerGlowTargetSpec } = {
 
 local VFXController = {}
 
+local frozenLakePresentation: PresentationCourseDefinition = {
+	CourseId = FROZEN_LAKE_COURSE_ID,
+	WorldModelName = "FrostlineWorld",
+	PlayerSpawnEnabled = true,
+}
+table.freeze(frozenLakePresentation)
+
+local frostTrailPresentation: PresentationCourseDefinition = {
+	CourseId = FROST_TRAIL_COURSE_ID,
+	WorldModelName = "FrostTrailWorld",
+	PlayerSpawnEnabled = false,
+}
+table.freeze(frostTrailPresentation)
+
+local presentationCourses: { [string]: PresentationCourseDefinition } = {
+	[FROZEN_LAKE_COURSE_ID] = frozenLakePresentation,
+	[FROST_TRAIL_COURSE_ID] = frostTrailPresentation,
+}
+table.freeze(presentationCourses)
+
 local localPlayer = Players.LocalPlayer
 
 local function shouldUseReducedQuality(): boolean
@@ -214,6 +255,57 @@ end
 
 local function isFiniteNumber(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
+end
+
+local function selectedPresentationDefinition(): PresentationCourseDefinition?
+	local attributeValue = localPlayer:GetAttribute(PRESENTATION_COURSE_ATTRIBUTE_NAME)
+	if attributeValue == nil or attributeValue == FROZEN_LAKE_COURSE_ID then
+		return presentationCourses[FROZEN_LAKE_COURSE_ID]
+	elseif attributeValue == FROST_TRAIL_COURSE_ID then
+		return presentationCourses[FROST_TRAIL_COURSE_ID]
+	end
+	return nil
+end
+
+local function resolvePresentationCourse(): ResolvedPresentationCourse?
+	local definition = selectedPresentationDefinition()
+	if not definition then
+		return nil
+	end
+
+	local worldInstance = Workspace:FindFirstChild(definition.WorldModelName)
+	if not worldInstance
+		or not worldInstance:IsA("Model")
+		or worldInstance.Parent ~= Workspace
+		or worldInstance:GetAttribute("CourseId") ~= definition.CourseId
+	then
+		return nil
+	end
+	local geometryInstance = worldInstance:FindFirstChild(GEOMETRY_FOLDER_NAME)
+	if not geometryInstance or not geometryInstance:IsA("Folder") or geometryInstance.Parent ~= worldInstance then
+		return nil
+	end
+	local spawnInstance = geometryInstance:FindFirstChild(PLAYER_SPAWN_NAME)
+	if not spawnInstance
+		or not spawnInstance:IsA("SpawnLocation")
+		or spawnInstance.Parent ~= geometryInstance
+		or spawnInstance.Enabled ~= definition.PlayerSpawnEnabled
+	then
+		return nil
+	end
+	local activeSledsInstance = worldInstance:FindFirstChild(ACTIVE_SLEDS_FOLDER_NAME)
+	if not activeSledsInstance
+		or not activeSledsInstance:IsA("Folder")
+		or activeSledsInstance.Parent ~= worldInstance
+	then
+		return nil
+	end
+
+	return {
+		Definition = definition,
+		World = worldInstance,
+		ActiveSleds = activeSledsInstance,
+	}
 end
 
 local function isKnownPhase(value: string): boolean
@@ -462,39 +554,48 @@ end
 
 local function findActiveSledModel(): (Model?, BasePart?)
 	local character = localPlayer.Character
-	if not character then
+	if not character or not character:IsDescendantOf(Workspace) then
 		return nil, nil
 	end
 
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid then
+	if not humanoid or humanoid.Health <= 0 then
 		return nil, nil
 	end
 	local seatPart = humanoid.SeatPart
-	if not seatPart then
+	if not seatPart
+		or not seatPart:IsA("Seat")
+		or seatPart.Name ~= DRIVER_SEAT_NAME
+		or seatPart.Occupant ~= humanoid
+	then
 		return nil, nil
 	end
 
-	local world = Workspace:FindFirstChild(GameConfig.World.FolderName)
-	local activeSleds = if world then world:FindFirstChild("ActiveSleds") else nil
-	if not activeSleds or not activeSleds:IsA("Folder") then
+	local course = resolvePresentationCourse()
+	if not course then
+		return nil, nil
+	end
+	local activeSleds = course.ActiveSleds
+
+	local candidate = seatPart.Parent
+	if not candidate
+		or not candidate:IsA("Model")
+		or candidate.Name ~= SLED_MODEL_NAME
+		or candidate.Parent ~= activeSleds
+	then
+		return nil, nil
+	end
+	local root = candidate:FindFirstChild(SLED_ROOT_NAME)
+	local driverSeat = candidate:FindFirstChild(DRIVER_SEAT_NAME)
+	if not root
+		or not root:IsA("BasePart")
+		or driverSeat ~= seatPart
+		or candidate.PrimaryPart ~= root
+	then
 		return nil, nil
 	end
 
-	local candidate: Instance? = seatPart.Parent
-	while candidate and candidate ~= activeSleds do
-		if candidate:IsA("Model") and candidate.Parent == activeSleds then
-			local root = candidate:FindFirstChild("SledRoot")
-			local driverSeat = candidate:FindFirstChild("DriverSeat")
-			if root and root:IsA("BasePart") and driverSeat == seatPart then
-				return candidate, root
-			end
-			return nil, nil
-		end
-		candidate = candidate.Parent
-	end
-
-	return nil, nil
+	return candidate, root
 end
 
 local function findRunnerPair(model: Model, root: BasePart): (BasePart?, BasePart?)
@@ -1395,6 +1496,17 @@ local function resetRunPresentation(runId: number)
 	sledEffectsDisabledRunId = nil
 end
 
+local function onPresentationCourseChanged()
+	local effects = activeSledEffects
+	if effects then
+		local currentModel, currentRoot = findActiveSledModel()
+		if currentModel ~= effects.Model or currentRoot ~= effects.Root then
+			destroyActiveSledEffects()
+		end
+	end
+	nextSledResolveAt = 0
+end
+
 function VFXController.start()
 	if started then
 		return
@@ -1425,6 +1537,10 @@ function VFXController.start()
 		currentGlowTucking = false
 		destroyActiveSledEffects()
 	end))
+	table.insert(
+		controllerConnections,
+		localPlayer:GetAttributeChangedSignal(PRESENTATION_COURSE_ATTRIBUTE_NAME):Connect(onPresentationCourseChanged)
+	)
 	table.insert(controllerConnections, script.Destroying:Connect(function()
 		VFXController.destroy()
 	end))

@@ -17,6 +17,19 @@ export type TaperZone = {
 	Widens: boolean,
 }
 
+export type RouteGeometryPoint = {
+	LocalPosition: Vector3,
+	TrackWidth: number,
+	ClearPlayableWidth: number,
+}
+
+export type RouteData = {
+	SampledCenterlinePoints: { Vector3 },
+	GeometryPoints: { RouteGeometryPoint },
+	GeometrySplitLongitudinals: { number },
+	AuthoredPathLengthStuds: number,
+}
+
 export type FrostTrailConfig = {
 	CourseId: string,
 	DisplayName: string,
@@ -24,6 +37,7 @@ export type FrostTrailConfig = {
 	WorldVersion: number,
 	StaticFoundationOnly: boolean,
 	Playable: boolean,
+	ActivationMode: "StudioControlledTest",
 	WorldOrigin: Vector3,
 	ForwardDirection: Vector3,
 	ValidationEpsilon: number,
@@ -51,6 +65,7 @@ export type FrostTrailConfig = {
 	LandingTopY: number,
 	LandingSegmentOverlap: number,
 	PathPoints: { Vector3 },
+	RouteData: RouteData,
 	Sections: { SectionDefinition },
 	WidenedRouteZones: { RouteWidthZone },
 	TaperZones: { TaperZone },
@@ -66,6 +81,36 @@ export type FrostTrailConfig = {
 	LandingStartLongitudinal: number,
 	LandingEndLongitudinal: number,
 }
+
+local TRACK_WIDTH = 84
+local CLEAR_PLAYABLE_WIDTH = 72
+local WIDENED_TRACK_WIDTH = 120
+local WIDENED_CLEAR_PLAYABLE_WIDTH = 108
+local SAMPLES_PER_CURVE = 4
+
+local geometrySplitLongitudinals: { number } = {
+	3050,
+	3075,
+	3100,
+	3125,
+	3150,
+	3600,
+	3625,
+	3650,
+	3675,
+	3700,
+	3950,
+	3975,
+	4000,
+	4025,
+	4050,
+	4500,
+	4525,
+	4550,
+	4575,
+	4600,
+}
+table.freeze(geometrySplitLongitudinals)
 
 local pathPoints: { Vector3 } = {
 	Vector3.new(0, 560, -250),
@@ -116,24 +161,127 @@ table.freeze(taperZones)
 local laneCenterOffsets: { number } = { -24, 0, 24 }
 table.freeze(laneCenterOffsets)
 
+local function catmullRom(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, alpha: number): Vector3
+	local alphaSquared = alpha * alpha
+	local alphaCubed = alphaSquared * alpha
+	return 0.5
+		* (
+			(2 * p1)
+			+ ((-p0 + p2) * alpha)
+			+ ((2 * p0 - 5 * p1 + 4 * p2 - p3) * alphaSquared)
+			+ ((-p0 + 3 * p1 - 3 * p2 + p3) * alphaCubed)
+		)
+end
+
+local function sampleCenterline(): { Vector3 }
+	local sampled: { Vector3 } = {}
+	for index = 1, #pathPoints - 1 do
+		local p0 = pathPoints[math.max(1, index - 1)]
+		local p1 = pathPoints[index]
+		local p2 = pathPoints[index + 1]
+		local p3 = pathPoints[math.min(#pathPoints, index + 2)]
+		for sampleIndex = 0, SAMPLES_PER_CURVE - 1 do
+			local alpha = sampleIndex / SAMPLES_PER_CURVE
+			table.insert(sampled, catmullRom(p0, p1, p2, p3, alpha))
+		end
+	end
+	table.insert(sampled, pathPoints[#pathPoints])
+	return sampled
+end
+
+local function smoothstep(alpha: number): number
+	local clamped = math.clamp(alpha, 0, 1)
+	return clamped * clamped * (3 - 2 * clamped)
+end
+
+local function widthsAt(longitudinal: number): (number, number)
+	for _, taper in ipairs(taperZones) do
+		if longitudinal >= taper.StartLongitudinal and longitudinal <= taper.EndLongitudinal then
+			local alpha = (longitudinal - taper.StartLongitudinal)
+				/ (taper.EndLongitudinal - taper.StartLongitudinal)
+			local eased = smoothstep(alpha)
+			if taper.Widens then
+				return TRACK_WIDTH + (WIDENED_TRACK_WIDTH - TRACK_WIDTH) * eased,
+					CLEAR_PLAYABLE_WIDTH
+						+ (WIDENED_CLEAR_PLAYABLE_WIDTH - CLEAR_PLAYABLE_WIDTH) * eased
+			end
+			return WIDENED_TRACK_WIDTH + (TRACK_WIDTH - WIDENED_TRACK_WIDTH) * eased,
+				WIDENED_CLEAR_PLAYABLE_WIDTH
+					+ (CLEAR_PLAYABLE_WIDTH - WIDENED_CLEAR_PLAYABLE_WIDTH) * eased
+		end
+	end
+	for _, zone in ipairs(widenedRouteZones) do
+		if longitudinal >= zone.StartLongitudinal and longitudinal <= zone.EndLongitudinal then
+			return WIDENED_TRACK_WIDTH, WIDENED_CLEAR_PLAYABLE_WIDTH
+		end
+	end
+	return TRACK_WIDTH, CLEAR_PLAYABLE_WIDTH
+end
+
+local function splitCenterline(sampled: { Vector3 }): { Vector3 }
+	local geometryPositions: { Vector3 } = { sampled[1] }
+	for index = 1, #sampled - 1 do
+		local pointA = sampled[index]
+		local pointB = sampled[index + 1]
+		for _, splitLongitudinal in ipairs(geometrySplitLongitudinals) do
+			if splitLongitudinal > pointA.Z and splitLongitudinal < pointB.Z then
+				local alpha = (splitLongitudinal - pointA.Z) / (pointB.Z - pointA.Z)
+				table.insert(geometryPositions, pointA:Lerp(pointB, alpha))
+			end
+		end
+		table.insert(geometryPositions, pointB)
+	end
+	return geometryPositions
+end
+
+local sampledCenterlinePoints = sampleCenterline()
+local authoredPathLengthStuds = 0
+for index = 1, #sampledCenterlinePoints - 1 do
+	authoredPathLengthStuds += (sampledCenterlinePoints[index + 1] - sampledCenterlinePoints[index]).Magnitude
+end
+table.freeze(sampledCenterlinePoints)
+
+local geometryPositions = splitCenterline(sampledCenterlinePoints)
+local geometryPoints: { RouteGeometryPoint } = {}
+for _, localPosition in ipairs(geometryPositions) do
+	local trackWidth, clearPlayableWidth = widthsAt(localPosition.Z)
+	local routePoint: RouteGeometryPoint = {
+		LocalPosition = localPosition,
+		TrackWidth = trackWidth,
+		ClearPlayableWidth = clearPlayableWidth,
+	}
+	table.freeze(routePoint)
+	table.insert(geometryPoints, routePoint)
+end
+table.freeze(geometryPoints)
+
+local routeData: RouteData = {
+	SampledCenterlinePoints = sampledCenterlinePoints,
+	GeometryPoints = geometryPoints,
+	GeometrySplitLongitudinals = geometrySplitLongitudinals,
+	AuthoredPathLengthStuds = authoredPathLengthStuds,
+}
+table.freeze(routeData)
+
 local config: FrostTrailConfig = {
 	CourseId = "FrostTrailV1",
 	DisplayName = "FROST TRAIL",
 	WorldModelName = "FrostTrailWorld",
 	WorldVersion = 1,
-	StaticFoundationOnly = true,
+	StaticFoundationOnly = false,
 	Playable = false,
+	ActivationMode = "StudioControlledTest",
 	WorldOrigin = Vector3.new(3200, 0, 0),
 	ForwardDirection = Vector3.zAxis,
 	ValidationEpsilon = 1e-5,
-	TrackWidth = 84,
-	ClearPlayableWidth = 72,
+	TrackWidth = TRACK_WIDTH,
+	ClearPlayableWidth = CLEAR_PLAYABLE_WIDTH,
 	LaneCenterOffsets = laneCenterOffsets,
-	WidenedTrackWidth = 120,
-	WidenedClearPlayableWidth = 108,
+	WidenedTrackWidth = WIDENED_TRACK_WIDTH,
+	WidenedClearPlayableWidth = WIDENED_CLEAR_PLAYABLE_WIDTH,
 	TrackThickness = 3,
 	TrackSegmentOverlap = 1.5,
-	SamplesPerCurve = 4,
+	SamplesPerCurve = SAMPLES_PER_CURVE,
 	SnowBankWidth = 10,
 	SafetyWallThickness = 2,
 	SafetyWallHeight = 14,
@@ -150,6 +298,7 @@ local config: FrostTrailConfig = {
 	LandingTopY = 0,
 	LandingSegmentOverlap = 0.25,
 	PathPoints = pathPoints,
+	RouteData = routeData,
 	Sections = sections,
 	WidenedRouteZones = widenedRouteZones,
 	TaperZones = taperZones,

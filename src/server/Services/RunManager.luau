@@ -3,12 +3,14 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
 local Workspace = game:GetService("Workspace")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
 local CourseRegistry = require(script.Parent.CourseRegistry)
+local FrostTrailConfig = require(script.Parent.FrostTrailConfig)
 local PlayerDataService = require(script.Parent.PlayerDataService)
 local ResultService = require(script.Parent.ResultService)
 local SledFactory = require(script.Parent.SledFactory)
@@ -22,6 +24,17 @@ local STATE_REMOTE_NAME = "RunState"
 local RESULT_REMOTE_NAME = "RunResult"
 local RESULT_ACTION_REMOTE_NAME = "ResultAction"
 local PROMPT_NAME = "StartRunPrompt"
+local STUDIO_COURSE_CONTROL_BRIDGE_NAME = "FrostlineStudioCourseControl"
+local PRESENTATION_COURSE_ATTRIBUTE = "FrostlinePresentationCourseId"
+local CLASSIC_COURSE_ID: CourseRegistry.CourseId = "FrozenLakeV2"
+local FROST_TRAIL_COURSE_ID: CourseRegistry.CourseId = "FrostTrailV1"
+local FROST_LAKE_MARKED_PART_NAME = "FrostTrailLakeMarked_0000m_1500m"
+local FROST_LAKE_RUNOFF_PART_NAME = "FrostTrailLakeRunoff_1500m_1800m"
+local FROST_ROUTE_EXPECTED_AUTHORED_LENGTH = 6696.671726289
+local FROST_ROUTE_LENGTH_TOLERANCE = 0.01
+local FROST_ROUTE_EXPECTED_SAMPLE_COUNT = 57
+local FROST_ROUTE_EXPECTED_GEOMETRY_POINT_COUNT = 75
+local FROST_ROUTE_EXPECTED_SPLIT_COUNT = 20
 local MIN_TUCK_REQUEST_INTERVAL = 0.06
 local HUD_UPDATE_INTERVAL = 0.1
 local MAX_START_DISTANCE = 20
@@ -47,12 +60,13 @@ local COURSE_BASIS_EPSILON = 1e-5
 local LANDING_CONTACT_LOG_PREFIX = "[Frostline][LandingContact]"
 local LANDING_CONTACT_SOURCE = "SledRoot.Touched"
 local LANDING_CONTACT_CONDITION =
-	"activeExact&&!CleanupStarted&&otherPart:IsDescendantOf(session.ResolvedCourse.LandingSurfaces)&&phase==Airborne&&SledRoot.Parent~=nil&&transitionTo(Landed)==true"
+	"activeExact&&!CleanupStarted&&isCourseLandingSurface(session.ResolvedCourse,otherPart)&&phase==Airborne&&SledRoot.Parent~=nil&&transitionTo(Landed)==true"
 
 type Phase = RunPhase.Name
 type Sled = SledFactory.Sled
 type CourseId = CourseRegistry.CourseId
 type CourseDefinition = CourseRegistry.CourseDefinition
+type RouteData = CourseRegistry.RouteData
 type StallObservationKind = "recovery" | "missed-launch"
 type RunOutcome = "missed-launch"
 type ResultAction = ResultTypes.Action
@@ -132,6 +146,7 @@ type ResolvedCourse = {
 	SummitPlatform: BasePart,
 	LaunchEdge: BasePart,
 	LandingSurfaces: Folder,
+	ExactLandingSurfaces: { [BasePart]: boolean }?,
 	PlayerSpawn: SpawnLocation,
 	CoordinateOrigin: Vector3,
 	ForwardDirection: Vector3,
@@ -147,6 +162,20 @@ type ResolvedCourse = {
 }
 
 type ResolvedCourseDictionary = { [CourseId]: ResolvedCourse }
+
+type RouteSample = {
+	CenterX: number,
+	CenterY: number,
+	TrackWidth: number,
+}
+
+type PreparedCourseState = {
+	CourseId: CourseId,
+	Generation: number,
+	Routing: boolean,
+	SawInitialCharacter: boolean,
+	CharacterConnection: RBXScriptConnection?,
+}
 
 type Session = {
 	RunId: number,
@@ -268,26 +297,63 @@ local sessions: { [Player]: Session } = {}
 local started = false
 local stateRemote: RemoteEvent? = nil
 local resultRemote: RemoteEvent? = nil
-local startPrompt: ProximityPrompt? = nil
+local startPrompts: { [CourseId]: ProximityPrompt } = {}
 local trustedReplay: ((Player, CourseId) -> ())? = nil
 local resolvedCourses: ResolvedCourseDictionary? = nil
 local pendingReplays: { [Player]: PendingReplay } = {}
 local storeOperations: { [Player]: StoreOperationToken } = {}
+local preparedCourses: { [Player]: PreparedCourseState } = {}
+local studioCourseControlBridge: BindableFunction? = nil
+local studioCourseControlWarningIssued = false
 local latestRunId = 0
 
-local function refreshStartPrompt()
-	local prompt = startPrompt
-	if not prompt or not prompt.Parent then
-		return
+local function exactCourseId(value: string): CourseId?
+	if value == CLASSIC_COURSE_ID then
+		return CLASSIC_COURSE_ID
+	elseif value == FROST_TRAIL_COURSE_ID then
+		return FROST_TRAIL_COURSE_ID
 	end
-	prompt.Enabled = next(sessions) == nil
+
+	return nil
 end
 
-local function disableStartPrompt()
-	local prompt = startPrompt
-	if prompt and prompt.Parent then
-		prompt.Enabled = false
+local function setPreparedCourse(player: Player, courseId: CourseId): boolean
+	local state = preparedCourses[player]
+	if state == nil or player.Parent ~= Players then
+		return false
 	end
+
+	state.CourseId = courseId
+	state.Generation += 1
+	player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, courseId)
+	return true
+end
+
+local function refreshStartPrompts()
+	local enabled = next(sessions) == nil
+	for _, prompt in startPrompts do
+		if prompt.Parent then
+			prompt.Enabled = enabled
+		end
+	end
+end
+
+local function disableStartPrompts()
+	for _, prompt in startPrompts do
+		if prompt.Parent then
+			prompt.Enabled = false
+		end
+	end
+end
+
+local function hasPreparedCourseRouting(): boolean
+	for _, state in preparedCourses do
+		if state.Routing then
+			return true
+		end
+	end
+
+	return false
 end
 
 local function isTransitionAllowed(currentPhase: Phase, nextPhase: Phase): boolean
@@ -363,8 +429,87 @@ local function forwardProgress(course: ResolvedCourse, fromPosition: Vector3, to
 	return (toPosition - fromPosition):Dot(course.ForwardDirection)
 end
 
+local function interpolateRouteSample(course: ResolvedCourse, longitudinal: number): RouteSample?
+	local routeData = course.Definition.RouteData
+	if course.Definition.RouteMode ~= "MonotonicZCenterline" or routeData == nil then
+		return nil
+	end
+
+	local points = routeData.GeometryPoints
+	local firstPoint = points[1]
+	local lastPoint = points[#points]
+	if firstPoint == nil or lastPoint == nil then
+		return nil
+	end
+
+	local function fromPoint(point: FrostTrailConfig.RouteGeometryPoint): RouteSample
+		return {
+			CenterX = point.LocalPosition.X,
+			CenterY = point.LocalPosition.Y,
+			TrackWidth = point.TrackWidth,
+		}
+	end
+
+	if longitudinal <= firstPoint.LocalPosition.Z then
+		return fromPoint(firstPoint)
+	elseif longitudinal >= lastPoint.LocalPosition.Z then
+		return fromPoint(lastPoint)
+	end
+
+	local lowerIndex = 1
+	local upperIndex = #points
+	while upperIndex - lowerIndex > 1 do
+		local middleIndex = math.floor((lowerIndex + upperIndex) * 0.5)
+		if points[middleIndex].LocalPosition.Z <= longitudinal then
+			lowerIndex = middleIndex
+		else
+			upperIndex = middleIndex
+		end
+	end
+
+	local lowerPoint = points[lowerIndex]
+	local upperPoint = points[upperIndex]
+	local alpha = (longitudinal - lowerPoint.LocalPosition.Z)
+		/ (upperPoint.LocalPosition.Z - lowerPoint.LocalPosition.Z)
+	local center = lowerPoint.LocalPosition:Lerp(upperPoint.LocalPosition, alpha)
+	return {
+		CenterX = center.X,
+		CenterY = center.Y,
+		TrackWidth = lowerPoint.TrackWidth + (upperPoint.TrackWidth - lowerPoint.TrackWidth) * alpha,
+	}
+end
+
 local function lateralOffset(course: ResolvedCourse, position: Vector3): number
+	if course.Definition.RouteMode == "MonotonicZCenterline" then
+		local routeSample = interpolateRouteSample(course, forwardCoordinate(course, position))
+		if routeSample == nil then
+			return math.huge
+		end
+		local localX = (position - course.CoordinateOrigin):Dot(course.RightDirection)
+		return localX - routeSample.CenterX
+	end
+
 	return (position - course.CoordinateOrigin):Dot(course.RightDirection)
+end
+
+local function activeTrackWidth(course: ResolvedCourse, position: Vector3): number
+	if course.Definition.RouteMode == "MonotonicZCenterline" then
+		local routeSample = interpolateRouteSample(course, forwardCoordinate(course, position))
+		return if routeSample then routeSample.TrackWidth else 0
+	end
+
+	return course.TrackWidth
+end
+
+local function isCourseLandingSurface(course: ResolvedCourse, part: BasePart): boolean
+	if course.CourseId == FROST_TRAIL_COURSE_ID then
+		local exactLandingSurfaces = course.ExactLandingSurfaces
+		return exactLandingSurfaces ~= nil
+			and exactLandingSurfaces[part] == true
+			and part.Parent == course.LandingSurfaces
+	end
+
+	return part:IsDescendantOf(course.LandingSurfaces)
 end
 
 local function forwardSpeed(course: ResolvedCourse, velocity: Vector3): number
@@ -389,10 +534,15 @@ local function withMinimumForwardSpeed(
 end
 
 local function distanceFromLaunch(course: ResolvedCourse, position: Vector3): number
-	return math.max(
+	local distanceMeters = math.max(
 		0,
 		(forwardCoordinate(course, position) - course.LaunchLongitudinal) / course.StudsPerMeter
 	)
+	if course.Definition.RouteMode == "MonotonicZCenterline" then
+		return math.min(distanceMeters, course.LandingFieldDistanceMeters)
+	end
+
+	return distanceMeters
 end
 
 local function isFiniteCFrame(value: CFrame): boolean
@@ -1457,7 +1607,8 @@ local function evaluateEarlyRecoveryCandidate(
 		return false, stoppedReason
 	end
 
-	local maximumLateralPosition = course.TrackWidth * 0.5 - math.max(root.Size.X, root.Size.Z) * 0.5
+	local maximumLateralPosition = activeTrackWidth(course, snapshot.Position) * 0.5
+		- math.max(root.Size.X, root.Size.Z) * 0.5
 	if math.abs(lateralOffset(course, snapshot.Position)) > maximumLateralPosition then
 		return false, "outside-track-footprint"
 	end
@@ -2218,14 +2369,14 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		end
 		if sessions[player] ~= session or session.RunId ~= runId then
 			pendingReplays[player] = nil
-			refreshStartPrompt()
+			refreshStartPrompts()
 			return
 		end
 
 		pendingReplays[player] = nil
 		if player.Parent ~= Players then
 			sessions[player] = nil
-			refreshStartPrompt()
+			refreshStartPrompts()
 			return
 		end
 
@@ -2233,7 +2384,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		if not replay then
 			lifecycleLog(session, "replay-cancelled", "reason=trusted-replay-unavailable")
 			sessions[player] = nil
-			refreshStartPrompt()
+			refreshStartPrompts()
 			return
 		end
 
@@ -2242,7 +2393,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		lifecycleLog(session, "replay-creation", "state=starting")
 		sessions[player] = nil
 		replay(player, courseId)
-		refreshStartPrompt()
+		refreshStartPrompts()
 	end)
 end
 
@@ -2292,6 +2443,7 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 
 	local teleportVerified = not teleportPlayer
 	if teleportPlayer then
+		setPreparedCourse(session.Player, session.CourseId)
 		local teleportCallSucceeded, teleportResult = pcall(teleportToSpawn, session, runId, traceReturn)
 		teleportVerified = teleportCallSucceeded and teleportResult == true
 		if not teleportCallSucceeded then
@@ -2323,7 +2475,7 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 		if sessions[session.Player] == session then
 			sessions[session.Player] = nil
 		end
-		refreshStartPrompt()
+		refreshStartPrompts()
 		return
 	end
 	local replayRequested = session.ReplayRequested and teleportVerified
@@ -2346,7 +2498,7 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 	elseif sessions[session.Player] == session then
 		sessions[session.Player] = nil
 	end
-	refreshStartPrompt()
+	refreshStartPrompts()
 end
 
 local function formatTelemetryNumber(value: number?): string
@@ -2887,7 +3039,7 @@ local function connectRunEvents(session: Session, runId: number)
 
 			if otherPart == course.LaunchEdge and session.Phase == RunPhase.Descent then
 				enterAirborne(session, runId)
-			elseif otherPart:IsDescendantOf(course.LandingSurfaces) then
+			elseif isCourseLandingSurface(course, otherPart) then
 				-- A high-speed sled can cross the thin LaunchEdge between physics events.
 				-- Promote it first so touchdown is still recognized on the same contact.
 				if session.Phase == RunPhase.Descent
@@ -3268,16 +3420,316 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 	then
 		return false, "player spawn reference is stale"
 	end
+	local spawnLook = playerSpawn.CFrame.LookVector
+	local horizontalSpawnLook = Vector3.new(spawnLook.X, 0, spawnLook.Z)
+	if horizontalSpawnLook.Magnitude <= COURSE_BASIS_EPSILON
+		or horizontalSpawnLook.Unit:Dot(course.ForwardDirection) < 1 - COURSE_BASIS_EPSILON
+	then
+		return false, "player spawn facing changed"
+	end
+
+	if course.CourseId == CLASSIC_COURSE_ID then
+		if definition.ActivationMode ~= "LiveDefault"
+			or definition.RouteMode ~= "FixedBasis"
+			or definition.RouteData ~= nil
+			or course.ExactLandingSurfaces ~= nil
+			or world:GetAttribute("CourseId") ~= CLASSIC_COURSE_ID
+		then
+			return false, "Classic routing identity changed"
+		end
+	elseif course.CourseId == FROST_TRAIL_COURSE_ID then
+		local markedLandingPart = landingSurfaces:FindFirstChild(FROST_LAKE_MARKED_PART_NAME)
+		local runoffLandingPart = landingSurfaces:FindFirstChild(FROST_LAKE_RUNOFF_PART_NAME)
+		local exactLandingSurfaces = course.ExactLandingSurfaces
+		if definition.ActivationMode ~= "StudioControlledTest"
+			or definition.RouteMode ~= "MonotonicZCenterline"
+			or definition.RouteData ~= FrostTrailConfig.RouteData
+			or world:GetAttribute("CourseId") ~= FROST_TRAIL_COURSE_ID
+			or world:GetAttribute("DisplayName") ~= FrostTrailConfig.DisplayName
+			or world:GetAttribute("WorldVersion") ~= FrostTrailConfig.WorldVersion
+			or world:GetAttribute("StaticFoundationOnly") ~= false
+			or world:GetAttribute("Playable") ~= false
+			or world:GetAttribute("ActivationMode") ~= "StudioControlledTest"
+			or world:GetAttribute("ForwardX") ~= FrostTrailConfig.ForwardDirection.X
+			or world:GetAttribute("ForwardY") ~= FrostTrailConfig.ForwardDirection.Y
+			or world:GetAttribute("ForwardZ") ~= FrostTrailConfig.ForwardDirection.Z
+			or world:GetAttribute("OriginX") ~= FrostTrailConfig.WorldOrigin.X
+			or world:GetAttribute("OriginY") ~= FrostTrailConfig.WorldOrigin.Y
+			or world:GetAttribute("OriginZ") ~= FrostTrailConfig.WorldOrigin.Z
+			or world:GetAttribute("TrackStartLongitudinal") ~= FrostTrailConfig.PathPoints[1].Z
+			or world:GetAttribute("LaunchLongitudinal") ~= 6350
+			or world:GetAttribute("AuthoredPathLengthStuds") ~= FrostTrailConfig.RouteData.AuthoredPathLengthStuds
+			or world:GetAttribute("BasePartCount") ~= 447
+			or launchEdge.Anchored ~= true
+			or launchEdge.Transparency ~= 1
+			or launchEdge.CanCollide ~= false
+			or launchEdge.CanTouch ~= true
+			or launchEdge.CanQuery ~= false
+			or launchEdge.CastShadow ~= false
+			or playerSpawn.Enabled ~= false
+			or not markedLandingPart
+			or not markedLandingPart:IsA("BasePart")
+			or markedLandingPart.Parent ~= landingSurfaces
+			or not runoffLandingPart
+			or not runoffLandingPart:IsA("BasePart")
+			or runoffLandingPart.Parent ~= landingSurfaces
+			or exactLandingSurfaces == nil
+			or not table.isfrozen(exactLandingSurfaces)
+			or exactLandingSurfaces[markedLandingPart] ~= true
+			or exactLandingSurfaces[runoffLandingPart] ~= true
+		then
+			return false, "Frost routing or lifecycle identity changed"
+		end
+		local validatedLandingSurfaces = exactLandingSurfaces :: { [BasePart]: boolean }
+
+		local directLakeParts = 0
+		for _, child in ipairs(landingSurfaces:GetChildren()) do
+			if child:IsA("BasePart") then
+				directLakeParts += 1
+				if validatedLandingSurfaces[child] ~= true
+					or not child.Anchored
+					or not child.CanCollide
+					or not child.CanTouch
+					or not child.CanQuery
+				then
+					return false, "Frost landing touch lifecycle changed"
+				end
+			end
+		end
+		if directLakeParts ~= 2 then
+			return false, "Frost landing surface identity changed"
+		end
+	else
+		return false, "resolved CourseId is not allowlisted"
+	end
 
 	return true, "ok"
 end
 
+local function isPreparedRoutingCurrent(
+	player: Player,
+	state: PreparedCourseState,
+	generation: number,
+	character: Model,
+	course: ResolvedCourse
+): boolean
+	local courses = resolvedCourses
+	return started
+		and player.Parent == Players
+		and preparedCourses[player] == state
+		and state.Generation == generation
+		and state.CourseId == course.CourseId
+		and state.Routing
+		and player.Character == character
+		and character.Parent ~= nil
+		and next(sessions) == nil
+		and next(pendingReplays) == nil
+		and courses ~= nil
+		and courses[course.CourseId] == course
+end
+
+local function teleportPreparedCharacter(
+	player: Player,
+	state: PreparedCourseState,
+	generation: number,
+	character: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	course: ResolvedCourse
+): boolean
+	local targetCFrame = course.PlayerSpawn.CFrame + Vector3.new(0, 4, 0)
+	local originalAnchored = root.Anchored
+	local controlled = false
+
+	local function releaseRoot()
+		if not controlled then
+			return
+		end
+		controlled = false
+		if root.Parent and root:IsDescendantOf(character) then
+			pcall(function()
+				root.Anchored = originalAnchored
+			end)
+			if not originalAnchored then
+				pcall(function()
+					root:SetNetworkOwnershipAuto()
+				end)
+			end
+		end
+	end
+
+	local function subjectIsCurrent(): boolean
+		return isPreparedRoutingCurrent(player, state, generation, character, course)
+			and humanoid.Parent == character
+			and humanoid.Health > 0
+			and root.Parent ~= nil
+			and root:IsDescendantOf(character)
+	end
+
+	local callSucceeded, verified = pcall(function(): boolean
+		if not subjectIsCurrent() then
+			return false
+		end
+		controlled = true
+		if root.Anchored then
+			root.Anchored = false
+		end
+		local ownershipSucceeded = pcall(function()
+			root:SetNetworkOwner(nil)
+		end)
+		if not ownershipSucceeded or not subjectIsCurrent() then
+			return false
+		end
+
+		root.Anchored = true
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		character:PivotTo(targetCFrame)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+
+		RunService.PostSimulation:Wait()
+		if not subjectIsCurrent() then
+			return false
+		end
+		RunService.PostSimulation:Wait()
+		if not subjectIsCurrent() then
+			return false
+		end
+
+		root.Anchored = originalAnchored
+		if not originalAnchored then
+			root:SetNetworkOwnershipAuto()
+		end
+		controlled = false
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+		RunService.Heartbeat:Wait()
+		if not subjectIsCurrent() then
+			return false
+		end
+		return (root.Position - targetCFrame.Position).Magnitude <= RESULT.TeleportToleranceStuds
+	end)
+
+	releaseRoot()
+	return callSucceeded and verified == true
+end
+
+local function routePreparedCharacter(player: Player, state: PreparedCourseState, character: Model)
+	if not RunService:IsStudio() or state.Routing then
+		return
+	end
+
+	local generation = state.Generation
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootInstance = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid then
+		local waitedHumanoid = character:WaitForChild("Humanoid", RESULT.TeleportCharacterReadyTimeoutSeconds)
+		if waitedHumanoid and waitedHumanoid:IsA("Humanoid") then
+			humanoid = waitedHumanoid
+		end
+	end
+	if not rootInstance then
+		rootInstance = character:WaitForChild("HumanoidRootPart", RESULT.TeleportCharacterReadyTimeoutSeconds)
+	end
+	if preparedCourses[player] ~= state
+		or state.Generation ~= generation
+		or player.Character ~= character
+	then
+		return
+	end
+	if not humanoid
+		or humanoid.Health <= 0
+		or not rootInstance
+		or not rootInstance:IsA("BasePart")
+		or sessions[player] ~= nil
+		or pendingReplays[player] ~= nil
+		or storeOperations[player] ~= nil
+	then
+		return
+	end
+
+	local courses = resolvedCourses
+	local course = if courses then courses[state.CourseId] else nil
+	if course == nil then
+		return
+	end
+	local courseValid = validateResolvedCourseLive(course)
+	if not courseValid then
+		return
+	end
+
+	state.Routing = true
+	local routeGeneration = state.Generation
+	teleportPreparedCharacter(player, state, routeGeneration, character, humanoid, rootInstance, course)
+	if preparedCourses[player] == state and state.Generation == routeGeneration then
+		state.Routing = false
+	end
+end
+
+local function onPreparedCharacterAdded(player: Player, state: PreparedCourseState, character: Model)
+	if preparedCourses[player] ~= state then
+		return
+	end
+	if not state.SawInitialCharacter then
+		state.SawInitialCharacter = true
+		return
+	end
+
+	routePreparedCharacter(player, state, character)
+end
+
+local function initializePreparedPlayer(player: Player)
+	if player.Parent ~= Players or preparedCourses[player] ~= nil then
+		return
+	end
+
+	local state: PreparedCourseState = {
+		CourseId = CLASSIC_COURSE_ID,
+		Generation = 0,
+		Routing = false,
+		SawInitialCharacter = player.Character ~= nil,
+		CharacterConnection = nil,
+	}
+	preparedCourses[player] = state
+	player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, CLASSIC_COURSE_ID)
+	if RunService:IsStudio() then
+		state.CharacterConnection = player.CharacterAdded:Connect(function(character: Model)
+			onPreparedCharacterAdded(player, state, character)
+		end)
+	end
+end
+
+local function clearPreparedPlayer(player: Player)
+	local state = preparedCourses[player]
+	if state == nil then
+		return
+	end
+	state.Generation += 1
+	state.Routing = false
+	local connection = state.CharacterConnection
+	state.CharacterConnection = nil
+	if connection then
+		connection:Disconnect()
+	end
+	preparedCourses[player] = nil
+end
+
 local function beginRun(player: Player, course: ResolvedCourse, trustedStart: boolean)
 	if player.Parent ~= Players
-		or sessions[player]
+		or next(sessions) ~= nil
+		or hasPreparedCourseRouting()
 		or pendingReplays[player]
 		or storeOperations[player]
 		or PlayerDataService.hasUnresolvedStoreSave(player)
+	then
+		return
+	end
+	local preparedState = preparedCourses[player]
+	if preparedState == nil or preparedState.Routing then
+		return
+	elseif course.CourseId == FROST_TRAIL_COURSE_ID
+		and (not RunService:IsStudio() or preparedState.CourseId ~= FROST_TRAIL_COURSE_ID)
 	then
 		return
 	end
@@ -3308,7 +3760,10 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		return
 	end
 	local equippedSledId = PlayerDataService.getEquippedSledId(player)
-	disableStartPrompt()
+	if not setPreparedCourse(player, course.CourseId) then
+		return
+	end
+	disableStartPrompts()
 
 	local triggerCenter = course.StartTrigger.Position
 	local sled = SledFactory.create(
@@ -3425,14 +3880,14 @@ local function startRunSafely(player: Player, courseId: CourseId, trustedStart: 
 				player.Name
 			)
 		)
-		refreshStartPrompt()
+		refreshStartPrompts()
 		return
 	end
 
 	local ok, message = pcall(beginRun, player, course, trustedStart)
 	if ok then
 		if not sessions[player] then
-			refreshStartPrompt()
+			refreshStartPrompts()
 		end
 		return
 	end
@@ -3452,11 +3907,116 @@ local function startRunSafely(player: Player, courseId: CourseId, trustedStart: 
 		end
 	else
 		warn(string.format("[Frostline] Failed to create run for %s: %s", player.Name, tostring(message)))
-		refreshStartPrompt()
+		refreshStartPrompts()
 	end
 end
 
-local function validateRegistry(): (CourseDefinition?, string)
+local function validateRouteData(routeData: RouteData): (boolean, string)
+	if routeData ~= FrostTrailConfig.RouteData or not table.isfrozen(routeData) then
+		return false, "Frost route data identity or freeze is invalid"
+	elseif not table.isfrozen(routeData.SampledCenterlinePoints)
+		or #routeData.SampledCenterlinePoints ~= FROST_ROUTE_EXPECTED_SAMPLE_COUNT
+	then
+		return false, "Frost sampled centerline is invalid"
+	elseif not table.isfrozen(routeData.GeometryPoints)
+		or #routeData.GeometryPoints ~= FROST_ROUTE_EXPECTED_GEOMETRY_POINT_COUNT
+	then
+		return false, "Frost geometry route is invalid"
+	elseif not table.isfrozen(routeData.GeometrySplitLongitudinals)
+		or #routeData.GeometrySplitLongitudinals ~= FROST_ROUTE_EXPECTED_SPLIT_COUNT
+	then
+		return false, "Frost geometry splits are invalid"
+	elseif not isFiniteNumber(routeData.AuthoredPathLengthStuds)
+		or math.abs(routeData.AuthoredPathLengthStuds - FROST_ROUTE_EXPECTED_AUTHORED_LENGTH)
+			> FROST_ROUTE_LENGTH_TOLERANCE
+	then
+		return false, "Frost authored route length is invalid"
+	end
+
+	local measuredLength = 0
+	for index, point in ipairs(routeData.SampledCenterlinePoints) do
+		if not isFiniteVector3(point) then
+			return false, "Frost sampled centerline contains a non-finite point"
+		end
+		if index > 1 then
+			local previous = routeData.SampledCenterlinePoints[index - 1]
+			local chord = point - previous
+			if point.Z <= previous.Z or chord.Magnitude <= COURSE_BASIS_EPSILON then
+				return false, "Frost sampled centerline is not strictly monotonic"
+			end
+			measuredLength += chord.Magnitude
+		end
+	end
+	if math.abs(measuredLength - routeData.AuthoredPathLengthStuds) > FROST_ROUTE_LENGTH_TOLERANCE then
+		return false, "Frost sampled centerline length does not match its metadata"
+	end
+
+	for index, routePoint in ipairs(routeData.GeometryPoints) do
+		if not table.isfrozen(routePoint)
+			or not isFiniteVector3(routePoint.LocalPosition)
+			or not isFinitePositiveNumber(routePoint.TrackWidth)
+			or not isFinitePositiveNumber(routePoint.ClearPlayableWidth)
+			or routePoint.ClearPlayableWidth > routePoint.TrackWidth
+		then
+			return false, "Frost geometry route point is invalid"
+		end
+		if index > 1 then
+			local previous = routeData.GeometryPoints[index - 1].LocalPosition
+			local chord = routePoint.LocalPosition - previous
+			if routePoint.LocalPosition.Z <= previous.Z or chord.Magnitude <= COURSE_BASIS_EPSILON then
+				return false, "Frost geometry route is not strictly monotonic"
+			end
+		end
+	end
+
+	local firstSample = routeData.SampledCenterlinePoints[1]
+	local lastSample = routeData.SampledCenterlinePoints[#routeData.SampledCenterlinePoints]
+	local firstGeometry = routeData.GeometryPoints[1].LocalPosition
+	local lastGeometry = routeData.GeometryPoints[#routeData.GeometryPoints].LocalPosition
+	if firstSample ~= firstGeometry
+		or lastSample ~= lastGeometry
+		or firstGeometry ~= FrostTrailConfig.PathPoints[1]
+		or lastGeometry ~= FrostTrailConfig.PathPoints[#FrostTrailConfig.PathPoints]
+	then
+		return false, "Frost route endpoints are invalid"
+	end
+
+	local previousSplit = -math.huge
+	for _, splitLongitudinal in ipairs(routeData.GeometrySplitLongitudinals) do
+		if not isFiniteNumber(splitLongitudinal) or splitLongitudinal <= previousSplit then
+			return false, "Frost geometry splits are not strictly ordered"
+		end
+		previousSplit = splitLongitudinal
+		local found = false
+		for _, routePoint in ipairs(routeData.GeometryPoints) do
+			if math.abs(routePoint.LocalPosition.Z - splitLongitudinal) <= FrostTrailConfig.ValidationEpsilon then
+				found = true
+				break
+			end
+		end
+		if not found then
+			return false, "Frost geometry split is absent from the route"
+		end
+	end
+
+	return true, "ok"
+end
+
+local function validateDefinitionNames(definition: CourseDefinition): boolean
+	return isNonEmptyString(definition.CourseId)
+		and isNonEmptyString(definition.DisplayName)
+		and isNonEmptyString(definition.WorldModelName)
+		and isNonEmptyString(definition.GeometryFolderName)
+		and isNonEmptyString(definition.MarkersFolderName)
+		and isNonEmptyString(definition.ActiveSledsFolderName)
+		and isNonEmptyString(definition.StartTriggerName)
+		and isNonEmptyString(definition.SummitPlatformName)
+		and isNonEmptyString(definition.LaunchEdgeName)
+		and isNonEmptyString(definition.LandingSurfacesName)
+		and isNonEmptyString(definition.PlayerSpawnName)
+end
+
+local function validateRegistry(): ({ [CourseId]: CourseDefinition }?, string)
 	if not table.isfrozen(CourseRegistry) then
 		return nil, "registry API is not frozen"
 	elseif not table.isfrozen(CourseRegistry.Definitions) then
@@ -3464,59 +4024,91 @@ local function validateRegistry(): (CourseDefinition?, string)
 	end
 
 	local definitionCount = 0
-	local registeredDefinition: CourseDefinition? = nil
 	for courseId, definition in CourseRegistry.Definitions do
 		definitionCount += 1
-		registeredDefinition = definition
-		if courseId ~= definition.CourseId then
+		if exactCourseId(courseId) == nil then
+			return nil, "definitions contain a non-allowlisted CourseId"
+		elseif courseId ~= definition.CourseId then
 			return nil, "definition key does not match CourseId"
 		elseif not table.isfrozen(definition) then
 			return nil, "course definition is not frozen"
 		end
 	end
-	if definitionCount ~= 1 or registeredDefinition == nil then
-		return nil, "definitions must contain exactly one course"
+	if definitionCount ~= 2 then
+		return nil, "definitions must contain exactly two courses"
 	end
 
-	local defaultCourseId = CourseRegistry.DefaultCourseId
-	if defaultCourseId ~= "FrozenLakeV2" then
+	if CourseRegistry.DefaultCourseId ~= CLASSIC_COURSE_ID then
 		return nil, "default CourseId is not FrozenLakeV2"
-	elseif defaultCourseId ~= GameConfig.Leaderboard.CourseId then
+	elseif CourseRegistry.DefaultCourseId ~= GameConfig.Leaderboard.CourseId then
 		return nil, "default CourseId does not match leaderboard CourseId"
 	end
 
-	local definition = CourseRegistry.getDefinition(defaultCourseId)
-	if definition == nil
-		or CourseRegistry.Definitions[defaultCourseId] ~= definition
-		or definition ~= registeredDefinition
+	local classicDefinition = CourseRegistry.getDefinition(CLASSIC_COURSE_ID)
+	local frostDefinition = CourseRegistry.getDefinition(FROST_TRAIL_COURSE_ID)
+	if classicDefinition == nil
+		or frostDefinition == nil
+		or CourseRegistry.Definitions[CLASSIC_COURSE_ID] ~= classicDefinition
+		or CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID] ~= frostDefinition
 	then
-		return nil, "default course definition is unavailable"
-	elseif CourseRegistry.getDefinition("UnknownCourse") ~= nil then
-		return nil, "registry accepted an unknown CourseId"
+		return nil, "allowlisted course definitions are unavailable"
+	elseif CourseRegistry.getDefinition("UnknownCourse") ~= nil
+		or CourseRegistry.getDefinition("frozenlakev2") ~= nil
+		or CourseRegistry.getDefinition("FROST TRAIL") ~= nil
+		or CourseRegistry.getDefinition("1") ~= nil
+	then
+		return nil, "registry accepted a non-exact CourseId"
 	end
 
-	if not isNonEmptyString(definition.CourseId)
-		or not isNonEmptyString(definition.DisplayName)
-		or not isNonEmptyString(definition.WorldModelName)
-		or not isNonEmptyString(definition.GeometryFolderName)
-		or not isNonEmptyString(definition.MarkersFolderName)
-		or not isNonEmptyString(definition.ActiveSledsFolderName)
-		or not isNonEmptyString(definition.StartTriggerName)
-		or not isNonEmptyString(definition.SummitPlatformName)
-		or not isNonEmptyString(definition.LaunchEdgeName)
-		or not isNonEmptyString(definition.LandingSurfacesName)
-		or not isNonEmptyString(definition.PlayerSpawnName)
+	if classicDefinition.ActivationMode ~= "LiveDefault"
+		or classicDefinition.RouteMode ~= "FixedBasis"
+		or classicDefinition.RouteData ~= nil
+		or not validateDefinitionNames(classicDefinition)
 	then
-		return nil, "course definition contains an empty name"
+		return nil, "Classic routing discriminators are invalid"
 	end
 
-	return definition, "ok"
+	return CourseRegistry.Definitions, "ok"
 end
 
-local function resolveCourses(): (ResolvedCourseDictionary?, string)
-	local definition, registryReason = validateRegistry()
-	if not definition then
-		return nil, registryReason
+local function validateFrostDefinition(definition: CourseDefinition): (boolean, string)
+	local frostRouteData = definition.RouteData
+	if not table.isfrozen(FrostTrailConfig)
+		or not table.isfrozen(FrostTrailConfig.PathPoints)
+		or not validateDefinitionNames(definition)
+		or definition.ActivationMode ~= "StudioControlledTest"
+		or definition.RouteMode ~= "MonotonicZCenterline"
+		or frostRouteData == nil
+		or definition.CourseId ~= FrostTrailConfig.CourseId
+		or definition.DisplayName ~= FrostTrailConfig.DisplayName
+		or definition.WorldModelName ~= FrostTrailConfig.WorldModelName
+		or definition.CoordinateOrigin ~= FrostTrailConfig.WorldOrigin
+		or definition.ForwardDirection ~= FrostTrailConfig.ForwardDirection
+		or definition.TrackWidth ~= FrostTrailConfig.TrackWidth
+		or definition.StudsPerMeter ~= FrostTrailConfig.StudsPerMeter
+		or definition.RampFreedomLongitudinal ~= FrostTrailConfig.RampFreedomLongitudinal
+		or definition.LandingFieldDistanceMeters ~= FrostTrailConfig.LandingFieldDistanceMeters
+		or definition.MaximumRunDurationSeconds ~= FrostTrailConfig.MaximumRunDurationSeconds
+		or definition.SafetyMaximumLateralDistance ~= FrostTrailConfig.SafetyMaximumLateralDistance
+		or definition.SafetyMinimumWorldY ~= FrostTrailConfig.SafetyMinimumWorldY
+		or FrostTrailConfig.StaticFoundationOnly ~= false
+		or FrostTrailConfig.Playable ~= false
+		or FrostTrailConfig.ActivationMode ~= "StudioControlledTest"
+	then
+		return false, "Frost definition or lifecycle metadata is invalid"
+	end
+
+	return validateRouteData(frostRouteData)
+end
+
+local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedCourse?, string)
+	if definition.CourseId == FROST_TRAIL_COURSE_ID then
+		local frostDefinitionValid, frostDefinitionReason = validateFrostDefinition(definition)
+		if not frostDefinitionValid then
+			return nil, frostDefinitionReason
+		end
+	elseif definition.CourseId ~= CLASSIC_COURSE_ID or not validateDefinitionNames(definition) then
+		return nil, "course definition identity is invalid"
 	end
 
 	local coordinateOrigin = definition.CoordinateOrigin
@@ -3614,6 +4206,7 @@ local function resolveCourses(): (ResolvedCourseDictionary?, string)
 	local launchEdge = launchEdgeInstance
 	local landingSurfaces = landingSurfacesInstance
 	local playerSpawn = playerSpawnInstance
+	local exactLandingSurfaces: { [BasePart]: boolean }? = nil
 
 	if not geometry:IsDescendantOf(world)
 		or not markers:IsDescendantOf(world)
@@ -3627,6 +4220,84 @@ local function resolveCourses(): (ResolvedCourseDictionary?, string)
 	elseif landingSurfaces:FindFirstChildWhichIsA("BasePart", false) == nil then
 		return nil, "landing surfaces contain no direct BasePart"
 	end
+	local spawnLook = playerSpawn.CFrame.LookVector
+	local horizontalSpawnLook = Vector3.new(spawnLook.X, 0, spawnLook.Z)
+	if horizontalSpawnLook.Magnitude <= COURSE_BASIS_EPSILON
+		or horizontalSpawnLook.Unit:Dot(forwardDirection) < 1 - COURSE_BASIS_EPSILON
+	then
+		return nil, "PlayerSpawn does not face the course"
+	end
+
+	if definition.CourseId == FROST_TRAIL_COURSE_ID then
+		local markedLandingInstance = landingSurfaces:FindFirstChild(FROST_LAKE_MARKED_PART_NAME)
+		local runoffLandingInstance = landingSurfaces:FindFirstChild(FROST_LAKE_RUNOFF_PART_NAME)
+		if not markedLandingInstance
+			or not markedLandingInstance:IsA("BasePart")
+			or markedLandingInstance.Parent ~= landingSurfaces
+			or not runoffLandingInstance
+			or not runoffLandingInstance:IsA("BasePart")
+			or runoffLandingInstance.Parent ~= landingSurfaces
+		then
+			return nil, "Frost landing surface identities are invalid"
+		end
+		local markedLandingPart = markedLandingInstance :: BasePart
+		local runoffLandingPart = runoffLandingInstance :: BasePart
+		local landingSurfaceSet: { [BasePart]: boolean } = {
+			[markedLandingPart] = true,
+			[runoffLandingPart] = true,
+		}
+		table.freeze(landingSurfaceSet)
+		exactLandingSurfaces = landingSurfaceSet
+
+		local frostPartCount = 0
+		for _, descendant in ipairs(world:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				frostPartCount += 1
+			end
+		end
+		local directLakeParts = 0
+		for _, child in ipairs(landingSurfaces:GetChildren()) do
+			if child:IsA("BasePart") then
+				directLakeParts += 1
+				if landingSurfaceSet[child] ~= true
+					or not child.Anchored
+					or not child.CanCollide
+					or not child.CanTouch
+					or not child.CanQuery
+				then
+					return nil, "Frost landing surface touch lifecycle is invalid"
+				end
+			end
+		end
+		if world:GetAttribute("CourseId") ~= FrostTrailConfig.CourseId
+			or world:GetAttribute("DisplayName") ~= FrostTrailConfig.DisplayName
+			or world:GetAttribute("WorldVersion") ~= FrostTrailConfig.WorldVersion
+			or world:GetAttribute("StaticFoundationOnly") ~= false
+			or world:GetAttribute("Playable") ~= false
+			or world:GetAttribute("ActivationMode") ~= "StudioControlledTest"
+			or world:GetAttribute("ForwardX") ~= FrostTrailConfig.ForwardDirection.X
+			or world:GetAttribute("ForwardY") ~= FrostTrailConfig.ForwardDirection.Y
+			or world:GetAttribute("ForwardZ") ~= FrostTrailConfig.ForwardDirection.Z
+			or world:GetAttribute("OriginX") ~= FrostTrailConfig.WorldOrigin.X
+			or world:GetAttribute("OriginY") ~= FrostTrailConfig.WorldOrigin.Y
+			or world:GetAttribute("OriginZ") ~= FrostTrailConfig.WorldOrigin.Z
+			or world:GetAttribute("TrackStartLongitudinal") ~= FrostTrailConfig.PathPoints[1].Z
+			or world:GetAttribute("BasePartCount") ~= 447
+			or frostPartCount ~= 447
+			or world:GetAttribute("LaunchLongitudinal") ~= 6350
+			or world:GetAttribute("AuthoredPathLengthStuds") ~= FrostTrailConfig.RouteData.AuthoredPathLengthStuds
+			or launchEdge.Anchored ~= true
+			or launchEdge.Transparency ~= 1
+			or launchEdge.CanCollide ~= false
+			or launchEdge.CanTouch ~= true
+			or launchEdge.CanQuery ~= false
+			or launchEdge.CastShadow ~= false
+			or directLakeParts ~= 2
+			or playerSpawn.Enabled ~= false
+		then
+			return nil, "Frost world identity or lifecycle attributes are invalid"
+		end
+	end
 
 	local launchLongitudinal = (launchEdge.Position - coordinateOrigin):Dot(forwardDirection)
 	local startLongitudinal = (startTrigger.Position - coordinateOrigin):Dot(forwardDirection)
@@ -3636,10 +4307,16 @@ local function resolveCourses(): (ResolvedCourseDictionary?, string)
 		return nil, "StartTrigger must be before LaunchEdge"
 	elseif definition.RampFreedomLongitudinal >= launchLongitudinal then
 		return nil, "ramp freedom must be before LaunchEdge"
+	elseif definition.CourseId == FROST_TRAIL_COURSE_ID and launchLongitudinal ~= 6350 then
+		return nil, "Frost launch plane is invalid"
 	end
 
-	-- Reconcile ActiveSleds only after every registry, metric, basis, and required
-	-- Instance check above has succeeded.
+	if definition.CourseId == CLASSIC_COURSE_ID then
+		world:SetAttribute("CourseId", CLASSIC_COURSE_ID)
+	end
+
+	-- Reconcile ActiveSleds only after every registry, metric, basis, lifecycle,
+	-- hierarchy, ancestry, and touch check above has succeeded.
 	local activeSleds: Folder
 	local existingSleds = world:FindFirstChild(definition.ActiveSledsFolderName)
 	if existingSleds and existingSleds:IsA("Folder") then
@@ -3664,6 +4341,7 @@ local function resolveCourses(): (ResolvedCourseDictionary?, string)
 		SummitPlatform = summitPlatform,
 		LaunchEdge = launchEdge,
 		LandingSurfaces = landingSurfaces,
+		ExactLandingSurfaces = exactLandingSurfaces,
 		PlayerSpawn = playerSpawn,
 		CoordinateOrigin = coordinateOrigin,
 		ForwardDirection = forwardDirection,
@@ -3678,13 +4356,49 @@ local function resolveCourses(): (ResolvedCourseDictionary?, string)
 		SafetyMinimumWorldY = definition.SafetyMinimumWorldY,
 	}
 	table.freeze(resolvedCourse)
+	if not table.isfrozen(resolvedCourse) then
+		return nil, "resolved course is not frozen"
+	end
 
+	return resolvedCourse, "ok"
+end
+
+local function resolveCourses(): (ResolvedCourseDictionary?, string)
+	local definitions, registryReason = validateRegistry()
+	if not definitions then
+		return nil, registryReason
+	end
+
+	local classicCourse, classicReason = resolveCourseDefinition(definitions[CLASSIC_COURSE_ID])
+	if not classicCourse then
+		return nil, classicReason
+	end
 	local courses: ResolvedCourseDictionary = {
-		[definition.CourseId] = resolvedCourse,
+		[CLASSIC_COURSE_ID] = classicCourse,
 	}
+
+	local frostDefinition = definitions[FROST_TRAIL_COURSE_ID]
+	if Workspace:FindFirstChild("FrostTrailWorld") ~= nil then
+		local succeeded, frostCourseOrError, frostReason = pcall(function(): (ResolvedCourse?, string)
+			return resolveCourseDefinition(frostDefinition)
+		end)
+		local frostCourse = if succeeded then frostCourseOrError :: ResolvedCourse? else nil
+		if frostCourse then
+			courses[FROST_TRAIL_COURSE_ID] = frostCourse
+		else
+			warn(
+				string.format(
+					"[Frostline][Course] CourseId=%s unavailable reason=%s",
+					FROST_TRAIL_COURSE_ID,
+					if succeeded then frostReason else tostring(frostCourseOrError)
+				)
+			)
+		end
+	end
+
 	table.freeze(courses)
-	if not table.isfrozen(resolvedCourse) or not table.isfrozen(courses) then
-		return nil, "resolved course tables are not frozen"
+	if not table.isfrozen(courses) then
+		return nil, "resolved course dictionary is not frozen"
 	end
 
 	return courses, "ok"
@@ -3740,7 +4454,7 @@ local function configurePrompt(startTrigger: BasePart): ProximityPrompt
 	prompt.RequiresLineOfSight = false
 	prompt.HoldDuration = RUN.StartPromptHoldDuration
 	prompt.MaxActivationDistance = 14
-	prompt.Enabled = true
+	prompt.Enabled = false
 	return prompt
 end
 
@@ -3839,8 +4553,147 @@ local function onResultAction(player: Player, requestedRunId: any, requestedActi
 	acceptResultAction(session, requestedRunId, requestedAction :: ResultAction, "client")
 end
 
+function RunManager.prepareStudioCourse(player: Player, requestedCourseId: string): (boolean, string)
+	if not started or resolvedCourses == nil then
+		return false, "RunManager unavailable"
+	elseif not RunService:IsStudio() then
+		return false, "Studio only"
+	elseif typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+		return false, "Player unavailable"
+	end
+
+	local courseId = exactCourseId(requestedCourseId)
+	if courseId == nil then
+		return false, "Unknown course"
+	end
+	local courses = resolvedCourses :: ResolvedCourseDictionary
+	local course = courses[courseId]
+	if course == nil or CourseRegistry.getDefinition(requestedCourseId) ~= course.Definition then
+		return false, "Course unavailable"
+	end
+	local courseValid = validateResolvedCourseLive(course)
+	if not courseValid then
+		return false, "Course invalid"
+	end
+
+	local state = preparedCourses[player]
+	if state == nil then
+		return false, "Player state unavailable"
+	elseif sessions[player] ~= nil then
+		return false, "Run active"
+	elseif pendingReplays[player] ~= nil then
+		return false, "Replay pending"
+	elseif next(sessions) ~= nil or next(pendingReplays) ~= nil then
+		return false, "Server busy"
+	elseif state.Routing then
+		return false, "Course preparation active"
+	elseif hasPreparedCourseRouting() then
+		return false, "Server busy"
+	elseif storeOperations[player] ~= nil then
+		return false, "Store operation active"
+	elseif PlayerDataService.hasUnresolvedStoreSave(player) then
+		return false, "Store save unresolved"
+	end
+
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local rootInstance = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not character
+		or not character:IsA("Model")
+		or not character.Parent
+		or not humanoid
+		or humanoid.Health <= 0
+		or not rootInstance
+		or not rootInstance:IsA("BasePart")
+		or not course.PlayerSpawn.Parent
+	then
+		return false, "Character unavailable"
+	end
+
+	local previousCourseId = state.CourseId
+	state.Routing = true
+	if not setPreparedCourse(player, courseId) then
+		state.Routing = false
+		return false, "Player state unavailable"
+	end
+	local generation = state.Generation
+	local teleported = teleportPreparedCharacter(
+		player,
+		state,
+		generation,
+		character,
+		humanoid,
+		rootInstance,
+		course
+	)
+	if preparedCourses[player] ~= state then
+		return false, "Player unavailable"
+	end
+	state.Routing = false
+	if not teleported then
+		state.CourseId = previousCourseId
+		state.Generation += 1
+		player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, previousCourseId)
+		return false, "Teleport failed"
+	end
+
+	return true, "Prepared"
+end
+
+local function warnStudioCourseControlOnce(reason: string)
+	if studioCourseControlWarningIssued then
+		return
+	end
+	studioCourseControlWarningIssued = true
+	warn(string.format("[Frostline][StudioControl] Bridge unavailable reason=%s", reason))
+end
+
+local function publishStudioCourseControlBridge()
+	if not RunService:IsStudio() then
+		return
+	elseif studioCourseControlBridge ~= nil then
+		return
+	end
+
+	local existing = ServerStorage:FindFirstChild(STUDIO_COURSE_CONTROL_BRIDGE_NAME, false)
+	if existing ~= nil then
+		warnStudioCourseControlOnce("name already in use")
+		return
+	end
+
+	local runningPrepareStudioCourse = RunManager.prepareStudioCourse
+	local bridge = Instance.new("BindableFunction")
+	bridge.Name = STUDIO_COURSE_CONTROL_BRIDGE_NAME
+	bridge.OnInvoke = function(player: any, requestedCourseId: any): (boolean, string)
+		if not RunService:IsStudio() then
+			return false, "Studio only"
+		elseif studioCourseControlBridge ~= bridge or bridge.Parent ~= ServerStorage then
+			return false, "Bridge unavailable"
+		elseif typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+			return false, "Player unavailable"
+		elseif type(requestedCourseId) ~= "string" then
+			return false, "Unknown course"
+		end
+
+		local courseId = exactCourseId(requestedCourseId)
+		local definition = CourseRegistry.getDefinition(requestedCourseId)
+		if courseId == nil or definition == nil or definition.CourseId ~= courseId then
+			return false, "Unknown course"
+		elseif courseId == FROST_TRAIL_COURSE_ID and definition.ActivationMode ~= "StudioControlledTest" then
+			return false, "Course unavailable"
+		elseif courseId == CLASSIC_COURSE_ID and definition.ActivationMode ~= "LiveDefault" then
+			return false, "Course unavailable"
+		end
+
+		return runningPrepareStudioCourse(player, requestedCourseId)
+	end
+	studioCourseControlBridge = bridge
+	bridge.Parent = ServerStorage
+end
+
 function RunManager.handlePlayerRemoving(player: Player)
 	local session = sessions[player]
+	clearPreparedPlayer(player)
 	pendingReplays[player] = nil
 	storeOperations[player] = nil
 	if session then
@@ -3852,15 +4705,17 @@ function RunManager.handlePlayerRemoving(player: Player)
 			end
 		end
 	end
-	refreshStartPrompt()
+	refreshStartPrompts()
 	ResultService.removePlayer(player)
 end
 
 function RunManager.canAccessStore(player: Player): boolean
+	local preparedState = preparedCourses[player]
 	return started
 		and player.Parent == Players
 		and sessions[player] == nil
 		and pendingReplays[player] == nil
+		and (preparedState == nil or not preparedState.Routing)
 end
 
 function RunManager.beginStoreOperation(player: Player): (StoreOperationToken?, string?)
@@ -3872,6 +4727,8 @@ function RunManager.beginStoreOperation(player: Player): (StoreOperationToken?, 
 		return nil, "run active"
 	elseif pendingReplays[player] ~= nil then
 		return nil, "replay pending"
+	elseif preparedCourses[player] ~= nil and (preparedCourses[player] :: PreparedCourseState).Routing then
+		return nil, "course preparation active"
 	elseif storeOperations[player] ~= nil then
 		return nil, "store operation already reserved"
 	end
@@ -3889,6 +4746,7 @@ function RunManager.isStoreOperationCurrent(player: Player, token: StoreOperatio
 		and storeOperations[player] == token
 		and sessions[player] == nil
 		and pendingReplays[player] == nil
+		and (preparedCourses[player] == nil or not (preparedCourses[player] :: PreparedCourseState).Routing)
 end
 
 function RunManager.endStoreOperation(player: Player, token: StoreOperationToken)
@@ -3916,7 +4774,6 @@ function RunManager.start()
 		return
 	end
 	resolvedCourses = courses
-	local defaultCourse = courses[CourseRegistry.DefaultCourseId]
 
 	local remoteFolder = getOrCreateRemoteFolder()
 	local tuckRemote = getOrCreateRemote(remoteFolder, TUCK_REMOTE_NAME)
@@ -3930,14 +4787,39 @@ function RunManager.start()
 		startRunSafely(player, courseId, true)
 	end
 
-	local prompt = configurePrompt(defaultCourse.StartTrigger)
-	startPrompt = prompt
-	refreshStartPrompt()
-	prompt.Triggered:Connect(function(player: Player)
-		startRunSafely(player, CourseRegistry.DefaultCourseId, false)
-	end)
+	for _, player in ipairs(Players:GetPlayers()) do
+		initializePreparedPlayer(player)
+	end
+	Players.PlayerAdded:Connect(initializePreparedPlayer)
+
+	local function connectCoursePrompt(courseId: CourseId)
+		local course = courses[courseId]
+		if course == nil then
+			return
+		end
+		local prompt = configurePrompt(course.StartTrigger)
+		startPrompts[courseId] = prompt
+		prompt.Triggered:Connect(function(player: Player)
+			local preparedState = preparedCourses[player]
+			if preparedState == nil or preparedState.Routing then
+				return
+			elseif courseId == FROST_TRAIL_COURSE_ID
+				and (not RunService:IsStudio() or preparedState.CourseId ~= FROST_TRAIL_COURSE_ID)
+			then
+				return
+			end
+			startRunSafely(player, courseId, false)
+		end)
+	end
+
+	connectCoursePrompt(CLASSIC_COURSE_ID)
+	if RunService:IsStudio() and courses[FROST_TRAIL_COURSE_ID] ~= nil then
+		connectCoursePrompt(FROST_TRAIL_COURSE_ID)
+	end
+	refreshStartPrompts()
 
 	print("[Frostline] RunManager ready")
+	publishStudioCourseControlBridge()
 end
 
 return RunManager
