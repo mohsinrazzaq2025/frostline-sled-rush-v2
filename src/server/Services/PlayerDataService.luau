@@ -21,6 +21,8 @@ local OPERATION_POLL_INTERVAL = 0.05
 local MAXIMUM_SAFE_INTEGER = 9007199254740991
 
 type PersistenceStatus = PlayerDataTypes.PersistenceStatus
+type CourseId = PlayerDataTypes.CourseId
+type CourseBestDistances = PlayerDataTypes.CourseBestDistances
 type OwnedSleds = PlayerDataTypes.OwnedSleds
 type PlayerProgress = PlayerDataTypes.PlayerProgress
 type ProgressSnapshot = PlayerDataTypes.ProgressSnapshot
@@ -30,6 +32,7 @@ type StoreStatusCode = StoreTypes.StatusCode
 type CatalogEntry = StoreTypes.CatalogEntry
 type LoadState = "Loading" | "Persistent" | "SessionOnly" | "Releasing" | "Released"
 type StoreMutationAction = "Purchase" | "Equip"
+type CourseBestField = "Classic" | "FrostTrail"
 type ReservationValidator = () -> boolean
 type VerifiedBestObserver = (userId: number, verifiedBestDistance: number) -> ()
 
@@ -58,6 +61,7 @@ type StoredEnvelope = {
 	Data: {
 		FrostCoins: number,
 		BestDistance: number,
+		CourseBestDistances: CourseBestDistances,
 		OwnedSleds: OwnedSleds,
 		EquippedSledId: string,
 	},
@@ -128,6 +132,10 @@ local started = false
 local shuttingDown = false
 local latestProfileGeneration = 0
 
+local CLASSIC_COURSE_ID: CourseId = "FrozenLakeV2"
+local FROST_TRAIL_COURSE_ID: CourseId = "FrostTrailV1"
+local INVENTORY_SCHEMA_VERSION = 2
+
 local function isFiniteNumber(value: any): boolean
 	return typeof(value) == "number" and value == value and value > -math.huge and value < math.huge
 end
@@ -138,6 +146,30 @@ end
 
 local function isSafeNonNegativeInteger(value: any): boolean
 	return isNonNegativeInteger(value) and value <= MAXIMUM_SAFE_INTEGER
+end
+
+local function resolveCourseBestField(courseId: string): CourseBestField?
+	if courseId == CLASSIC_COURSE_ID then
+		return "Classic"
+	elseif courseId == FROST_TRAIL_COURSE_ID then
+		return "FrostTrail"
+	end
+	return nil
+end
+
+local function getCourseBestDistance(progress: PlayerProgress, field: CourseBestField): number
+	if field == "Classic" then
+		return progress.BestDistance
+	end
+	return progress.CourseBestDistances.FrostTrailV1
+end
+
+local function setCourseBestDistance(progress: PlayerProgress, field: CourseBestField, distance: number)
+	if field == "Classic" then
+		progress.BestDistance = distance
+	else
+		progress.CourseBestDistances.FrostTrailV1 = distance
+	end
 end
 
 local function dispatchVerifiedBest(userId: number, verifiedBestDistance: number)
@@ -164,6 +196,38 @@ local function createDefaultOwnedSleds(): OwnedSleds
 	return {
 		[DEFAULT_SLED_ID] = true,
 	}
+end
+
+local function createDefaultCourseBestDistances(): CourseBestDistances
+	return {
+		FrostTrailV1 = 0,
+	}
+end
+
+local function copyCourseBestDistances(source: CourseBestDistances): CourseBestDistances
+	return {
+		FrostTrailV1 = source.FrostTrailV1,
+	}
+end
+
+local function readCourseBestDistances(value: any): (CourseBestDistances?, string?)
+	if typeof(value) ~= "table" then
+		return nil, "stored Course Best Distances are not a table"
+	end
+
+	local frostTrailBestDistance = value.FrostTrailV1
+	if not isFiniteNumber(frostTrailBestDistance) or frostTrailBestDistance < 0 then
+		return nil, "stored Frost Trail Best Distance is invalid"
+	end
+
+	local firstKey = next(value)
+	if firstKey ~= FROST_TRAIL_COURSE_ID or next(value, firstKey) ~= nil then
+		return nil, "stored Course Best Distances contain unexpected keys"
+	end
+
+	return {
+		FrostTrailV1 = frostTrailBestDistance,
+	}, nil
 end
 
 local function copyOwnedSleds(source: OwnedSleds): OwnedSleds
@@ -207,6 +271,7 @@ local function createDefaultProgress(): PlayerProgress
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = 0,
 		BestDistance = 0,
+		CourseBestDistances = createDefaultCourseBestDistances(),
 		OwnedSleds = createDefaultOwnedSleds(),
 		EquippedSledId = DEFAULT_SLED_ID,
 	}
@@ -217,6 +282,7 @@ local function copyProgress(progress: PlayerProgress): PlayerProgress
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = progress.FrostCoins,
 		BestDistance = progress.BestDistance,
+		CourseBestDistances = copyCourseBestDistances(progress.CourseBestDistances),
 		OwnedSleds = copyOwnedSleds(progress.OwnedSleds),
 		EquippedSledId = progress.EquippedSledId,
 	}
@@ -224,6 +290,7 @@ end
 
 local function createFrozenProgressCopy(progress: PlayerProgress): PlayerProgress
 	local copied = copyProgress(progress)
+	table.freeze(copied.CourseBestDistances)
 	table.freeze(copied.OwnedSleds)
 	return table.freeze(copied)
 end
@@ -329,9 +396,17 @@ local function reconcileProfile(rawValue: any): (PlayerProgress?, StoredSession?
 	end
 	local ownedSleds = createDefaultOwnedSleds()
 	local equippedSledId = DEFAULT_SLED_ID
-	if schemaVersion == DATA.SchemaVersion then
+	if schemaVersion >= INVENTORY_SCHEMA_VERSION then
 		ownedSleds = normalizeOwnedSleds(dataSource.OwnedSleds)
 		equippedSledId = normalizeEquippedSledId(dataSource.EquippedSledId, ownedSleds)
+	end
+	local courseBestDistances = createDefaultCourseBestDistances()
+	if schemaVersion == DATA.SchemaVersion then
+		local storedCourseBestDistances, courseBestError = readCourseBestDistances(dataSource.CourseBestDistances)
+		if not storedCourseBestDistances then
+			return nil, nil, courseBestError or "stored Course Best Distances are invalid"
+		end
+		courseBestDistances = storedCourseBestDistances
 	end
 
 	if rawValue.UpdatedAt ~= nil and not isNonNegativeInteger(rawValue.UpdatedAt) then
@@ -346,6 +421,7 @@ local function reconcileProfile(rawValue: any): (PlayerProgress?, StoredSession?
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = frostCoins,
 		BestDistance = bestDistance,
+		CourseBestDistances = courseBestDistances,
 		OwnedSleds = ownedSleds,
 		EquippedSledId = equippedSledId,
 	}, storedSession, nil
@@ -357,6 +433,7 @@ local function createEnvelope(progress: PlayerProgress, sessionId: string?, upda
 		Data = {
 			FrostCoins = progress.FrostCoins,
 			BestDistance = progress.BestDistance,
+			CourseBestDistances = copyCourseBestDistances(progress.CourseBestDistances),
 			OwnedSleds = copyOwnedSleds(progress.OwnedSleds),
 			EquippedSledId = progress.EquippedSledId,
 		},
@@ -605,12 +682,15 @@ local function getPersistenceStatus(entry: ProfileSession): PersistenceStatus
 end
 
 local function createSnapshot(entry: ProfileSession): ProgressSnapshot
+	local courseBestDistances = copyCourseBestDistances(entry.Progress.CourseBestDistances)
+	table.freeze(courseBestDistances)
 	local ownedSleds = copyOwnedSleds(entry.Progress.OwnedSleds)
 	table.freeze(ownedSleds)
 	return table.freeze({
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = entry.Progress.FrostCoins,
 		BestDistance = entry.Progress.BestDistance,
+		CourseBestDistances = courseBestDistances,
 		OwnedSleds = ownedSleds,
 		EquippedSledId = entry.Progress.EquippedSledId,
 		PersistenceStatus = getPersistenceStatus(entry),
@@ -680,6 +760,7 @@ local function profilesMatch(left: PlayerProgress, right: PlayerProgress): boole
 	return left.SchemaVersion == right.SchemaVersion
 		and left.FrostCoins == right.FrostCoins
 		and left.BestDistance == right.BestDistance
+		and left.CourseBestDistances.FrostTrailV1 == right.CourseBestDistances.FrostTrailV1
 		and ownedSledsMatch(left.OwnedSleds, right.OwnedSleds)
 		and left.EquippedSledId == right.EquippedSledId
 end
@@ -1150,6 +1231,10 @@ function PlayerDataService.isPersistent(player: Player): boolean
 	return entry ~= nil and entry.State == "Persistent" and entry.Saveable and not entry.ReleaseStarted
 end
 
+function PlayerDataService.isSupportedCourseId(courseId: string): boolean
+	return resolveCourseBestField(courseId) ~= nil
+end
+
 function PlayerDataService.waitForLoad(player: Player, timeoutSeconds: number?): boolean
 	local entry = profiles[player]
 	if not entry or entry.ReleaseStarted or shuttingDown or player.Parent ~= Players then
@@ -1277,10 +1362,14 @@ end
 
 function PlayerDataService.applyRunReward(
 	player: Player,
+	courseId: CourseId,
 	finalDistance: number,
 	frostCoinsEarned: number
 ): (RewardUpdate?, string?)
-	if not isFiniteNumber(finalDistance) or finalDistance < 0 then
+	local courseBestField = resolveCourseBestField(courseId)
+	if not courseBestField then
+		return nil, "unsupported CourseId"
+	elseif not isFiniteNumber(finalDistance) or finalDistance < 0 then
 		return nil, "invalid final distance"
 	elseif not isNonNegativeInteger(frostCoinsEarned) then
 		return nil, "invalid Frost Coin reward"
@@ -1301,23 +1390,28 @@ function PlayerDataService.applyRunReward(
 	if not isNonNegativeInteger(updatedCoins) then
 		return nil, "Frost Coin total would be invalid"
 	end
-	local isNewBest = finalDistance > entry.Progress.BestDistance
+	local previousCourseBestDistance = getCourseBestDistance(entry.Progress, courseBestField)
+	local isNewBest = finalDistance > previousCourseBestDistance
 	entry.Progress.FrostCoins = updatedCoins
 	if isNewBest then
-		entry.Progress.BestDistance = finalDistance
+		setCourseBestDistance(entry.Progress, courseBestField, finalDistance)
 	end
 	entry.Revision += 1
 	entry.Dirty = true
 
+	local courseBestDistances = copyCourseBestDistances(entry.Progress.CourseBestDistances)
+	table.freeze(courseBestDistances)
 	local ownedSleds = copyOwnedSleds(entry.Progress.OwnedSleds)
 	table.freeze(ownedSleds)
 	return table.freeze({
 		SchemaVersion = DATA.SchemaVersion,
 		FrostCoins = entry.Progress.FrostCoins,
 		BestDistance = entry.Progress.BestDistance,
+		CourseBestDistances = courseBestDistances,
 		OwnedSleds = ownedSleds,
 		EquippedSledId = entry.Progress.EquippedSledId,
 		PersistenceStatus = getPersistenceStatus(entry),
+		CourseBestDistance = getCourseBestDistance(entry.Progress, courseBestField),
 		IsNewBest = isNewBest,
 	}), nil
 end

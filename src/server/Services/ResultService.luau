@@ -3,11 +3,13 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local PlayerDataTypes = require(ReplicatedStorage.Shared.PlayerDataTypes)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local PlayerDataService = require(script.Parent.PlayerDataService)
 
 local RESULT = GameConfig.Result
 
+type CourseId = PlayerDataTypes.CourseId
 type Outcome = ResultTypes.Outcome
 type Payload = ResultTypes.Payload
 type ServerFacts = ResultTypes.ServerFacts
@@ -91,8 +93,10 @@ local function validateOutcomeFacts(facts: ServerFacts): string?
 	return nil
 end
 
-function ResultService.finalize(player: Player, facts: ServerFacts): (Payload?, string?)
-	if facts.RunId <= 0 or facts.RunId % 1 ~= 0 then
+function ResultService.finalize(player: Player, courseId: CourseId, facts: ServerFacts): (Payload?, string?)
+	if not PlayerDataService.isSupportedCourseId(courseId) then
+		return nil, "invalid CourseId"
+	elseif facts.RunId <= 0 or facts.RunId % 1 ~= 0 then
 		return nil, "invalid RunId"
 	elseif not isKnownOutcome(facts.Outcome) then
 		return nil, "invalid outcome"
@@ -123,6 +127,7 @@ function ResultService.finalize(player: Player, facts: ServerFacts): (Payload?, 
 	local frostCoinsEarned = calculateCoins(facts.Outcome, finalDistanceMeters)
 	local rewardUpdate, mutationError = PlayerDataService.applyRunReward(
 		player,
+		courseId,
 		finalDistanceMeters,
 		frostCoinsEarned
 	)
@@ -136,7 +141,7 @@ function ResultService.finalize(player: Player, facts: ServerFacts): (Payload?, 
 		RunId = facts.RunId,
 		Outcome = facts.Outcome,
 		FinalDistanceMeters = roundDistance(finalDistanceMeters),
-		BestDistanceMeters = roundDistance(rewardUpdate.BestDistance),
+		BestDistanceMeters = roundDistance(rewardUpdate.CourseBestDistance),
 		FrostCoinsEarned = frostCoinsEarned,
 		TotalFrostCoins = rewardUpdate.FrostCoins,
 		TuckUsed = facts.TuckUsed,

@@ -139,7 +139,7 @@ local GameConfig = {
 	},
 
 	PlayerData = {
-		SchemaVersion = 2,
+		SchemaVersion = 3,
 		ProductionStoreName = "Frostline_PlayerProgress_v1",
 		StudioStoreName = "Frostline_PlayerProgress_Studio_v1",
 		KeyPrefix = "Player_",

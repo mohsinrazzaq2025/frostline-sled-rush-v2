@@ -2487,6 +2487,7 @@ local function finalizeResult(session: Session, runId: number, outcome: ResultOu
 		return false
 	end
 
+	local courseId = session.CourseId
 	local finalStopDistanceMeters = session.FinalStopDistanceMeters
 	local finalUprightDot = session.FinalUprightDot
 	local remote = resultRemote
@@ -2509,7 +2510,7 @@ local function finalizeResult(session: Session, runId: number, outcome: ResultOu
 		SeatSeparatedAfterAirborne = session.SeatSeparatedAfterAirborne,
 		FinalUprightDot = finalUprightDot,
 	}
-	local payload, failureReason = ResultService.finalize(session.Player, facts)
+	local payload, failureReason = ResultService.finalize(session.Player, courseId, facts)
 	if not payload then
 		warn(
 			string.format(
