@@ -8,13 +8,13 @@ local Workspace = game:GetService("Workspace")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local ResultTypes = require(ReplicatedStorage.Shared.ResultTypes)
 local RunPhase = require(ReplicatedStorage.Shared.RunPhase)
+local CourseRegistry = require(script.Parent.CourseRegistry)
 local PlayerDataService = require(script.Parent.PlayerDataService)
 local ResultService = require(script.Parent.ResultService)
 local SledFactory = require(script.Parent.SledFactory)
 
 local RUN = GameConfig.Run
 local RESULT = GameConfig.Result
-local WORLD = GameConfig.World
 
 local REMOTES_FOLDER_NAME = "FrostlineRemotes"
 local TUCK_REMOTE_NAME = "TuckIntent"
@@ -43,13 +43,16 @@ local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
 local MISSED_LAUNCH_OUTCOME = "missed-launch"
 local RAMP_EXIT_ROLL_WRITE_EPSILON = 1e-4
 local RAMP_EXIT_INVARIANT_EPSILON = 1e-5
+local COURSE_BASIS_EPSILON = 1e-5
 local LANDING_CONTACT_LOG_PREFIX = "[Frostline][LandingContact]"
 local LANDING_CONTACT_SOURCE = "SledRoot.Touched"
 local LANDING_CONTACT_CONDITION =
-	"activeExact&&!CleanupStarted&&otherPart:IsDescendantOf(references.LandingSurfaces)&&phase==Airborne&&SledRoot.Parent~=nil&&transitionTo(Landed)==true"
+	"activeExact&&!CleanupStarted&&otherPart:IsDescendantOf(session.ResolvedCourse.LandingSurfaces)&&phase==Airborne&&SledRoot.Parent~=nil&&transitionTo(Landed)==true"
 
 type Phase = RunPhase.Name
 type Sled = SledFactory.Sled
+type CourseId = CourseRegistry.CourseId
+type CourseDefinition = CourseRegistry.CourseDefinition
 type StallObservationKind = "recovery" | "missed-launch"
 type RunOutcome = "missed-launch"
 type ResultAction = ResultTypes.Action
@@ -118,19 +121,37 @@ type LandingContactTriggerSnapshot = {
 	ActiveSessionExact: boolean,
 }
 
-type WorldReferences = {
+type ResolvedCourse = {
+	Definition: CourseDefinition,
+	CourseId: CourseId,
+	World: Model,
+	Geometry: Folder,
+	Markers: Folder,
 	ActiveSleds: Folder,
 	StartTrigger: BasePart,
 	SummitPlatform: BasePart,
 	LaunchEdge: BasePart,
 	LandingSurfaces: Folder,
 	PlayerSpawn: SpawnLocation,
-	LaunchZ: number,
+	CoordinateOrigin: Vector3,
+	ForwardDirection: Vector3,
+	RightDirection: Vector3,
+	LaunchLongitudinal: number,
+	TrackWidth: number,
 	StudsPerMeter: number,
+	RampFreedomLongitudinal: number,
+	LandingFieldDistanceMeters: number,
+	MaximumRunDurationSeconds: number,
+	SafetyMaximumLateralDistance: number,
+	SafetyMinimumWorldY: number,
 }
+
+type ResolvedCourseDictionary = { [CourseId]: ResolvedCourse }
 
 type Session = {
 	RunId: number,
+	CourseId: CourseId,
+	ResolvedCourse: ResolvedCourse,
 	Player: Player,
 	Character: Model,
 	Humanoid: Humanoid,
@@ -144,9 +165,6 @@ type Session = {
 	CountdownValue: number?,
 	OriginalMassless: { [BasePart]: boolean },
 	Connections: { RBXScriptConnection },
-	PlayerSpawn: SpawnLocation,
-	LaunchZ: number,
-	StudsPerMeter: number,
 	DescentStartedAt: number?,
 	LandingSettledSince: number?,
 	LastTuckRequestAt: number,
@@ -161,9 +179,9 @@ type Session = {
 	CleanupStarted: boolean,
 	FirstCleanupReason: string?,
 	ReleaseInProgress: boolean,
-	ReleasePositionZ: number?,
+	ReleaseLongitudinal: number?,
 	StallObservationStartedAt: number?,
-	StallObservationStartZ: number?,
+	StallObservationStartLongitudinal: number?,
 	StallObservationKind: StallObservationKind?,
 	StallRecoveryUsed: boolean,
 	LastStallRejectionAt: number,
@@ -207,6 +225,7 @@ type StallSnapshot = {
 type PendingReplay = {
 	Session: Session,
 	RunId: number,
+	CourseId: CourseId,
 }
 
 export type StoreOperationToken = {
@@ -250,7 +269,8 @@ local started = false
 local stateRemote: RemoteEvent? = nil
 local resultRemote: RemoteEvent? = nil
 local startPrompt: ProximityPrompt? = nil
-local trustedReplay: ((Player) -> ())? = nil
+local trustedReplay: ((Player, CourseId) -> ())? = nil
+local resolvedCourses: ResolvedCourseDictionary? = nil
 local pendingReplays: { [Player]: PendingReplay } = {}
 local storeOperations: { [Player]: StoreOperationToken } = {}
 local latestRunId = 0
@@ -329,6 +349,50 @@ end
 
 local function isFiniteVector3(value: Vector3): boolean
 	return isFiniteNumber(value.X) and isFiniteNumber(value.Y) and isFiniteNumber(value.Z)
+end
+
+local function isNonEmptyString(value: string): boolean
+	return string.len(value) > 0
+end
+
+local function forwardCoordinate(course: ResolvedCourse, position: Vector3): number
+	return (position - course.CoordinateOrigin):Dot(course.ForwardDirection)
+end
+
+local function forwardProgress(course: ResolvedCourse, fromPosition: Vector3, toPosition: Vector3): number
+	return (toPosition - fromPosition):Dot(course.ForwardDirection)
+end
+
+local function lateralOffset(course: ResolvedCourse, position: Vector3): number
+	return (position - course.CoordinateOrigin):Dot(course.RightDirection)
+end
+
+local function forwardSpeed(course: ResolvedCourse, velocity: Vector3): number
+	return velocity:Dot(course.ForwardDirection)
+end
+
+local function crossedForwardPlane(course: ResolvedCourse, position: Vector3, longitudinal: number): boolean
+	return forwardCoordinate(course, position) >= longitudinal
+end
+
+local function withMinimumForwardSpeed(
+	course: ResolvedCourse,
+	velocity: Vector3,
+	minimumSpeed: number
+): Vector3
+	local currentForwardSpeed = forwardSpeed(course, velocity)
+	if currentForwardSpeed >= minimumSpeed then
+		return velocity
+	end
+
+	return velocity + course.ForwardDirection * (minimumSpeed - currentForwardSpeed)
+end
+
+local function distanceFromLaunch(course: ResolvedCourse, position: Vector3): number
+	return math.max(
+		0,
+		(forwardCoordinate(course, position) - course.LaunchLongitudinal) / course.StudsPerMeter
+	)
 end
 
 local function isFiniteCFrame(value: CFrame): boolean
@@ -1131,6 +1195,7 @@ end
 local function setTuckActive(session: Session, active: boolean)
 	local forceAvailable = session.TuckForce.Parent ~= nil
 	local root = session.Sled.Root
+	local course = session.ResolvedCourse
 	local assemblyMass = math.huge
 	if root.Parent and not root.Anchored then
 		assemblyMass = root.AssemblyMass
@@ -1144,11 +1209,11 @@ local function setTuckActive(session: Session, active: boolean)
 		and root.Parent ~= nil
 		and not root.Anchored
 		and hasUsableMass
-		and root.Position.Z < session.LaunchZ
+		and not crossedForwardPlane(course, root.Position, course.LaunchLongitudinal)
 	session.Tucking = shouldApply
 
 	if shouldApply then
-		session.TuckForce.Force = Vector3.new(0, 0, assemblyMass * RUN.TuckAcceleration)
+		session.TuckForce.Force = course.ForwardDirection * assemblyMass * RUN.TuckAcceleration
 		session.TuckForce.Enabled = true
 		session.TuckUsed = true
 	elseif forceAvailable then
@@ -1256,6 +1321,7 @@ end
 local function setAntiStallActive(session: Session, runId: number, active: boolean)
 	local forceAvailable = session.AntiStallForce.Parent ~= nil
 	local root = session.Sled.Root
+	local course = session.ResolvedCourse
 	local assemblyMass = math.huge
 	if root.Parent and not root.Anchored then
 		assemblyMass = root.AssemblyMass
@@ -1277,11 +1343,7 @@ local function setAntiStallActive(session: Session, runId: number, active: boole
 
 	session.AntiStallActive = shouldApply
 	if shouldApply then
-		session.AntiStallForce.Force = Vector3.new(
-			0,
-			0,
-			assemblyMass * RUN.AntiStallAcceleration
-		)
+		session.AntiStallForce.Force = course.ForwardDirection * assemblyMass * RUN.AntiStallAcceleration
 		session.AntiStallForce.Enabled = true
 		if RESULT.LifecycleDiagnosticsEnabled then
 			print(string.format("[Frostline][Run] %s AntiStall activated", runLabel(session)))
@@ -1307,12 +1369,15 @@ local function updateAntiStall(session: Session, runId: number)
 		return
 	end
 
-	local forwardSpeed = session.Sled.Root.AssemblyLinearVelocity.Z
+	local currentForwardSpeed = forwardSpeed(
+		session.ResolvedCourse,
+		session.Sled.Root.AssemblyLinearVelocity
+	)
 	if session.AntiStallActive then
-		if forwardSpeed >= RUN.AntiStallSpeed then
+		if currentForwardSpeed >= RUN.AntiStallSpeed then
 			setAntiStallActive(session, runId, false)
 		end
-	elseif forwardSpeed < RUN.AntiStallSpeed - ANTI_STALL_REACTIVATION_MARGIN then
+	elseif currentForwardSpeed < RUN.AntiStallSpeed - ANTI_STALL_REACTIVATION_MARGIN then
 		setAntiStallActive(session, runId, true)
 	end
 end
@@ -1331,7 +1396,8 @@ local function getStallGroundRayDistance(root: Part): number
 	return verticalHalfExtent + STALL_GROUND_CONTACT_CLEARANCE
 end
 
-local function getStallSnapshot(session: Session, root: Part, releasePositionZ: number): StallSnapshot
+local function getStallSnapshot(session: Session, root: Part, releaseLongitudinal: number): StallSnapshot
+	local course = session.ResolvedCourse
 	local velocity = root.AssemblyLinearVelocity
 	local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
 	local rayResult = Workspace:Raycast(
@@ -1347,8 +1413,8 @@ local function getStallSnapshot(session: Session, root: Part, releasePositionZ: 
 
 	return {
 		Position = root.Position,
-		Progress = root.Position.Z - releasePositionZ,
-		ForwardSpeed = velocity.Z,
+		Progress = forwardCoordinate(course, root.Position) - releaseLongitudinal,
+		ForwardSpeed = forwardSpeed(course, velocity),
 		HorizontalSpeed = horizontalSpeed,
 		AngularSpeed = root.AssemblyAngularVelocity.Magnitude,
 		Grounded = grounded,
@@ -1381,14 +1447,18 @@ local function evaluateStoppedCandidate(
 	return true, "ok"
 end
 
-local function evaluateEarlyRecoveryCandidate(root: Part, snapshot: StallSnapshot): (boolean, string)
+local function evaluateEarlyRecoveryCandidate(
+	course: ResolvedCourse,
+	root: Part,
+	snapshot: StallSnapshot
+): (boolean, string)
 	local stopped, stoppedReason = evaluateStoppedCandidate(root, snapshot, true)
 	if not stopped then
 		return false, stoppedReason
 	end
 
-	local maximumLateralPosition = WORLD.TrackWidth * 0.5 - math.max(root.Size.X, root.Size.Z) * 0.5
-	if math.abs(snapshot.Position.X) > maximumLateralPosition then
+	local maximumLateralPosition = course.TrackWidth * 0.5 - math.max(root.Size.X, root.Size.Z) * 0.5
+	if math.abs(lateralOffset(course, snapshot.Position)) > maximumLateralPosition then
 		return false, "outside-track-footprint"
 	end
 
@@ -1397,7 +1467,7 @@ end
 
 local function resetStallObservation(session: Session)
 	session.StallObservationStartedAt = nil
-	session.StallObservationStartZ = nil
+	session.StallObservationStartLongitudinal = nil
 	session.StallObservationKind = nil
 end
 
@@ -1407,19 +1477,24 @@ local function updateStallObservation(
 	root: Part,
 	now: number
 ): (boolean, number)
+	local course = session.ResolvedCourse
 	local observationStartedAt = session.StallObservationStartedAt
-	local observationStartZ = session.StallObservationStartZ
-	if session.StallObservationKind ~= kind or observationStartedAt == nil or observationStartZ == nil then
+	local observationStartLongitudinal = session.StallObservationStartLongitudinal
+	if session.StallObservationKind ~= kind
+		or observationStartedAt == nil
+		or observationStartLongitudinal == nil
+	then
 		session.StallObservationKind = kind
 		session.StallObservationStartedAt = now
-		session.StallObservationStartZ = root.Position.Z
+		session.StallObservationStartLongitudinal = forwardCoordinate(course, root.Position)
 		return false, 0
 	end
 
-	local observationProgress = math.abs(root.Position.Z - observationStartZ)
+	local currentLongitudinal = forwardCoordinate(course, root.Position)
+	local observationProgress = math.abs(currentLongitudinal - observationStartLongitudinal)
 	if observationProgress > EARLY_STALL_MAXIMUM_OBSERVATION_PROGRESS then
 		session.StallObservationStartedAt = now
-		session.StallObservationStartZ = root.Position.Z
+		session.StallObservationStartLongitudinal = currentLongitudinal
 		return false, observationProgress
 	end
 
@@ -1481,9 +1556,9 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 		return nil
 	end
 
-	local releasePositionZ = session.ReleasePositionZ
+	local releaseLongitudinal = session.ReleaseLongitudinal
 	local descentStartedAt = session.DescentStartedAt
-	if releasePositionZ == nil or descentStartedAt == nil then
+	if releaseLongitudinal == nil or descentStartedAt == nil then
 		resetStallObservation(session)
 		return nil
 	end
@@ -1494,7 +1569,8 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 		return nil
 	end
 
-	local snapshot = getStallSnapshot(session, root, releasePositionZ)
+	local course = session.ResolvedCourse
+	local snapshot = getStallSnapshot(session, root, releaseLongitudinal)
 	session.MaximumDescentProgress = math.max(session.MaximumDescentProgress, snapshot.Progress)
 	local elapsed = now - descentStartedAt
 	local insideEarlyWindow = elapsed <= EARLY_STALL_MAXIMUM_DURATION
@@ -1518,7 +1594,7 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 			candidateAccepted = false
 			rejectionReason = "rollback-from-maximum"
 		else
-			candidateAccepted, rejectionReason = evaluateEarlyRecoveryCandidate(root, snapshot)
+			candidateAccepted, rejectionReason = evaluateEarlyRecoveryCandidate(course, root, snapshot)
 		end
 	end
 
@@ -1554,7 +1630,7 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 			return nil
 		end
 
-		local finalSnapshot = getStallSnapshot(session, root, releasePositionZ)
+		local finalSnapshot = getStallSnapshot(session, root, releaseLongitudinal)
 		session.MaximumDescentProgress = math.max(session.MaximumDescentProgress, finalSnapshot.Progress)
 		local finalElapsed = now - descentStartedAt
 		local finalMissedLaunchEligible = session.StallRecoveryUsed
@@ -1578,12 +1654,12 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 		return nil
 	end
 
-	local finalSnapshot = getStallSnapshot(session, root, releasePositionZ)
+	local finalSnapshot = getStallSnapshot(session, root, releaseLongitudinal)
 	session.MaximumDescentProgress = math.max(session.MaximumDescentProgress, finalSnapshot.Progress)
 	local finalElapsed = now - descentStartedAt
 	local finalAtForwardFrontier = session.MaximumDescentProgress - finalSnapshot.Progress
 		<= EARLY_STALL_MAXIMUM_OBSERVATION_PROGRESS
-	local finalCandidateAccepted, finalRejectionReason = evaluateEarlyRecoveryCandidate(root, finalSnapshot)
+	local finalCandidateAccepted, finalRejectionReason = evaluateEarlyRecoveryCandidate(course, root, finalSnapshot)
 	local finalContextRejection: string? = nil
 	if session.StallRecoveryUsed then
 		finalContextRejection = "already-used"
@@ -1606,20 +1682,16 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 	session.StallRecoveryUsed = true
 	resetStallObservation(session)
 	local currentVelocity = root.AssemblyLinearVelocity
-	root.AssemblyLinearVelocity = Vector3.new(
-		currentVelocity.X,
-		currentVelocity.Y,
-		math.max(currentVelocity.Z, RUN.InitialPushSpeed)
-	)
+	root.AssemblyLinearVelocity = withMinimumForwardSpeed(course, currentVelocity, RUN.InitialPushSpeed)
 	if RESULT.LifecycleDiagnosticsEnabled then
-		local recoveryStartZ = root.Position.Z
+		local recoveryStartPosition = root.Position
 		print(
 			string.format(
 				"[Frostline][Run] %s Stall recovery confirmed progress=%.2f forwardSpeed=%.2f reappliedSpeed=%.2f",
 				runLabel(session),
 				observationProgress,
 				finalSnapshot.ForwardSpeed,
-				root.AssemblyLinearVelocity.Z
+				forwardSpeed(course, root.AssemblyLinearVelocity)
 			)
 		)
 
@@ -1636,8 +1708,8 @@ local function updateDescentStopDetection(session: Session, runId: number, now: 
 				return
 			end
 
-			local recoveredProgress = root.Position.Z - recoveryStartZ
-			local recoveredSpeed = root.AssemblyLinearVelocity.Z
+			local recoveredProgress = forwardProgress(course, recoveryStartPosition, root.Position)
+			local recoveredSpeed = forwardSpeed(course, root.AssemblyLinearVelocity)
 			local recovered = recoveredProgress > STALL_RECOVERY_RESULT_MINIMUM_PROGRESS
 				or recoveredSpeed > STALL_RECOVERY_RESULT_MINIMUM_SPEED
 			print(
@@ -1761,10 +1833,11 @@ local function enterRampFreedom(session: Session, runId: number)
 end
 
 local function updateRampFreedom(session: Session, runId: number)
+	local course = session.ResolvedCourse
 	if session.Phase == RunPhase.Descent
 		and not session.RampFreedomEntered
 		and session.Sled.Root.Parent
-		and session.Sled.Root.Position.Z >= RUN.RampFreedomStartZ
+		and crossedForwardPlane(course, session.Sled.Root.Position, course.RampFreedomLongitudinal)
 	then
 		enterRampFreedom(session, runId)
 	end
@@ -1832,10 +1905,11 @@ local function teleportToSpawn(session: Session, runId: number, traceReturn: boo
 
 	local targetCFrame = CFrame.new()
 	local targetAvailable = pcall(function()
-		if not session.PlayerSpawn.Parent or not session.PlayerSpawn:IsDescendantOf(Workspace) then
+		local playerSpawn = session.ResolvedCourse.PlayerSpawn
+		if not playerSpawn.Parent or not playerSpawn:IsDescendantOf(Workspace) then
 			error("PlayerSpawn unavailable")
 		end
-		targetCFrame = session.PlayerSpawn.CFrame + Vector3.new(0, 4, 0)
+		targetCFrame = playerSpawn.CFrame + Vector3.new(0, 4, 0)
 	end)
 	if not targetAvailable then
 		warn(string.format("[Frostline][Run] %s Teleport verification result=spawn unavailable", runLabel(session)))
@@ -2123,9 +2197,11 @@ end
 
 local function scheduleTrustedReplay(session: Session, runId: number)
 	local player = session.Player
+	local courseId = session.CourseId
 	pendingReplays[player] = {
 		Session = session,
 		RunId = runId,
+		CourseId = courseId,
 	}
 	lifecycleLog(session, "replay-queued", "waitingFor=cleanup-boundary")
 
@@ -2135,6 +2211,8 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		if not pendingReplay
 			or pendingReplay.Session ~= session
 			or pendingReplay.RunId ~= runId
+			or pendingReplay.CourseId ~= courseId
+			or session.CourseId ~= courseId
 		then
 			return
 		end
@@ -2163,7 +2241,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		-- path. beginRun publishes the replacement session before its first yield.
 		lifecycleLog(session, "replay-creation", "state=starting")
 		sessions[player] = nil
-		replay(player)
+		replay(player, courseId)
 		refreshStartPrompt()
 	end)
 end
@@ -2275,10 +2353,6 @@ local function formatTelemetryNumber(value: number?): string
 	return if value == nil then "n/a" else string.format("%.2f", value)
 end
 
-local function distanceFromLaunch(session: Session, zPosition: number): number
-	return math.max(0, (zPosition - session.LaunchZ) / session.StudsPerMeter)
-end
-
 local function updateMaximumDistance(session: Session)
 	if not session.Sled.Root.Parent then
 		return
@@ -2286,7 +2360,7 @@ local function updateMaximumDistance(session: Session)
 
 	session.MaximumDistanceMeters = math.max(
 		session.MaximumDistanceMeters,
-		distanceFromLaunch(session, session.Sled.Root.Position.Z)
+		distanceFromLaunch(session.ResolvedCourse, session.Sled.Root.Position)
 	)
 end
 
@@ -2299,7 +2373,7 @@ local function emitTelemetry(session: Session)
 		return
 	end
 
-	local fieldDistance = WORLD.LandingMarkedDistanceMeters + WORLD.LandingRunoffDistanceMeters
+	local fieldDistance = session.ResolvedCourse.LandingFieldDistanceMeters
 	local finalStopDistance = session.FinalStopDistanceMeters
 	local remainingDistance = if finalStopDistance == nil
 		then nil
@@ -2475,7 +2549,7 @@ local function finishMissedLaunch(session: Session, runId: number, snapshot: Sta
 		requestCleanup(session, runId, "sled removed during missed launch", true)
 		return
 	end
-	session.FinalStopDistanceMeters = distanceFromLaunch(session, root.Position.Z)
+	session.FinalStopDistanceMeters = distanceFromLaunch(session.ResolvedCourse, root.Position)
 	session.FinalUprightDot = root.CFrame.UpVector:Dot(Vector3.yAxis)
 	resetStallObservation(session)
 	clearTuckState(session)
@@ -2526,7 +2600,7 @@ local function finishLanding(session: Session, runId: number)
 		diagnosticAngularSpeed = root.AssemblyAngularVelocity.Magnitude
 	end
 	updateMaximumDistance(session)
-	session.FinalStopDistanceMeters = distanceFromLaunch(session, position.Z)
+	session.FinalStopDistanceMeters = distanceFromLaunch(session.ResolvedCourse, position)
 	session.FinalUprightDot = root.CFrame.UpVector:Dot(Vector3.yAxis)
 	if session.Sled.DriverSeat.Occupant ~= session.Humanoid then
 		session.SeatSeparatedAfterAirborne = true
@@ -2603,8 +2677,8 @@ local function updateLandingStopDetection(session: Session, runId: number, now: 
 	end
 end
 
-local function isExtremeLateralPosition(position: Vector3): boolean
-	return math.abs(position.X) > RUN.SafetyBounds.MaximumLateralDistance
+local function isExtremeLateralPosition(course: ResolvedCourse, position: Vector3): boolean
+	return math.abs(lateralOffset(course, position)) > course.SafetyMaximumLateralDistance
 end
 
 local function addSessionConnection(session: Session, connection: RBXScriptConnection)
@@ -2741,6 +2815,7 @@ local function monitorSession(session: Session, runId: number)
 			end
 
 			local root = session.Sled.Root
+			local course = session.ResolvedCourse
 			if not root.Parent then
 				local removalReason = if session.ReleaseInProgress then "sled removed during release" else "sled removed"
 				requestCleanup(session, runId, removalReason, true)
@@ -2748,7 +2823,9 @@ local function monitorSession(session: Session, runId: number)
 			end
 			local now = os.clock()
 			updateRampFreedom(session, runId)
-			if session.Phase == RunPhase.Descent and root.Position.Z >= session.LaunchZ then
+			if session.Phase == RunPhase.Descent
+				and crossedForwardPlane(course, root.Position, course.LaunchLongitudinal)
+			then
 				enterAirborne(session, runId)
 			end
 			if RUN.LaunchStabilityDiagnosticsEnabled then
@@ -2772,10 +2849,10 @@ local function monitorSession(session: Session, runId: number)
 			end
 
 			local position = root.Position
-			if position.Y < RUN.SafetyBounds.MinimumY then
+			if position.Y < course.SafetyMinimumWorldY then
 				requestCleanup(session, runId, "fell below the world", true)
 				return
-			elseif isExtremeLateralPosition(position) then
+			elseif isExtremeLateralPosition(course, position) then
 				requestCleanup(session, runId, "exceeded lateral safety bounds", true)
 				return
 			end
@@ -2784,7 +2861,7 @@ local function monitorSession(session: Session, runId: number)
 			if session.Phase ~= RunPhase.Landed
 				and session.Phase ~= RunPhase.Results
 				and descentStartedAt
-				and now - descentStartedAt >= RUN.MaximumRunDuration
+				and now - descentStartedAt >= course.MaximumRunDurationSeconds
 			then
 				requestCleanup(session, runId, "run timed out", true)
 				return
@@ -2798,7 +2875,8 @@ local function monitorSession(session: Session, runId: number)
 	)
 end
 
-local function connectRunEvents(session: Session, references: WorldReferences, runId: number)
+local function connectRunEvents(session: Session, runId: number)
+	local course = session.ResolvedCourse
 	addSessionConnection(
 		session,
 		session.Sled.Root.Touched:Connect(function(otherPart: BasePart)
@@ -2806,12 +2884,14 @@ local function connectRunEvents(session: Session, references: WorldReferences, r
 				return
 			end
 
-			if otherPart == references.LaunchEdge and session.Phase == RunPhase.Descent then
+			if otherPart == course.LaunchEdge and session.Phase == RunPhase.Descent then
 				enterAirborne(session, runId)
-			elseif otherPart:IsDescendantOf(references.LandingSurfaces) then
+			elseif otherPart:IsDescendantOf(course.LandingSurfaces) then
 				-- A high-speed sled can cross the thin LaunchEdge between physics events.
 				-- Promote it first so touchdown is still recognized on the same contact.
-				if session.Phase == RunPhase.Descent and session.Sled.Root.Position.Z >= session.LaunchZ then
+				if session.Phase == RunPhase.Descent
+					and crossedForwardPlane(course, session.Sled.Root.Position, course.LaunchLongitudinal)
+				then
 					enterAirborne(session, runId)
 				end
 				if session.Phase == RunPhase.Airborne then
@@ -2887,7 +2967,7 @@ end
 local function verifyReleaseAfterHeartbeat(
 	session: Session,
 	runId: number,
-	releasePositionZ: number
+	releaseLongitudinal: number
 ): (boolean, string)
 	local releaseValid, releaseReason = validateRelease(session, runId, RunPhase.Descent, false)
 	logReleaseValidity(session, "post", releaseValid, releaseReason)
@@ -2896,20 +2976,17 @@ local function verifyReleaseAfterHeartbeat(
 	end
 
 	local root = session.Sled.Root
+	local course = session.ResolvedCourse
 	local measuredVelocity = root.AssemblyLinearVelocity
-	local measuredForwardSpeed = measuredVelocity.Z
+	local measuredForwardSpeed = forwardSpeed(course, measuredVelocity)
 	local reapplied = false
 	if measuredForwardSpeed < RUN.InitialPushSpeed then
-		root.AssemblyLinearVelocity = Vector3.new(
-			measuredVelocity.X,
-			measuredVelocity.Y,
-			math.max(measuredForwardSpeed, RUN.InitialPushSpeed)
-		)
+		root.AssemblyLinearVelocity = withMinimumForwardSpeed(course, measuredVelocity, RUN.InitialPushSpeed)
 		reapplied = true
 	end
 
 	if RESULT.LifecycleDiagnosticsEnabled then
-		local progress = root.Position.Z - releasePositionZ
+		local progress = forwardCoordinate(course, root.Position) - releaseLongitudinal
 		print(
 			string.format(
 				"[Frostline][Run] %s Release verification result=%s progress=%.2f forwardSpeed=%.2f",
@@ -2984,22 +3061,19 @@ local function runCountdown(session: Session, runId: number)
 
 	-- Apply the existing baseline before the first unanchored physics synchronization.
 	local currentVelocity = root.AssemblyLinearVelocity
+	local course = session.ResolvedCourse
 	root.AssemblyAngularVelocity = Vector3.zero
-	root.AssemblyLinearVelocity = Vector3.new(
-		currentVelocity.X,
-		currentVelocity.Y,
-		math.max(currentVelocity.Z, RUN.InitialPushSpeed)
-	)
-	local releasePositionZ = root.Position.Z
+	root.AssemblyLinearVelocity = withMinimumForwardSpeed(course, currentVelocity, RUN.InitialPushSpeed)
+	local releaseLongitudinal = forwardCoordinate(course, root.Position)
 	session.DescentStartedAt = os.clock()
-	session.ReleasePositionZ = releasePositionZ
+	session.ReleaseLongitudinal = releaseLongitudinal
 	logLaunchStabilitySnapshot(session, "post-release", nil, false)
 	if RESULT.LifecycleDiagnosticsEnabled then
 		print(
 			string.format(
 				"[Frostline][Run] %s Released initialSpeed=%.1f",
 				runLabel(session),
-				root.AssemblyLinearVelocity.Z
+				forwardSpeed(course, root.AssemblyLinearVelocity)
 			)
 		)
 	end
@@ -3008,7 +3082,7 @@ local function runCountdown(session: Session, runId: number)
 	local releaseVerified, releaseVerificationReason = verifyReleaseAfterHeartbeat(
 		session,
 		runId,
-		releasePositionZ
+		releaseLongitudinal
 	)
 	if not releaseVerified then
 		session.ReleaseInProgress = false
@@ -3024,7 +3098,10 @@ local function runCountdown(session: Session, runId: number)
 
 	session.ReleaseInProgress = false
 	resetStallObservation(session)
-	session.MaximumDescentProgress = math.max(0, root.Position.Z - releasePositionZ)
+	session.MaximumDescentProgress = math.max(
+		0,
+		forwardCoordinate(course, root.Position) - releaseLongitudinal
+	)
 	session.TuckActivationReady = true
 	local activateQueuedTuck = session.TuckQueued and session.TuckIntentHeld
 	session.TuckQueued = false
@@ -3097,7 +3174,104 @@ local function seatPlayer(session: Session, runId: number): boolean
 		and seat.Occupant == session.Humanoid
 end
 
-local function beginRun(player: Player, references: WorldReferences, trustedStart: boolean)
+local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, string)
+	local definition = course.Definition
+	local courses = resolvedCourses
+	if not courses or not table.isfrozen(courses) or courses[course.CourseId] ~= course then
+		return false, "resolved course identity changed"
+	elseif not table.isfrozen(course) then
+		return false, "resolved course is not frozen"
+	elseif not table.isfrozen(definition) then
+		return false, "course definition is not frozen"
+	elseif CourseRegistry.getDefinition(course.CourseId) ~= definition then
+		return false, "course definition identity changed"
+	end
+
+	local world = course.World
+	if not world:IsA("Model")
+		or world.Name ~= definition.WorldModelName
+		or world.Parent ~= Workspace
+	then
+		return false, "world reference is stale"
+	end
+
+	local geometry = course.Geometry
+	if not geometry:IsA("Folder")
+		or geometry.Name ~= definition.GeometryFolderName
+		or geometry.Parent ~= world
+		or not geometry:IsDescendantOf(world)
+	then
+		return false, "geometry reference is stale"
+	end
+
+	local markers = course.Markers
+	if not markers:IsA("Folder")
+		or markers.Name ~= definition.MarkersFolderName
+		or markers.Parent ~= world
+		or not markers:IsDescendantOf(world)
+	then
+		return false, "markers reference is stale"
+	end
+
+	local activeSleds = course.ActiveSleds
+	if not activeSleds:IsA("Folder")
+		or activeSleds.Name ~= definition.ActiveSledsFolderName
+		or activeSleds.Parent ~= world
+		or not activeSleds:IsDescendantOf(world)
+	then
+		return false, "active sleds reference is stale"
+	end
+
+	local startTrigger = course.StartTrigger
+	if not startTrigger:IsA("BasePart")
+		or startTrigger.Name ~= definition.StartTriggerName
+		or startTrigger.Parent ~= markers
+		or not startTrigger:IsDescendantOf(world)
+	then
+		return false, "start trigger reference is stale"
+	end
+
+	local summitPlatform = course.SummitPlatform
+	if not summitPlatform:IsA("BasePart")
+		or summitPlatform.Name ~= definition.SummitPlatformName
+		or summitPlatform.Parent ~= geometry
+		or not summitPlatform:IsDescendantOf(world)
+	then
+		return false, "summit platform reference is stale"
+	end
+
+	local launchEdge = course.LaunchEdge
+	if not launchEdge:IsA("BasePart")
+		or launchEdge.Name ~= definition.LaunchEdgeName
+		or launchEdge.Parent ~= markers
+		or not launchEdge:IsDescendantOf(world)
+	then
+		return false, "launch edge reference is stale"
+	end
+
+	local landingSurfaces = course.LandingSurfaces
+	if not landingSurfaces:IsA("Folder")
+		or landingSurfaces.Name ~= definition.LandingSurfacesName
+		or landingSurfaces.Parent ~= geometry
+		or not landingSurfaces:IsDescendantOf(world)
+		or landingSurfaces:FindFirstChildWhichIsA("BasePart", false) == nil
+	then
+		return false, "landing surfaces reference is stale"
+	end
+
+	local playerSpawn = course.PlayerSpawn
+	if not playerSpawn:IsA("SpawnLocation")
+		or playerSpawn.Name ~= definition.PlayerSpawnName
+		or playerSpawn.Parent ~= geometry
+		or not playerSpawn:IsDescendantOf(world)
+	then
+		return false, "player spawn reference is stale"
+	end
+
+	return true, "ok"
+end
+
+local function beginRun(player: Player, course: ResolvedCourse, trustedStart: boolean)
 	if player.Parent ~= Players
 		or sessions[player]
 		or pendingReplays[player]
@@ -3106,12 +3280,16 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	then
 		return
 	end
-	if not references.PlayerSpawn.Parent or not references.PlayerSpawn:IsDescendantOf(Workspace) then
-		warn(string.format("[Frostline] PlayerSpawn unavailable; refusing run for %s", player.Name))
-		return
-	end
-	if not references.SummitPlatform.Parent or not references.SummitPlatform:IsDescendantOf(Workspace) then
-		warn(string.format("[Frostline] SummitPlatform unavailable; refusing run for %s", player.Name))
+	local courseValid, courseReason = validateResolvedCourseLive(course)
+	if not courseValid then
+		warn(
+			string.format(
+				"[Frostline][Course] CourseId=%s refusing run for player=%s reason=%s",
+				course.CourseId,
+				player.Name,
+				courseReason
+			)
+		)
 		return
 	end
 
@@ -3125,26 +3303,23 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	if not humanoidInstance or humanoidInstance.Health <= 0 or not rootPart or not rootPart:IsA("BasePart") then
 		return
 	end
-	if not trustedStart and (rootPart.Position - references.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
+	if not trustedStart and (rootPart.Position - course.StartTrigger.Position).Magnitude > MAX_START_DISTANCE then
 		return
 	end
 	local equippedSledId = PlayerDataService.getEquippedSledId(player)
 	disableStartPrompt()
 
-	local triggerCenter = references.StartTrigger.Position
+	local triggerCenter = course.StartTrigger.Position
 	local sled = SledFactory.create(
-		CFrame.lookAt(triggerCenter, triggerCenter + Vector3.zAxis),
+		CFrame.lookAt(triggerCenter, triggerCenter + course.ForwardDirection),
 		equippedSledId
 	)
-	local summitTopY = references.SummitPlatform.Position.Y + references.SummitPlatform.Size.Y * 0.5
-	local startPosition = Vector3.new(
-		triggerCenter.X,
-		summitTopY + sled.Root.Size.Y * 0.5 + START_BOTTOM_CLEARANCE,
-		triggerCenter.Z
-	)
-	local spawnCFrame = CFrame.lookAt(startPosition, startPosition + Vector3.zAxis)
+	local summitTopY = course.SummitPlatform.Position.Y + course.SummitPlatform.Size.Y * 0.5
+	local startY = summitTopY + sled.Root.Size.Y * 0.5 + START_BOTTOM_CLEARANCE
+	local startPosition = triggerCenter + Vector3.yAxis * (startY - triggerCenter.Y)
+	local spawnCFrame = CFrame.lookAt(startPosition, startPosition + course.ForwardDirection)
 	sled.Model:PivotTo(spawnCFrame)
-	sled.Model.Parent = references.ActiveSleds
+	sled.Model.Parent = course.ActiveSleds
 
 	latestRunId += 1
 	local runId = latestRunId
@@ -3156,6 +3331,8 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	groundRaycastParams.RespectCanCollide = true
 	local session: Session = {
 		RunId = runId,
+		CourseId = course.CourseId,
+		ResolvedCourse = course,
 		Player = player,
 		Character = character,
 		Humanoid = humanoidInstance,
@@ -3169,9 +3346,6 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 		CountdownValue = nil,
 		OriginalMassless = {},
 		Connections = {},
-		PlayerSpawn = references.PlayerSpawn,
-		LaunchZ = references.LaunchZ,
-		StudsPerMeter = references.StudsPerMeter,
 		DescentStartedAt = nil,
 		LandingSettledSince = nil,
 		LastTuckRequestAt = 0,
@@ -3186,9 +3360,9 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 		CleanupStarted = false,
 		FirstCleanupReason = nil,
 		ReleaseInProgress = false,
-		ReleasePositionZ = nil,
+		ReleaseLongitudinal = nil,
 		StallObservationStartedAt = nil,
-		StallObservationStartZ = nil,
+		StallObservationStartLongitudinal = nil,
 		StallObservationKind = nil,
 		StallRecoveryUsed = false,
 		LastStallRejectionAt = -math.huge,
@@ -3228,7 +3402,7 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	end
 
 	session.OriginalMassless = makeCharacterMassless(character)
-	connectRunEvents(session, references, runId)
+	connectRunEvents(session, runId)
 
 	if not seatPlayer(session, runId) then
 		requestCleanup(session, runId, "could not seat player", true)
@@ -3238,8 +3412,23 @@ local function beginRun(player: Player, references: WorldReferences, trustedStar
 	task.spawn(runCountdown, session, runId)
 end
 
-local function startRunSafely(player: Player, references: WorldReferences, trustedStart: boolean)
-	local ok, message = pcall(beginRun, player, references, trustedStart)
+local function startRunSafely(player: Player, courseId: CourseId, trustedStart: boolean)
+	local courses = resolvedCourses
+	local definition = CourseRegistry.getDefinition(courseId)
+	local course = if courses and definition then courses[courseId] else nil
+	if course == nil or course.Definition ~= definition then
+		warn(
+			string.format(
+				"[Frostline][Course] CourseId=%s refusing run for player=%s reason=course unavailable",
+				courseId,
+				player.Name
+			)
+		)
+		refreshStartPrompt()
+		return
+	end
+
+	local ok, message = pcall(beginRun, player, course, trustedStart)
 	if ok then
 		if not sessions[player] then
 			refreshStartPrompt()
@@ -3266,50 +3455,192 @@ local function startRunSafely(player: Player, references: WorldReferences, trust
 	end
 end
 
-local function findWorldReferences(): WorldReferences?
-	local world = Workspace:FindFirstChild(WORLD.FolderName)
-	if not world or not world:IsA("Model") then
-		warn("[Frostline] RunManager could not find FrostlineWorld")
-		return nil
+local function validateRegistry(): (CourseDefinition?, string)
+	if not table.isfrozen(CourseRegistry) then
+		return nil, "registry API is not frozen"
+	elseif not table.isfrozen(CourseRegistry.Definitions) then
+		return nil, "definitions dictionary is not frozen"
 	end
 
-	local markers = world:FindFirstChild("Markers")
-	local geometry = world:FindFirstChild("Geometry")
-	if not markers or not markers:IsA("Folder") or not geometry or not geometry:IsA("Folder") then
-		warn("[Frostline] RunManager could not find world folders")
-		return nil
+	local definitionCount = 0
+	local registeredDefinition: CourseDefinition? = nil
+	for courseId, definition in CourseRegistry.Definitions do
+		definitionCount += 1
+		registeredDefinition = definition
+		if courseId ~= definition.CourseId then
+			return nil, "definition key does not match CourseId"
+		elseif not table.isfrozen(definition) then
+			return nil, "course definition is not frozen"
+		end
+	end
+	if definitionCount ~= 1 or registeredDefinition == nil then
+		return nil, "definitions must contain exactly one course"
 	end
 
-	local startTrigger = markers:FindFirstChild("StartTrigger")
-	local summitPlatform = geometry:FindFirstChild("SummitPlatform")
-	local launchEdge = markers:FindFirstChild("LaunchEdge")
-	local landingSurfaces = geometry:FindFirstChild("FrozenLake")
-	local playerSpawn = geometry:FindFirstChild("PlayerSpawn", true)
-	if not startTrigger
-		or not startTrigger:IsA("BasePart")
-		or not summitPlatform
-		or not summitPlatform:IsA("BasePart")
-		or not launchEdge
-		or not launchEdge:IsA("BasePart")
-		or not landingSurfaces
-		or not landingSurfaces:IsA("Folder")
-		or not playerSpawn
-		or not playerSpawn:IsA("SpawnLocation")
+	local defaultCourseId = CourseRegistry.DefaultCourseId
+	if defaultCourseId ~= "FrozenLakeV2" then
+		return nil, "default CourseId is not FrozenLakeV2"
+	elseif defaultCourseId ~= GameConfig.Leaderboard.CourseId then
+		return nil, "default CourseId does not match leaderboard CourseId"
+	end
+
+	local definition = CourseRegistry.getDefinition(defaultCourseId)
+	if definition == nil
+		or CourseRegistry.Definitions[defaultCourseId] ~= definition
+		or definition ~= registeredDefinition
 	then
-		warn("[Frostline] RunManager could not resolve required world objects")
-		return nil
-	end
-	if not landingSurfaces:FindFirstChildWhichIsA("BasePart") then
-		warn("[Frostline] RunManager found no FrozenLake surface parts")
-		return nil
-	end
-	if WORLD.StudsPerMeter <= 0 then
-		warn("[Frostline] RunManager found invalid StudsPerMeter")
-		return nil
+		return nil, "default course definition is unavailable"
+	elseif CourseRegistry.getDefinition("UnknownCourse") ~= nil then
+		return nil, "registry accepted an unknown CourseId"
 	end
 
+	if not isNonEmptyString(definition.CourseId)
+		or not isNonEmptyString(definition.DisplayName)
+		or not isNonEmptyString(definition.WorldModelName)
+		or not isNonEmptyString(definition.GeometryFolderName)
+		or not isNonEmptyString(definition.MarkersFolderName)
+		or not isNonEmptyString(definition.ActiveSledsFolderName)
+		or not isNonEmptyString(definition.StartTriggerName)
+		or not isNonEmptyString(definition.SummitPlatformName)
+		or not isNonEmptyString(definition.LaunchEdgeName)
+		or not isNonEmptyString(definition.LandingSurfacesName)
+		or not isNonEmptyString(definition.PlayerSpawnName)
+	then
+		return nil, "course definition contains an empty name"
+	end
+
+	return definition, "ok"
+end
+
+local function resolveCourses(): (ResolvedCourseDictionary?, string)
+	local definition, registryReason = validateRegistry()
+	if not definition then
+		return nil, registryReason
+	end
+
+	local coordinateOrigin = definition.CoordinateOrigin
+	local configuredForward = definition.ForwardDirection
+	if not isFiniteVector3(coordinateOrigin) then
+		return nil, "CoordinateOrigin is not finite"
+	elseif not isFiniteVector3(configuredForward) then
+		return nil, "ForwardDirection is not finite"
+	elseif math.abs(configuredForward.Y) > COURSE_BASIS_EPSILON then
+		return nil, "ForwardDirection is not horizontal"
+	elseif configuredForward.Magnitude <= COURSE_BASIS_EPSILON then
+		return nil, "ForwardDirection is zero"
+	elseif math.abs(configuredForward.Magnitude - 1) > COURSE_BASIS_EPSILON then
+		return nil, "ForwardDirection is not unit length"
+	end
+
+	local forwardDirection = configuredForward.Unit
+	local rightCandidate = forwardDirection:Cross(Vector3.yAxis)
+	if not isFiniteVector3(rightCandidate) or rightCandidate.Magnitude <= COURSE_BASIS_EPSILON then
+		return nil, "RightDirection could not be derived"
+	end
+	local rightDirection = rightCandidate.Unit
+	local basisForward = Vector3.yAxis:Cross(rightDirection)
+	if not isFiniteVector3(rightDirection)
+		or math.abs(rightDirection.Y) > COURSE_BASIS_EPSILON
+		or math.abs(rightDirection.Magnitude - 1) > COURSE_BASIS_EPSILON
+		or math.abs(forwardDirection:Dot(rightDirection)) > COURSE_BASIS_EPSILON
+		or basisForward.Magnitude <= COURSE_BASIS_EPSILON
+		or basisForward.Unit:Dot(forwardDirection) < 1 - COURSE_BASIS_EPSILON
+	then
+		return nil, "course basis is invalid"
+	end
+
+	if not isFinitePositiveNumber(definition.TrackWidth) then
+		return nil, "TrackWidth is not finite and positive"
+	elseif not isFinitePositiveNumber(definition.StudsPerMeter) then
+		return nil, "StudsPerMeter is not finite and positive"
+	elseif not isFiniteNumber(definition.RampFreedomLongitudinal) then
+		return nil, "RampFreedomLongitudinal is not finite"
+	elseif not isFinitePositiveNumber(definition.LandingFieldDistanceMeters) then
+		return nil, "LandingFieldDistanceMeters is not finite and positive"
+	elseif not isFinitePositiveNumber(definition.MaximumRunDurationSeconds) then
+		return nil, "MaximumRunDurationSeconds is not finite and positive"
+	elseif not isFinitePositiveNumber(definition.SafetyMaximumLateralDistance) then
+		return nil, "SafetyMaximumLateralDistance is not finite and positive"
+	elseif not isFiniteNumber(definition.SafetyMinimumWorldY) then
+		return nil, "SafetyMinimumWorldY is not finite"
+	end
+
+	local worldInstance = Workspace:FindFirstChild(definition.WorldModelName)
+	if not worldInstance or not worldInstance:IsA("Model") or worldInstance.Parent ~= Workspace then
+		return nil, "world Model is unavailable"
+	end
+	local world = worldInstance
+
+	local geometryInstance = world:FindFirstChild(definition.GeometryFolderName)
+	local markersInstance = world:FindFirstChild(definition.MarkersFolderName)
+	if not geometryInstance
+		or not geometryInstance:IsA("Folder")
+		or geometryInstance.Parent ~= world
+		or not markersInstance
+		or not markersInstance:IsA("Folder")
+		or markersInstance.Parent ~= world
+	then
+		return nil, "course folders are unavailable"
+	end
+	local geometry = geometryInstance
+	local markers = markersInstance
+
+	local startTriggerInstance = markers:FindFirstChild(definition.StartTriggerName)
+	local summitPlatformInstance = geometry:FindFirstChild(definition.SummitPlatformName)
+	local launchEdgeInstance = markers:FindFirstChild(definition.LaunchEdgeName)
+	local landingSurfacesInstance = geometry:FindFirstChild(definition.LandingSurfacesName)
+	local playerSpawnInstance = geometry:FindFirstChild(definition.PlayerSpawnName)
+	if not startTriggerInstance
+		or not startTriggerInstance:IsA("BasePart")
+		or startTriggerInstance.Parent ~= markers
+		or not summitPlatformInstance
+		or not summitPlatformInstance:IsA("BasePart")
+		or summitPlatformInstance.Parent ~= geometry
+		or not launchEdgeInstance
+		or not launchEdgeInstance:IsA("BasePart")
+		or launchEdgeInstance.Parent ~= markers
+		or not landingSurfacesInstance
+		or not landingSurfacesInstance:IsA("Folder")
+		or landingSurfacesInstance.Parent ~= geometry
+		or not playerSpawnInstance
+		or not playerSpawnInstance:IsA("SpawnLocation")
+		or playerSpawnInstance.Parent ~= geometry
+	then
+		return nil, "required course Instances are unavailable"
+	end
+	local startTrigger = startTriggerInstance
+	local summitPlatform = summitPlatformInstance
+	local launchEdge = launchEdgeInstance
+	local landingSurfaces = landingSurfacesInstance
+	local playerSpawn = playerSpawnInstance
+
+	if not geometry:IsDescendantOf(world)
+		or not markers:IsDescendantOf(world)
+		or not startTrigger:IsDescendantOf(world)
+		or not summitPlatform:IsDescendantOf(world)
+		or not launchEdge:IsDescendantOf(world)
+		or not landingSurfaces:IsDescendantOf(world)
+		or not playerSpawn:IsDescendantOf(world)
+	then
+		return nil, "course Instances do not share the resolved world"
+	elseif landingSurfaces:FindFirstChildWhichIsA("BasePart", false) == nil then
+		return nil, "landing surfaces contain no direct BasePart"
+	end
+
+	local launchLongitudinal = (launchEdge.Position - coordinateOrigin):Dot(forwardDirection)
+	local startLongitudinal = (startTrigger.Position - coordinateOrigin):Dot(forwardDirection)
+	if not isFiniteNumber(launchLongitudinal) or not isFiniteNumber(startLongitudinal) then
+		return nil, "course planes are not finite"
+	elseif startLongitudinal >= launchLongitudinal then
+		return nil, "StartTrigger must be before LaunchEdge"
+	elseif definition.RampFreedomLongitudinal >= launchLongitudinal then
+		return nil, "ramp freedom must be before LaunchEdge"
+	end
+
+	-- Reconcile ActiveSleds only after every registry, metric, basis, and required
+	-- Instance check above has succeeded.
 	local activeSleds: Folder
-	local existingSleds = world:FindFirstChild("ActiveSleds")
+	local existingSleds = world:FindFirstChild(definition.ActiveSledsFolderName)
 	if existingSleds and existingSleds:IsA("Folder") then
 		activeSleds = existingSleds
 	else
@@ -3317,20 +3648,45 @@ local function findWorldReferences(): WorldReferences?
 			existingSleds:Destroy()
 		end
 		activeSleds = Instance.new("Folder")
-		activeSleds.Name = "ActiveSleds"
+		activeSleds.Name = definition.ActiveSledsFolderName
 		activeSleds.Parent = world
 	end
 
-	return {
+	local resolvedCourse: ResolvedCourse = {
+		Definition = definition,
+		CourseId = definition.CourseId,
+		World = world,
+		Geometry = geometry,
+		Markers = markers,
 		ActiveSleds = activeSleds,
 		StartTrigger = startTrigger,
 		SummitPlatform = summitPlatform,
 		LaunchEdge = launchEdge,
 		LandingSurfaces = landingSurfaces,
 		PlayerSpawn = playerSpawn,
-		LaunchZ = launchEdge.Position.Z,
-		StudsPerMeter = WORLD.StudsPerMeter,
+		CoordinateOrigin = coordinateOrigin,
+		ForwardDirection = forwardDirection,
+		RightDirection = rightDirection,
+		LaunchLongitudinal = launchLongitudinal,
+		TrackWidth = definition.TrackWidth,
+		StudsPerMeter = definition.StudsPerMeter,
+		RampFreedomLongitudinal = definition.RampFreedomLongitudinal,
+		LandingFieldDistanceMeters = definition.LandingFieldDistanceMeters,
+		MaximumRunDurationSeconds = definition.MaximumRunDurationSeconds,
+		SafetyMaximumLateralDistance = definition.SafetyMaximumLateralDistance,
+		SafetyMinimumWorldY = definition.SafetyMinimumWorldY,
 	}
+	table.freeze(resolvedCourse)
+
+	local courses: ResolvedCourseDictionary = {
+		[definition.CourseId] = resolvedCourse,
+	}
+	table.freeze(courses)
+	if not table.isfrozen(resolvedCourse) or not table.isfrozen(courses) then
+		return nil, "resolved course tables are not frozen"
+	end
+
+	return courses, "ok"
 end
 
 local function getOrCreateRemoteFolder(): Folder
@@ -3546,11 +3902,20 @@ function RunManager.start()
 	end
 	started = true
 
-	local references = findWorldReferences()
-	if not references then
+	local courses, resolutionReason = resolveCourses()
+	if not courses then
+		warn(
+			string.format(
+				"[Frostline][Course] CourseId=%s unavailable reason=%s",
+				CourseRegistry.DefaultCourseId,
+				resolutionReason
+			)
+		)
 		started = false
 		return
 	end
+	resolvedCourses = courses
+	local defaultCourse = courses[CourseRegistry.DefaultCourseId]
 
 	local remoteFolder = getOrCreateRemoteFolder()
 	local tuckRemote = getOrCreateRemote(remoteFolder, TUCK_REMOTE_NAME)
@@ -3560,15 +3925,15 @@ function RunManager.start()
 
 	tuckRemote.OnServerEvent:Connect(onTuckIntent)
 	resultActionRemote.OnServerEvent:Connect(onResultAction)
-	trustedReplay = function(player: Player)
-		startRunSafely(player, references, true)
+	trustedReplay = function(player: Player, courseId: CourseId)
+		startRunSafely(player, courseId, true)
 	end
 
-	local prompt = configurePrompt(references.StartTrigger)
+	local prompt = configurePrompt(defaultCourse.StartTrigger)
 	startPrompt = prompt
 	refreshStartPrompt()
 	prompt.Triggered:Connect(function(player: Player)
-		startRunSafely(player, references, false)
+		startRunSafely(player, CourseRegistry.DefaultCourseId, false)
 	end)
 
 	print("[Frostline] RunManager ready")
