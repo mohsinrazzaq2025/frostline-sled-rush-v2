@@ -30,6 +30,26 @@ export type RouteData = {
 	AuthoredPathLengthStuds: number,
 }
 
+export type SteeringTuning = {
+	Enabled: boolean,
+	InputQuantizationSteps: number,
+	MaximumSequence: number,
+	MaximumSequenceJump: number,
+	ServerRateTokensPerSecond: number,
+	ServerRateBucketCapacity: number,
+	ServerIntentTimeoutSeconds: number,
+	AppliedInputRisePerSecond: number,
+	AppliedInputReleasePerSecond: number,
+	MinimumLateralSpeed: number,
+	LateralSpeedBase: number,
+	LateralSpeedPerForwardSpeed: number,
+	MaximumLateralSpeed: number,
+	LateralVelocityResponseSeconds: number,
+	MaximumLateralAcceleration: number,
+	GroundRayDistance: number,
+	AppliedInputSnapEpsilon: number,
+}
+
 export type FrostTrailConfig = {
 	CourseId: string,
 	DisplayName: string,
@@ -66,6 +86,7 @@ export type FrostTrailConfig = {
 	LandingSegmentOverlap: number,
 	PathPoints: { Vector3 },
 	RouteData: RouteData,
+	Steering: SteeringTuning,
 	Sections: { SectionDefinition },
 	WidenedRouteZones: { RouteWidthZone },
 	TaperZones: { TaperZone },
@@ -263,6 +284,27 @@ local routeData: RouteData = {
 }
 table.freeze(routeData)
 
+local steering: SteeringTuning = {
+	Enabled = true,
+	InputQuantizationSteps = 20,
+	MaximumSequence = 2147483647,
+	MaximumSequenceJump = 64,
+	ServerRateTokensPerSecond = 24,
+	ServerRateBucketCapacity = 8,
+	ServerIntentTimeoutSeconds = 0.45,
+	AppliedInputRisePerSecond = 6,
+	AppliedInputReleasePerSecond = 9,
+	MinimumLateralSpeed = 18,
+	LateralSpeedBase = 15,
+	LateralSpeedPerForwardSpeed = 0.10,
+	MaximumLateralSpeed = 26,
+	LateralVelocityResponseSeconds = 0.45,
+	MaximumLateralAcceleration = 45,
+	GroundRayDistance = 5,
+	AppliedInputSnapEpsilon = 0.01,
+}
+table.freeze(steering)
+
 local config: FrostTrailConfig = {
 	CourseId = "FrostTrailV1",
 	DisplayName = "FROST TRAIL",
@@ -299,6 +341,7 @@ local config: FrostTrailConfig = {
 	LandingSegmentOverlap = 0.25,
 	PathPoints = pathPoints,
 	RouteData = routeData,
+	Steering = steering,
 	Sections = sections,
 	WidenedRouteZones = widenedRouteZones,
 	TaperZones = taperZones,

@@ -4,6 +4,7 @@ local ContextActionService = game:GetService("ContextActionService")
 local GuiService = game:GetService("GuiService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
@@ -17,7 +18,19 @@ local JUMP_BLOCK_ACTION_NAME = "FrostlineRunJumpBlock"
 local JUMP_BLOCK_PRIORITY = Enum.ContextActionPriority.High.Value + 1
 local REMOTES_FOLDER_NAME = "FrostlineRemotes"
 local TUCK_REMOTE_NAME = "TuckIntent"
+local STEERING_REMOTE_NAME = "SteeringIntent"
 local STATE_REMOTE_NAME = "RunState"
+local PRESENTATION_COURSE_ATTRIBUTE = "FrostlinePresentationCourseId"
+local FROST_TRAIL_COURSE_ID = "FrostTrailV1"
+local STEERING_QUANTIZATION_STEPS = 20
+local STEERING_MAXIMUM_SEQUENCE = 2147483647
+local STEERING_SEND_INTERVAL = 0.05
+local STEERING_KEEPALIVE_INTERVAL = 0.20
+local STEERING_KEYBOARD_DEADZONE = 0.10
+local STEERING_TOUCH_DEADZONE = 0.12
+local STEERING_GAMEPAD_DEADZONE = 0.18
+local STEERING_ANALOG_SATURATION = 0.95
+local STEERING_SCHMITT_PADDING = 0.025
 local TUCK_DEFAULT_COLOR = Color3.fromRGB(244, 190, 70)
 local TUCK_READY_COLOR = Color3.fromRGB(64, 224, 200)
 local TUCK_ACTIVE_COLOR = Color3.fromRGB(104, 255, 138)
@@ -45,6 +58,7 @@ type Hud = {
 	TuckBadgeScale: UIScale,
 	TuckLabel: TextLabel,
 	TutorialFrame: Frame,
+	TutorialTitle: TextLabel,
 	TutorialDetail: TextLabel,
 }
 
@@ -76,6 +90,14 @@ local function isGamepadInput(inputType: Enum.UserInputType): boolean
 	return string.sub(inputType.Name, 1, 7) == "Gamepad"
 end
 
+local function isFiniteNumber(value: number): boolean
+	return value == value and value > -math.huge and value < math.huge
+end
+
+local function isFiniteVector3(value: Vector3): boolean
+	return isFiniteNumber(value.X) and isFiniteNumber(value.Y) and isFiniteNumber(value.Z)
+end
+
 local function getTuckInputCopy(): (string, string, string, string)
 	local lastInputType = UserInputService:GetLastInputType()
 	local inputName: string
@@ -95,6 +117,21 @@ local function getTuckInputCopy(): (string, string, string, string)
 		string.format("HOLD %s TO PREPARE TUCK", string.upper(inputName)),
 		string.format("Hold %s during the downhill run.", inputName),
 		string.format("KEEP HOLDING %s", string.upper(inputName))
+end
+
+local function getFrostSteeringTutorialDetail(): string
+	local lastInputType = UserInputService:GetLastInputType()
+	if lastInputType == Enum.UserInputType.Touch then
+		return "Left thumbstick to steer. Hold TUCK for speed."
+	elseif isGamepadInput(lastInputType) then
+		return "Left Stick to steer. Hold L2 to TUCK."
+	elseif UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+		return "Left thumbstick to steer. Hold TUCK for speed."
+	elseif UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
+		return "Left Stick to steer. Hold L2 to TUCK."
+	end
+
+	return "A / D or arrow keys to steer. Hold Shift to TUCK."
 end
 
 local function createHud(defaultTuckInstruction: string, tutorialDetail: string): Hud
@@ -327,6 +364,7 @@ local function createHud(defaultTuckInstruction: string, tutorialDetail: string)
 		TuckBadgeScale = tuckBadgeScale,
 		TuckLabel = instructionLabel,
 		TutorialFrame = tutorialFrame,
+		TutorialTitle = tutorialTitle,
 		TutorialDetail = tutorialDetailLabel,
 	}
 end
@@ -714,7 +752,10 @@ function RunController.start()
 	local serverTucking = false
 	local serverReleaseAccepted = false
 	local currentOutcome: string? = nil
-	local tutorialDismissed = false
+	local classicTutorialDismissed = false
+	local frostTutorialPreparationPending = false
+	local frostTutorialDismissed = true
+	local currentPresentationCourseId: string? = nil
 	local lastTuckBadgeStyle = ""
 	local tuckBadgePulseGeneration = 0
 	local touchLayoutCleanup: (() -> ())? = nil
@@ -724,6 +765,8 @@ function RunController.start()
 	local tuckTouchButton: GuiObject? = nil
 	local tuckTouchButtonVisible = false
 	local releaseHeldTuckForLifecycle: (() -> ())? = nil
+	local endSteeringForCharacterLifecycle: (() -> ())? = nil
+	local windowFocused = true
 	local player = Players.LocalPlayer
 	local playerGuiInstance = hud.ScreenGui.Parent
 	if not playerGuiInstance or not playerGuiInstance:IsA("PlayerGui") then
@@ -979,6 +1022,10 @@ function RunController.start()
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterRemoving:Connect(function(_character: Model)
+		local endSteering = endSteeringForCharacterLifecycle
+		if endSteering then
+			endSteering()
+		end
 		local releaseHeldTuck = releaseHeldTuckForLifecycle
 		if releaseHeldTuck then
 			releaseHeldTuck()
@@ -990,6 +1037,10 @@ function RunController.start()
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterAdded:Connect(function(_character: Model)
+		local endSteering = endSteeringForCharacterLifecycle
+		if endSteering then
+			endSteering()
+		end
 		local releaseHeldTuck = releaseHeldTuckForLifecycle
 		if releaseHeldTuck then
 			releaseHeldTuck()
@@ -1007,9 +1058,23 @@ function RunController.start()
 		return currentOutcome == MISSED_LAUNCH_OUTCOME and currentPhase ~= RunPhase.Idle
 	end
 
+	local function isFrostPresentation(): boolean
+		return currentPresentationCourseId == FROST_TRAIL_COURSE_ID
+	end
+
+	local function shouldShowTutorial(): boolean
+		if currentPhase ~= RunPhase.Idle then
+			return false
+	elseif isFrostPresentation() then
+			return frostTutorialPreparationPending and not frostTutorialDismissed
+	end
+
+	return not classicTutorialDismissed
+	end
+
 	local function updatePhaseFeedback()
 		hud.StatusPanel.Visible = currentPhase ~= RunPhase.Results and currentPhase ~= RunPhase.Reset
-		hud.TutorialFrame.Visible = not tutorialDismissed and currentPhase == RunPhase.Idle
+		hud.TutorialFrame.Visible = shouldShowTutorial()
 		hud.PhaseLabel.TextColor3 = PHASE_DEFAULT_COLOR
 		hud.PhaseLabel.Font = Enum.Font.GothamBlack
 		if isShowingMissedLaunch() then
@@ -1128,8 +1193,292 @@ function RunController.start()
 
 	local function refreshInputCopy()
 		defaultTuckInstruction, prepareTuckInstruction, tutorialDetail, activeTuckInstruction = getTuckInputCopy()
-		hud.TutorialDetail.Text = tutorialDetail
+		if isFrostPresentation() then
+			hud.TutorialTitle.Text = "STEER THE FROST TRAIL"
+			hud.TutorialDetail.Text = getFrostSteeringTutorialDetail()
+		else
+			hud.TutorialTitle.Text = "TUCK FOR MORE SPEED"
+			hud.TutorialDetail.Text = tutorialDetail
+		end
 		updateTuckFeedback()
+	end
+
+	local steeringHeartbeatConnection: RBXScriptConnection? = nil
+	local steeringSessionRemote: RemoteEvent? = nil
+	local steeringSessionRunId: number? = nil
+	local steeringSessionCharacter: Model? = nil
+	local steeringSessionHumanoid: Humanoid? = nil
+	local steeringEndedRunId: number? = nil
+	local steeringSequence = 0
+	local steeringLastSentAxisQ: number? = nil
+	local steeringPendingAxisQ: number? = nil
+	local steeringLastSendAt = -math.huge
+	local steeringLastNonzeroSendAt = -math.huge
+	local steeringHardNeutralSent = false
+
+	local function resolveSteeringRemote(): RemoteEvent?
+		local instance = remoteFolder:FindFirstChild(STEERING_REMOTE_NAME)
+		if instance and instance:IsA("RemoteEvent") then
+			return instance
+		end
+		return nil
+	end
+
+	local function fireSteeringPacket(axisQ: number, now: number): boolean
+		local remote = steeringSessionRemote
+		local runId = steeringSessionRunId
+		if remote == nil
+			or remote.Parent ~= remoteFolder
+			or runId == nil
+			or steeringSequence >= STEERING_MAXIMUM_SEQUENCE
+		then
+			return false
+		end
+
+		steeringSequence += 1
+		local succeeded = pcall(function()
+			remote:FireServer(runId, steeringSequence, axisQ)
+		end)
+		if not succeeded then
+			return false
+		end
+
+		steeringLastSentAxisQ = axisQ
+		steeringLastSendAt = now
+		if axisQ ~= 0 then
+			steeringLastNonzeroSendAt = now
+		end
+		return true
+	end
+
+	local function endSteeringSender(sendFailSafeNeutral: boolean)
+		local oldRunId = steeringSessionRunId
+		if sendFailSafeNeutral
+			and not steeringHardNeutralSent
+			and steeringLastSentAxisQ ~= nil
+			and steeringLastSentAxisQ ~= 0
+		then
+			steeringHardNeutralSent = true
+			fireSteeringPacket(0, os.clock())
+		end
+
+		local connection = steeringHeartbeatConnection
+		steeringHeartbeatConnection = nil
+		if connection then
+			connection:Disconnect()
+		end
+		if oldRunId ~= nil then
+			steeringEndedRunId = oldRunId
+		end
+		steeringSessionRemote = nil
+		steeringSessionRunId = nil
+		steeringSessionCharacter = nil
+		steeringSessionHumanoid = nil
+		steeringSequence = 0
+		steeringLastSentAxisQ = nil
+		steeringPendingAxisQ = nil
+		steeringLastSendAt = -math.huge
+		steeringLastNonzeroSendAt = -math.huge
+		steeringHardNeutralSent = false
+	end
+	endSteeringForCharacterLifecycle = function()
+		endSteeringSender(true)
+	end
+
+	local function getSteeringDeadzone(): number
+		local lastInputType = UserInputService:GetLastInputType()
+		if lastInputType == Enum.UserInputType.Touch then
+			return STEERING_TOUCH_DEADZONE
+		elseif isGamepadInput(lastInputType) then
+			return STEERING_GAMEPAD_DEADZONE
+		end
+		return STEERING_KEYBOARD_DEADZONE
+	end
+
+	local function sampleSteeringAxis(humanoid: Humanoid): number
+		if not windowFocused or GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() ~= nil then
+			return 0
+	end
+
+		local walkSpeed = humanoid.WalkSpeed
+		if not isFiniteNumber(walkSpeed) or walkSpeed <= 0 then
+			return 0
+		end
+		local succeeded, moveVelocityValue = pcall(function()
+			return humanoid:GetMoveVelocity()
+		end)
+		if not succeeded or typeof(moveVelocityValue) ~= "Vector3" then
+			return 0
+		end
+		local moveVelocity = moveVelocityValue :: Vector3
+		if not isFiniteVector3(moveVelocity) then
+			return 0
+		end
+
+		local camera = Workspace.CurrentCamera
+		if not camera then
+			return 0
+		end
+		local rightVector = camera.CFrame.RightVector
+		local horizontalRight = Vector3.new(rightVector.X, 0, rightVector.Z)
+		if not isFiniteVector3(horizontalRight) or horizontalRight.Magnitude <= 1e-5 then
+			return 0
+		end
+
+		local rawAxis = math.clamp((moveVelocity / walkSpeed):Dot(horizontalRight.Unit), -1, 1)
+		local magnitude = math.abs(rawAxis)
+		local deadzone = getSteeringDeadzone()
+		local shapedMagnitude = math.clamp(
+			(magnitude - deadzone) / (STEERING_ANALOG_SATURATION - deadzone),
+			0,
+			1
+		)
+		local shaped = math.sign(rawAxis)
+			* (0.75 * shapedMagnitude + 0.25 * shapedMagnitude * shapedMagnitude * shapedMagnitude)
+		if shaped == 0 then
+			return 0
+		end
+
+		local lastAxisQ = steeringLastSentAxisQ
+		if lastAxisQ ~= nil then
+			local lower = math.clamp(
+				(lastAxisQ - 0.5) / STEERING_QUANTIZATION_STEPS - STEERING_SCHMITT_PADDING,
+				-1,
+				1
+			)
+			local upper = math.clamp(
+				(lastAxisQ + 0.5) / STEERING_QUANTIZATION_STEPS + STEERING_SCHMITT_PADDING,
+				-1,
+				1
+			)
+			if shaped >= lower and shaped <= upper then
+				return lastAxisQ
+			end
+		end
+
+		local axisQ = math.sign(shaped)
+			* math.floor(math.abs(shaped) * STEERING_QUANTIZATION_STEPS + 0.5)
+		return math.clamp(axisQ, -STEERING_QUANTIZATION_STEPS, STEERING_QUANTIZATION_STEPS)
+	end
+
+	local function steeringHeartbeat()
+		local runId = steeringSessionRunId
+		local remote = steeringSessionRemote
+		local character = steeringSessionCharacter
+		local humanoid = steeringSessionHumanoid
+		if controllerCleanupStarted
+			or runId == nil
+			or runId ~= currentRunId
+			or runId ~= latestRunId
+			or remote == nil
+			or remote.Parent ~= remoteFolder
+			or currentPresentationCourseId ~= FROST_TRAIL_COURSE_ID
+			or (currentPhase ~= RunPhase.Countdown and currentPhase ~= RunPhase.Descent)
+			or character == nil
+			or character ~= player.Character
+			or character.Parent == nil
+			or humanoid == nil
+			or humanoid.Parent ~= character
+			or humanoid.Health <= 0
+		then
+			endSteeringSender(true)
+			return
+		end
+
+		local axisQ = sampleSteeringAxis(humanoid)
+		steeringPendingAxisQ = axisQ
+		local now = os.clock()
+		if now - steeringLastSendAt < STEERING_SEND_INTERVAL then
+			return
+		end
+
+		local pendingAxisQ = steeringPendingAxisQ
+		if pendingAxisQ == nil then
+			return
+		elseif steeringLastSentAxisQ == nil or pendingAxisQ ~= steeringLastSentAxisQ then
+			if not fireSteeringPacket(pendingAxisQ, now) then
+				endSteeringSender(false)
+				return
+			end
+		elseif pendingAxisQ ~= 0
+			and now - steeringLastNonzeroSendAt >= STEERING_KEEPALIVE_INTERVAL
+		then
+			if not fireSteeringPacket(pendingAxisQ, now) then
+				endSteeringSender(false)
+				return
+			end
+		end
+		steeringPendingAxisQ = nil
+	end
+
+	local function reconcileSteeringSender()
+		local remote = resolveSteeringRemote()
+		local runId = currentRunId
+		local character = player.Character
+		local humanoidInstance = if character then character:FindFirstChildOfClass("Humanoid") else nil
+		local eligible = not controllerCleanupStarted
+			and remote ~= nil
+			and runId ~= nil
+			and runId > 0
+			and runId == latestRunId
+			and steeringEndedRunId ~= runId
+			and currentPresentationCourseId == FROST_TRAIL_COURSE_ID
+			and (currentPhase == RunPhase.Countdown or currentPhase == RunPhase.Descent)
+			and character ~= nil
+			and tuckTouchSessionCharacter == character
+			and character.Parent ~= nil
+			and humanoidInstance ~= nil
+			and humanoidInstance.Health > 0
+
+		if steeringHeartbeatConnection ~= nil then
+			if eligible
+				and steeringSessionRemote == remote
+				and steeringSessionRunId == runId
+				and steeringSessionCharacter == character
+				and steeringSessionHumanoid == humanoidInstance
+			then
+				return
+			end
+			endSteeringSender(true)
+			return
+		end
+		if not eligible then
+			return
+		end
+
+		steeringSessionRemote = remote
+		steeringSessionRunId = runId
+		steeringSessionCharacter = character
+		steeringSessionHumanoid = humanoidInstance
+		steeringSequence = 0
+		steeringLastSentAxisQ = nil
+		steeringPendingAxisQ = nil
+		steeringLastSendAt = -math.huge
+		steeringLastNonzeroSendAt = -math.huge
+		steeringHardNeutralSent = false
+		steeringHeartbeatConnection = RunService.Heartbeat:Connect(steeringHeartbeat)
+	end
+
+	local function reconcilePresentationCourse()
+		local attributeValue = player:GetAttribute(PRESENTATION_COURSE_ATTRIBUTE)
+		local nextCourseId = if typeof(attributeValue) == "string" then attributeValue else nil
+		local previousCourseId = currentPresentationCourseId
+		if nextCourseId ~= previousCourseId then
+			if previousCourseId == FROST_TRAIL_COURSE_ID and nextCourseId ~= FROST_TRAIL_COURSE_ID then
+				endSteeringSender(true)
+			end
+			currentPresentationCourseId = nextCourseId
+			if previousCourseId ~= FROST_TRAIL_COURSE_ID and nextCourseId == FROST_TRAIL_COURSE_ID then
+				frostTutorialPreparationPending = currentPhase == RunPhase.Idle
+				frostTutorialDismissed = not frostTutorialPreparationPending
+			elseif nextCourseId ~= FROST_TRAIL_COURSE_ID then
+				frostTutorialPreparationPending = false
+				frostTutorialDismissed = true
+			end
+			refreshInputCopy()
+			updatePhaseFeedback()
+		end
+		reconcileSteeringSender()
 	end
 
 	local function sendTuckIntent(
@@ -1252,6 +1601,17 @@ function RunController.start()
 	reconcileTuckTouchButtonVisibility()
 	ContextActionService:SetTitle(ACTION_NAME, "TUCK")
 	reconcileTuckTouchButtonVisibility()
+	table.insert(
+		runControllerConnections,
+		player:GetAttributeChangedSignal(PRESENTATION_COURSE_ATTRIBUTE):Connect(reconcilePresentationCourse)
+	)
+	reconcilePresentationCourse()
+	table.insert(runControllerConnections, UserInputService.WindowFocusReleased:Connect(function()
+		windowFocused = false
+	end))
+	table.insert(runControllerConnections, UserInputService.WindowFocused:Connect(function()
+		windowFocused = true
+	end))
 
 	table.insert(runControllerConnections, UserInputService.LastInputTypeChanged:Connect(function(_lastInputType)
 		refreshInputCopy()
@@ -1279,6 +1639,13 @@ function RunController.start()
 
 		local previousPhase = currentPhase
 		local runChanged = currentRunId ~= runId
+		if runChanged
+			or ((previousPhase == RunPhase.Countdown or previousPhase == RunPhase.Descent)
+				and phase ~= RunPhase.Countdown
+				and phase ~= RunPhase.Descent)
+		then
+			endSteeringSender(true)
+		end
 		if isTuckTouchButtonPhase(previousPhase)
 			and (runChanged or not isTuckTouchButtonPhase(phase))
 		then
@@ -1301,10 +1668,16 @@ function RunController.start()
 		local enteredCountdown = phase == RunPhase.Countdown
 			and (runChanged or previousPhase ~= RunPhase.Countdown)
 		if enteredCountdown then
-			tutorialDismissed = true
+			if isFrostPresentation() then
+				frostTutorialPreparationPending = false
+				frostTutorialDismissed = true
+			else
+				classicTutorialDismissed = true
+			end
 		end
 
 		currentPhase = phase
+		reconcileSteeringSender()
 		reconcileTuckTouchButtonVisibility()
 		updateJumpBlockForPhase(runId)
 		serverTuckQueued = if typeof(tuckQueued) == "boolean" then tuckQueued else false
@@ -1369,6 +1742,7 @@ function RunController.start()
 		if controllerCleanupStarted then
 			return
 		end
+		endSteeringSender(true)
 		releaseHeldTuck()
 		controllerCleanupStarted = true
 		tuckTouchSessionCharacter = nil
