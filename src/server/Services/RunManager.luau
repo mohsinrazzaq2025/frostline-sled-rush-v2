@@ -70,6 +70,8 @@ type Sled = SledFactory.Sled
 type CourseId = CourseRegistry.CourseId
 type CourseDefinition = CourseRegistry.CourseDefinition
 type RouteData = CourseRegistry.RouteData
+type SpeedZone = FrostTrailConfig.SpeedZone
+type SpeedTuning = FrostTrailConfig.SpeedTuning
 type SteeringTuning = FrostTrailConfig.SteeringTuning
 type StallObservationKind = "recovery" | "missed-launch"
 type RunOutcome = "missed-launch"
@@ -193,6 +195,11 @@ type Session = {
 	TuckForce: VectorForce,
 	AntiStallForce: VectorForce,
 	StabilityTorque: Torque,
+	SpeedGovernorForce: VectorForce?,
+	SpeedProfile: SpeedTuning?,
+	SpeedGovernorAppliedAcceleration: number,
+	SpeedGovernorDisqualified: boolean,
+	SpeedGovernorReleaseAuthorized: boolean,
 	SteeringForce: VectorForce?,
 	SteeringProfile: SteeringTuning?,
 	SteeringTarget: number,
@@ -251,6 +258,23 @@ type Session = {
 	ReplayRequested: boolean,
 	TelemetryLogged: boolean,
 }
+
+type FrostSpeedGovernorApi = {
+	clear: (Session) -> (),
+	isReleaseAuthoritative: (Session) -> boolean,
+	disqualifyForSeatLoss: (Session) -> (),
+	hasExactAuthorization: (Session) -> boolean,
+	getValidatedGroundResult: (Session, Part) -> RaycastResult?,
+	findZoneIndex: ({ SpeedZone }, number) -> number?,
+	getZoneTarget: (SpeedZone, boolean) -> number,
+	getPlannedTargetSpeed: (SpeedTuning, number, boolean) -> number?,
+	update: (Session, number, number, RaycastResult?) -> (),
+	updateGroundedControls: (Session, number, number) -> (),
+	createForce: (Part, Attachment) -> VectorForce,
+	validateProfile: (any, RouteData) -> (boolean, string),
+}
+
+local FrostSpeedGovernor: FrostSpeedGovernorApi
 
 type StallSnapshot = {
 	Position: Vector3,
@@ -1374,6 +1398,17 @@ local function setTuckActive(session: Session, active: boolean)
 		and not crossedForwardPlane(course, root.Position, course.LaunchLongitudinal)
 	session.Tucking = shouldApply
 
+	if session.CourseId == FROST_TRAIL_COURSE_ID then
+		if shouldApply then
+			session.TuckUsed = true
+		end
+		if forceAvailable then
+			session.TuckForce.Enabled = false
+			session.TuckForce.Force = Vector3.zero
+		end
+		return
+	end
+
 	if shouldApply then
 		session.TuckForce.Force = course.ForwardDirection * assemblyMass * RUN.TuckAcceleration
 		session.TuckForce.Enabled = true
@@ -1538,6 +1573,15 @@ end
 
 local function setAntiStallActive(session: Session, runId: number, active: boolean)
 	local forceAvailable = session.AntiStallForce.Parent ~= nil
+	if session.CourseId == FROST_TRAIL_COURSE_ID then
+		session.AntiStallActive = false
+		if forceAvailable then
+			session.AntiStallForce.Enabled = false
+			session.AntiStallForce.Force = Vector3.zero
+		end
+		return
+	end
+
 	local root = session.Sled.Root
 	local course = session.ResolvedCourse
 	local assemblyMass = math.huge
@@ -1605,7 +1649,12 @@ local function isTrackSurface(instance: Instance): boolean
 		or instance:GetAttribute(TRACK_SURFACE_ATTRIBUTE) == true
 end
 
-local function updateFrostSteering(session: Session, runId: number, deltaTime: number)
+local function updateFrostSteering(
+	session: Session,
+	runId: number,
+	deltaTime: number,
+	groundResult: RaycastResult?
+)
 	if not isSameSession(session, runId)
 		or session.CleanupStarted
 		or not hasExactSteeringAuthorization(session)
@@ -1667,18 +1716,7 @@ local function updateFrostSteering(session: Session, runId: number, deltaTime: n
 		session.SteeringTarget = 0
 	end
 
-	local rayResult = Workspace:Raycast(
-		root.Position,
-		Vector3.new(0, -profile.GroundRayDistance, 0),
-		session.GroundRaycastParams
-	)
-	local hit = if rayResult then rayResult.Instance else nil
-	if hit == nil
-		or not hit:IsA("BasePart")
-		or not hit.CanCollide
-		or not isTrackSurface(hit)
-		or not hit:IsDescendantOf(course.Geometry)
-	then
+	if groundResult == nil then
 		disableSteeringForce(session)
 		return
 	end
@@ -1722,6 +1760,394 @@ local function updateFrostSteering(session: Session, runId: number, deltaTime: n
 
 	steeringForce.Force = lateralForce
 	steeringForce.Enabled = true
+end
+
+do
+	local controller = {} :: FrostSpeedGovernorApi
+
+	function controller.clear(session: Session)
+		if session.CourseId ~= FROST_TRAIL_COURSE_ID then
+			return
+		end
+		session.SpeedGovernorAppliedAcceleration = 0
+		local governorForce = session.SpeedGovernorForce
+		if governorForce then
+			governorForce.Force = Vector3.zero
+			governorForce.Enabled = false
+		end
+	end
+
+	function controller.isReleaseAuthoritative(session: Session): boolean
+		return session.CourseId == FROST_TRAIL_COURSE_ID
+			and session.SpeedGovernorReleaseAuthorized
+	end
+
+	function controller.disqualifyForSeatLoss(session: Session)
+		if session.CourseId ~= FROST_TRAIL_COURSE_ID then
+			return
+		end
+		if controller.isReleaseAuthoritative(session) then
+			session.SpeedGovernorDisqualified = true
+		end
+		controller.clear(session)
+	end
+
+	function controller.hasExactAuthorization(session: Session): boolean
+		local courses = resolvedCourses
+		local course = session.ResolvedCourse
+		local definition = CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID]
+		local profile = session.SpeedProfile
+		return RunService:IsStudio()
+			and courses ~= nil
+			and session.CourseId == FROST_TRAIL_COURSE_ID
+			and courses[FROST_TRAIL_COURSE_ID] == course
+			and course.CourseId == FROST_TRAIL_COURSE_ID
+			and course.Definition == definition
+			and table.isfrozen(definition)
+			and definition.ActivationMode == "StudioControlledTest"
+			and course.World:GetAttribute("CourseId") == FROST_TRAIL_COURSE_ID
+			and course.World:GetAttribute("Playable") == false
+			and course.World:GetAttribute("ActivationMode") == "StudioControlledTest"
+			and FrostTrailConfig.ActivationMode == "StudioControlledTest"
+			and FrostTrailConfig.Playable == false
+			and table.isfrozen(FrostTrailConfig)
+			and profile ~= nil
+			and profile == FrostTrailConfig.Speed
+			and table.isfrozen(profile)
+			and table.isfrozen(profile.Zones)
+			and profile.Enabled == true
+	end
+
+	function controller.getValidatedGroundResult(session: Session, root: Part): RaycastResult?
+		local steeringProfile = session.SteeringProfile
+		if steeringProfile == nil or not isFinitePositiveNumber(steeringProfile.GroundRayDistance) then
+			return nil
+		end
+
+		local rayResult = Workspace:Raycast(
+			root.Position,
+			Vector3.new(0, -steeringProfile.GroundRayDistance, 0),
+			session.GroundRaycastParams
+		)
+		if rayResult == nil then
+			return nil
+		end
+
+		local hit = rayResult.Instance
+		local hitNormal = rayResult.Normal
+		if not hit:IsA("BasePart")
+			or not hit.CanCollide
+			or hit:GetAttribute(TRACK_SURFACE_ATTRIBUTE) ~= true
+			or not hit:IsDescendantOf(session.ResolvedCourse.Geometry)
+			or not isFiniteVector3(hitNormal)
+			or hitNormal.Magnitude <= COURSE_BASIS_EPSILON
+		then
+			return nil
+		end
+
+		return rayResult
+	end
+
+	function controller.findZoneIndex(zones: { SpeedZone }, longitudinal: number): number?
+	if #zones == 0 or not isFiniteNumber(longitudinal) then
+		return nil
+	elseif longitudinal < zones[1].StartLongitudinal then
+		return 1
+	end
+
+	local low = 1
+	local high = #zones
+	while low <= high do
+		local middle = math.floor((low + high) * 0.5)
+		local zone = zones[middle]
+		if longitudinal < zone.StartLongitudinal then
+			high = middle - 1
+		elseif longitudinal >= zone.EndLongitudinal then
+			low = middle + 1
+		else
+			return middle
+		end
+	end
+
+	return nil
+end
+
+function controller.getZoneTarget(zone: SpeedZone, tucking: boolean): number
+	return if tucking then zone.TuckTargetSpeed else zone.StandardTargetSpeed
+end
+
+function controller.getPlannedTargetSpeed(
+	profile: SpeedTuning,
+	longitudinal: number,
+	tucking: boolean
+): number?
+	local zones = profile.Zones
+	local currentIndex = controller.findZoneIndex(zones, longitudinal)
+	if currentIndex == nil then
+		return nil
+	end
+
+	local currentTarget = controller.getZoneTarget(zones[currentIndex], tucking)
+	if not isFiniteNumber(currentTarget)
+		or not isFinitePositiveNumber(profile.PlanningLookaheadStuds)
+		or not isFinitePositiveNumber(profile.PlanningBrakeAcceleration)
+	then
+		return nil
+	end
+
+	local plannedTarget = currentTarget
+	for futureIndex = currentIndex + 1, #zones do
+		local futureZone = zones[futureIndex]
+		local distanceToBoundary = futureZone.StartLongitudinal - longitudinal
+		if not isFiniteNumber(distanceToBoundary) or distanceToBoundary <= 0 then
+			return nil
+		elseif distanceToBoundary > profile.PlanningLookaheadStuds then
+			break
+		end
+
+		local futureTarget = controller.getZoneTarget(futureZone, tucking)
+		if not isFinitePositiveNumber(futureTarget) then
+			return nil
+		end
+		local radicand = futureTarget * futureTarget
+			+ 2 * profile.PlanningBrakeAcceleration * distanceToBoundary
+		if not isFiniteNumber(radicand) then
+			return nil
+		end
+		local candidate = math.sqrt(math.max(0, radicand))
+		if not isFiniteNumber(candidate) then
+			return nil
+		end
+		plannedTarget = math.min(plannedTarget, candidate)
+	end
+
+	if not isFiniteNumber(plannedTarget) then
+		return nil
+	end
+	return math.clamp(plannedTarget, 0, profile.AbsoluteMaximumTargetSpeed)
+end
+
+function controller.update(
+	session: Session,
+	runId: number,
+	deltaTime: number,
+	groundResult: RaycastResult?
+)
+	if not isSameSession(session, runId)
+		or session.CleanupStarted
+		or session.Phase ~= RunPhase.Descent
+		or session.ReleaseInProgress
+		or not session.TuckActivationReady
+		or not controller.isReleaseAuthoritative(session)
+		or session.SpeedGovernorDisqualified ~= false
+		or not controller.hasExactAuthorization(session)
+		or not hasExactSteeringOccupant(session)
+	then
+		controller.clear(session)
+		return
+	end
+
+	local root = session.Sled.Root
+	local course = session.ResolvedCourse
+	local profile = session.SpeedProfile :: SpeedTuning
+	local governorForce = session.SpeedGovernorForce
+	local longitudinal = forwardCoordinate(course, root.Position)
+	if governorForce == nil
+		or governorForce.Name ~= "FrostTrailSpeedGovernorForce"
+		or governorForce.Parent ~= root
+		or governorForce.Attachment0 ~= session.TuckAttachment
+		or governorForce.RelativeTo ~= Enum.ActuatorRelativeTo.World
+		or governorForce.ApplyAtCenterOfMass ~= true
+		or session.TuckAttachment.Name ~= "SledPhysicsAttachment"
+		or session.TuckAttachment.Parent ~= root
+		or root.Anchored
+		or not isFiniteVector3(root.Position)
+		or not isFiniteNumber(longitudinal)
+		or longitudinal >= course.LaunchLongitudinal
+		or groundResult == nil
+	then
+		controller.clear(session)
+		return
+	end
+
+	local assemblyMass = root.AssemblyMass
+	local velocity = root.AssemblyLinearVelocity
+	local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+	local horizontalSpeed = horizontalVelocity.Magnitude
+	if not isFinitePositiveNumber(assemblyMass)
+		or not isFiniteVector3(velocity)
+		or not isFiniteVector3(horizontalVelocity)
+		or not isFiniteNumber(horizontalSpeed)
+		or not isFiniteNumber(session.SpeedGovernorAppliedAcceleration)
+		or math.abs(session.SpeedGovernorAppliedAcceleration) > profile.MaximumForceAcceleration
+	then
+		controller.clear(session)
+		return
+	end
+
+	local sourceDirection = course.ForwardDirection
+	if horizontalSpeed >= profile.DirectionFallbackSpeed then
+		sourceDirection = horizontalVelocity.Unit
+	end
+	local hitNormal = groundResult.Normal
+	local sourceMagnitude = sourceDirection.Magnitude
+	local normalMagnitude = hitNormal.Magnitude
+	if not isFiniteVector3(sourceDirection)
+		or not isFiniteNumber(sourceMagnitude)
+		or sourceMagnitude <= COURSE_BASIS_EPSILON
+		or not isFiniteVector3(hitNormal)
+		or not isFiniteNumber(normalMagnitude)
+		or normalMagnitude <= COURSE_BASIS_EPSILON
+	then
+		controller.clear(session)
+		return
+	end
+
+	hitNormal = hitNormal.Unit
+	sourceDirection = sourceDirection.Unit
+	local tangentCandidate = sourceDirection - hitNormal * sourceDirection:Dot(hitNormal)
+	local tangentMagnitude = tangentCandidate.Magnitude
+	if not isFiniteVector3(tangentCandidate)
+		or not isFiniteNumber(tangentMagnitude)
+		or tangentMagnitude <= COURSE_BASIS_EPSILON
+	then
+		controller.clear(session)
+		return
+	end
+	local trackTangent = tangentCandidate.Unit
+	local forwardAlignment = trackTangent:Dot(course.ForwardDirection)
+	if not isFiniteNumber(forwardAlignment) or forwardAlignment < profile.MinimumForwardAlignment then
+		controller.clear(session)
+		return
+	end
+
+	local tucking = session.Tucking
+	local plannedTargetSpeed = controller.getPlannedTargetSpeed(profile, longitudinal, tucking)
+	local controlledVelocity = velocity:Dot(trackTangent)
+	if plannedTargetSpeed == nil or not isFiniteNumber(controlledVelocity) then
+		controller.clear(session)
+		return
+	end
+	local currentControlledSpeed = math.max(0, controlledVelocity)
+	local velocityErrorAcceleration = (plannedTargetSpeed - currentControlledSpeed)
+		/ profile.VelocityResponseSeconds
+	if not isFiniteNumber(velocityErrorAcceleration) then
+		controller.clear(session)
+		return
+	end
+
+	local activeMaximumDriveAcceleration = if tucking
+		then profile.TuckMaximumDriveAcceleration
+		else profile.StandardMaximumDriveAcceleration
+	local ordinaryDesiredAcceleration = math.clamp(
+		velocityErrorAcceleration,
+		-profile.MaximumBrakeAcceleration,
+		activeMaximumDriveAcceleration
+	)
+	local desiredProgressAcceleration = ordinaryDesiredAcceleration
+	if currentControlledSpeed > profile.EmergencyOverspeedThreshold then
+		desiredProgressAcceleration = -profile.EmergencyBrakeAcceleration
+	end
+
+	local gravity = Workspace.Gravity
+	if not isFiniteNumber(gravity) or gravity < 0 then
+		controller.clear(session)
+		return
+	end
+	local gravityAlong = Vector3.new(0, -gravity, 0):Dot(trackTangent)
+	local requiredForceAcceleration = desiredProgressAcceleration - gravityAlong
+	if not isFiniteNumber(requiredForceAcceleration) then
+		controller.clear(session)
+		return
+	end
+	requiredForceAcceleration = math.clamp(
+		requiredForceAcceleration,
+		-profile.MaximumForceAcceleration,
+		profile.MaximumForceAcceleration
+	)
+
+	if not isFiniteNumber(deltaTime) then
+		controller.clear(session)
+		return
+	end
+	local integrationDelta = math.clamp(deltaTime, 0, 0.10)
+	local appliedAcceleration = session.SpeedGovernorAppliedAcceleration
+	local maximumStep = profile.MaximumAccelerationSlewPerSecond * integrationDelta
+	if requiredForceAcceleration > appliedAcceleration then
+		appliedAcceleration = math.min(requiredForceAcceleration, appliedAcceleration + maximumStep)
+	elseif requiredForceAcceleration < appliedAcceleration then
+		appliedAcceleration = math.max(requiredForceAcceleration, appliedAcceleration - maximumStep)
+	end
+	if math.abs(appliedAcceleration) <= profile.AccelerationSnapEpsilon
+		and math.abs(requiredForceAcceleration) <= profile.AccelerationSnapEpsilon
+	then
+		appliedAcceleration = 0
+	end
+	if not isFiniteNumber(appliedAcceleration) then
+		controller.clear(session)
+		return
+	end
+	session.SpeedGovernorAppliedAcceleration = appliedAcceleration
+
+	local governorVector = trackTangent * assemblyMass * appliedAcceleration
+	if not isFiniteVector3(governorVector) then
+		controller.clear(session)
+		return
+	end
+	governorForce.Force = governorVector
+	governorForce.Enabled = true
+end
+
+function controller.updateGroundedControls(session: Session, runId: number, deltaTime: number)
+	if not isSameSession(session, runId)
+		or session.CleanupStarted
+		or not hasExactSteeringAuthorization(session)
+		or not controller.hasExactAuthorization(session)
+	then
+		clearSteeringState(session)
+		controller.clear(session)
+		return
+	end
+
+	if session.Phase == RunPhase.Countdown then
+		disableSteeringForce(session)
+		controller.clear(session)
+		return
+	elseif session.Phase ~= RunPhase.Descent then
+		clearSteeringState(session)
+		controller.clear(session)
+		return
+	end
+
+	if not hasExactSteeringOccupant(session) then
+		clearSteeringState(session)
+		controller.disqualifyForSeatLoss(session)
+		return
+	elseif session.ReleaseInProgress or not session.TuckActivationReady then
+		disableSteeringForce(session)
+		controller.clear(session)
+		return
+	end
+
+	local root = session.Sled.Root
+	local longitudinal = forwardCoordinate(session.ResolvedCourse, root.Position)
+	if root.Parent ~= session.Sled.Model
+		or root.Anchored
+		or not isFiniteVector3(root.Position)
+		or not isFiniteNumber(longitudinal)
+		or longitudinal >= session.ResolvedCourse.LaunchLongitudinal
+	then
+		clearSteeringState(session)
+		controller.clear(session)
+		return
+	end
+
+	local groundResult = controller.getValidatedGroundResult(session, root)
+	updateFrostSteering(session, runId, deltaTime, groundResult)
+	controller.update(session, runId, deltaTime, groundResult)
+end
+
+	FrostSpeedGovernor = controller :: FrostSpeedGovernorApi
 end
 
 local function getStallGroundRayDistance(root: Part): number
@@ -2587,6 +3013,7 @@ end
 
 local function cleanupSession(session: Session, runId: number, teleportPlayer: boolean, reason: string)
 	clearSteeringState(session)
+	FrostSpeedGovernor.clear(session)
 	if not isSameSession(session, runId) then
 		return
 	end
@@ -2772,6 +3199,7 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 	resetStallObservation(session)
 	clearTuckState(session)
 	clearSteeringState(session)
+	FrostSpeedGovernor.clear(session)
 	emitTelemetry(session)
 	if session.Phase ~= RunPhase.Reset and not transitionTo(session, RunPhase.Reset) then
 		session.Phase = RunPhase.Reset
@@ -2897,6 +3325,7 @@ local function finishMissedLaunch(session: Session, runId: number, snapshot: Sta
 	resetStallObservation(session)
 	clearTuckState(session)
 	clearSteeringState(session)
+	FrostSpeedGovernor.clear(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if RESULT.LifecycleDiagnosticsEnabled then
@@ -2951,6 +3380,7 @@ local function finishLanding(session: Session, runId: number)
 	end
 	session.StopConfirmed = true
 	logLaunchStabilitySnapshot(session, "final-stop", nil, false)
+	FrostSpeedGovernor.clear(session)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 	root.Anchored = true
@@ -3048,6 +3478,7 @@ local function enterAirborne(session: Session, runId: number)
 	resetStallObservation(session)
 	clearTuckState(session)
 	clearSteeringState(session)
+	FrostSpeedGovernor.clear(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if transitionTo(session, RunPhase.Airborne, true) then
@@ -3104,6 +3535,7 @@ local function enterLanded(session: Session, runId: number, hitPart: BasePart)
 
 	clearTuckState(session)
 	clearSteeringState(session)
+	FrostSpeedGovernor.clear(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
 	if transitionTo(session, RunPhase.Landed) then
@@ -3151,6 +3583,7 @@ local function monitorSession(session: Session, runId: number)
 			if not isSameSession(session, runId) or session.CleanupStarted then
 				if session.CourseId == FROST_TRAIL_COURSE_ID then
 					clearSteeringState(session)
+					FrostSpeedGovernor.clear(session)
 				end
 				resetStallObservation(session)
 				return
@@ -3181,9 +3614,19 @@ local function monitorSession(session: Session, runId: number)
 				retainLastAirborneContactSnapshot(session, runId, now)
 			end
 			if session.CourseId == FROST_TRAIL_COURSE_ID then
-				updateFrostSteering(session, runId, deltaTime)
+				if session.Phase == RunPhase.Descent then
+					FrostSpeedGovernor.updateGroundedControls(session, runId, deltaTime)
+				elseif session.Phase == RunPhase.Countdown then
+					disableSteeringForce(session)
+					FrostSpeedGovernor.clear(session)
+				else
+					clearSteeringState(session)
+					FrostSpeedGovernor.clear(session)
+				end
+				setAntiStallActive(session, runId, false)
+			else
+				updateAntiStall(session, runId)
 			end
-			updateAntiStall(session, runId)
 			updateGroundStability(session)
 			local missedLaunchSnapshot = updateDescentStopDetection(session, runId, now)
 			if missedLaunchSnapshot then
@@ -3287,7 +3730,11 @@ local function connectRunEvents(session: Session, runId: number)
 
 	addSessionConnection(
 		session,
-		session.Sled.DriverSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
+			session.Sled.DriverSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
+			local seatSeparated = session.Sled.DriverSeat.Occupant ~= session.Humanoid
+			if seatSeparated then
+				FrostSpeedGovernor.disqualifyForSeatLoss(session)
+			end
 			if not isSameSession(session, runId)
 				or session.CleanupStarted
 				or session.Phase == RunPhase.Reset
@@ -3295,7 +3742,6 @@ local function connectRunEvents(session: Session, runId: number)
 				return
 			end
 
-			local seatSeparated = session.Sled.DriverSeat.Occupant ~= session.Humanoid
 			if session.EnteredAirborne and seatSeparated then
 				session.SeatSeparatedAfterAirborne = true
 			end
@@ -3455,10 +3901,17 @@ local function runCountdown(session: Session, runId: number)
 		forwardCoordinate(course, root.Position) - releaseLongitudinal
 	)
 	session.TuckActivationReady = true
+	if session.CourseId == FROST_TRAIL_COURSE_ID then
+		session.SpeedGovernorReleaseAuthorized = true
+	end
 	local activateQueuedTuck = session.TuckQueued and session.TuckIntentHeld
 	session.TuckQueued = false
 	setTuckActive(session, activateQueuedTuck)
-	updateAntiStall(session, runId)
+	if session.CourseId == FROST_TRAIL_COURSE_ID then
+		setAntiStallActive(session, runId, false)
+	else
+		updateAntiStall(session, runId)
+	end
 	if session.TuckQueueScheduled then
 		if RESULT.LifecycleDiagnosticsEnabled then
 			print(
@@ -3519,6 +3972,18 @@ local function createFrostTrailSteeringForce(root: Part, attachment: Attachment)
 	steeringForce.Enabled = false
 	steeringForce.Parent = root
 	return steeringForce
+end
+
+function FrostSpeedGovernor.createForce(root: Part, attachment: Attachment): VectorForce
+	local governorForce = Instance.new("VectorForce")
+	governorForce.Name = "FrostTrailSpeedGovernorForce"
+	governorForce.Attachment0 = attachment
+	governorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+	governorForce.ApplyAtCenterOfMass = true
+	governorForce.Force = Vector3.zero
+	governorForce.Enabled = false
+	governorForce.Parent = root
+	return governorForce
 end
 
 local function seatPlayer(session: Session, runId: number): boolean
@@ -3991,8 +4456,14 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 	latestRunId += 1
 	local runId = latestRunId
 	local tuckAttachment, tuckForce, antiStallForce, stabilityTorque = createSledActuators(sled.Root)
+	local speedProfile: SpeedTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
+		then FrostTrailConfig.Speed
+		else nil
 	local steeringProfile: SteeringTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
 		then FrostTrailConfig.Steering
+		else nil
+	local speedGovernorForce = if speedProfile
+		then FrostSpeedGovernor.createForce(sled.Root, tuckAttachment)
 		else nil
 	local steeringForce = if steeringProfile
 		then createFrostTrailSteeringForce(sled.Root, tuckAttachment)
@@ -4015,6 +4486,11 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		TuckForce = tuckForce,
 		AntiStallForce = antiStallForce,
 		StabilityTorque = stabilityTorque,
+		SpeedGovernorForce = speedGovernorForce,
+		SpeedProfile = speedProfile,
+		SpeedGovernorAppliedAcceleration = 0,
+		SpeedGovernorDisqualified = false,
+		SpeedGovernorReleaseAuthorized = false,
 		SteeringForce = steeringForce,
 		SteeringProfile = steeringProfile,
 		SteeringTarget = 0,
@@ -4193,19 +4669,28 @@ local function validateSteeringProfile(profile: any): (boolean, string)
 		return false, "Frost steering quantization is invalid"
 	elseif profile.MaximumSequence ~= 2147483647 then
 		return false, "Frost steering sequence maximum is invalid"
-	elseif profile.MaximumSequenceJump > 64 then
+	elseif profile.MaximumSequenceJump ~= 64 then
 		return false, "Frost steering sequence jump is invalid"
-	elseif profile.ServerRateBucketCapacity > 8 then
+	elseif profile.ServerRateTokensPerSecond ~= 24
+		or profile.ServerRateBucketCapacity ~= 8
+	then
 		return false, "Frost steering token capacity is invalid"
-	elseif profile.ServerIntentTimeoutSeconds < 0.35 or profile.ServerIntentTimeoutSeconds > 0.50 then
+	elseif profile.ServerIntentTimeoutSeconds ~= 0.45 then
 		return false, "Frost steering timeout is invalid"
-	elseif profile.AppliedInputReleasePerSecond < profile.AppliedInputRisePerSecond then
-		return false, "Frost steering release response is invalid"
-	elseif profile.MinimumLateralSpeed > profile.MaximumLateralSpeed then
-		return false, "Frost steering lateral speed range is invalid"
-	elseif profile.MaximumLateralAcceleration > 45 then
-		return false, "Frost steering acceleration limit is invalid"
-	elseif profile.GroundRayDistance > RUN.StabilityRayDistance then
+	elseif profile.AppliedInputRisePerSecond ~= 4
+		or profile.AppliedInputReleasePerSecond ~= 7
+		or profile.MinimumLateralSpeed ~= 10
+		or profile.LateralSpeedBase ~= 8
+		or profile.LateralSpeedPerForwardSpeed ~= 0.22
+		or profile.MaximumLateralSpeed ~= 42
+		or profile.LateralVelocityResponseSeconds ~= 0.48
+		or profile.MaximumLateralAcceleration ~= 48
+	then
+		return false, "Frost steering balance profile is invalid"
+	elseif profile.GroundRayDistance ~= 5
+		or profile.AppliedInputSnapEpsilon ~= 0.01
+		or profile.GroundRayDistance > RUN.StabilityRayDistance
+	then
 		return false, "Frost steering ground ray exceeds the stability ray"
 	end
 
@@ -4313,6 +4798,186 @@ local function validateRouteData(routeData: RouteData): (boolean, string)
 	return true, "ok"
 end
 
+function FrostSpeedGovernor.validateProfile(profile: any, routeData: RouteData): (boolean, string)
+	if typeof(profile) ~= "table" then
+		return false, "Frost speed profile is unavailable"
+	elseif profile ~= FrostTrailConfig.Speed
+		or not table.isfrozen(FrostTrailConfig)
+		or not table.isfrozen(profile)
+		or typeof(profile.Zones) ~= "table"
+		or profile.Zones ~= FrostTrailConfig.Speed.Zones
+		or not table.isfrozen(profile.Zones)
+	then
+		return false, "Frost speed profile identity or freeze is invalid"
+	elseif profile.Enabled ~= true then
+		return false, "Frost speed governor is not enabled"
+	elseif typeof(profile.AbsoluteMaximumTargetSpeed) ~= "number"
+		or typeof(profile.PlanningLookaheadStuds) ~= "number"
+		or typeof(profile.PlanningBrakeAcceleration) ~= "number"
+		or typeof(profile.VelocityResponseSeconds) ~= "number"
+		or typeof(profile.StandardMaximumDriveAcceleration) ~= "number"
+		or typeof(profile.TuckMaximumDriveAcceleration) ~= "number"
+		or typeof(profile.MaximumBrakeAcceleration) ~= "number"
+		or typeof(profile.EmergencyOverspeedThreshold) ~= "number"
+		or typeof(profile.EmergencyBrakeAcceleration) ~= "number"
+		or typeof(profile.MaximumForceAcceleration) ~= "number"
+		or typeof(profile.MaximumAccelerationSlewPerSecond) ~= "number"
+		or typeof(profile.AccelerationSnapEpsilon) ~= "number"
+		or typeof(profile.DirectionFallbackSpeed) ~= "number"
+		or typeof(profile.MinimumForwardAlignment) ~= "number"
+	then
+		return false, "Frost speed profile contains a non-numeric value"
+	elseif not isFinitePositiveNumber(profile.AbsoluteMaximumTargetSpeed)
+		or not isFinitePositiveNumber(profile.PlanningLookaheadStuds)
+		or not isFinitePositiveNumber(profile.PlanningBrakeAcceleration)
+		or not isFinitePositiveNumber(profile.VelocityResponseSeconds)
+		or not isFinitePositiveNumber(profile.StandardMaximumDriveAcceleration)
+		or not isFinitePositiveNumber(profile.TuckMaximumDriveAcceleration)
+		or not isFinitePositiveNumber(profile.MaximumBrakeAcceleration)
+		or not isFinitePositiveNumber(profile.EmergencyOverspeedThreshold)
+		or not isFinitePositiveNumber(profile.EmergencyBrakeAcceleration)
+		or not isFinitePositiveNumber(profile.MaximumForceAcceleration)
+		or not isFinitePositiveNumber(profile.MaximumAccelerationSlewPerSecond)
+		or not isFinitePositiveNumber(profile.AccelerationSnapEpsilon)
+		or not isFinitePositiveNumber(profile.DirectionFallbackSpeed)
+		or not isFinitePositiveNumber(profile.MinimumForwardAlignment)
+	then
+		return false, "Frost speed profile contains an invalid numeric value"
+	elseif profile.AbsoluteMaximumTargetSpeed ~= 150
+		or profile.PlanningLookaheadStuds ~= 350
+		or profile.PlanningBrakeAcceleration ~= 24
+		or profile.VelocityResponseSeconds ~= 0.35
+		or profile.StandardMaximumDriveAcceleration ~= 12
+		or profile.TuckMaximumDriveAcceleration ~= 20
+		or profile.MaximumBrakeAcceleration ~= 30
+		or profile.EmergencyOverspeedThreshold ~= 151
+		or profile.EmergencyBrakeAcceleration ~= 42
+		or profile.MaximumForceAcceleration ~= 64
+		or profile.MaximumAccelerationSlewPerSecond ~= 96
+		or profile.AccelerationSnapEpsilon ~= 0.01
+		or profile.DirectionFallbackSpeed ~= 4
+		or profile.MinimumForwardAlignment ~= 0.75
+	then
+		return false, "Frost speed profile constants are invalid"
+	elseif profile.PlanningBrakeAcceleration >= profile.MaximumBrakeAcceleration
+		or profile.EmergencyOverspeedThreshold <= profile.AbsoluteMaximumTargetSpeed
+		or profile.EmergencyBrakeAcceleration <= profile.MaximumBrakeAcceleration
+		or profile.MinimumForwardAlignment <= 0
+		or profile.MinimumForwardAlignment > 1
+	then
+		return false, "Frost speed profile relationships are invalid"
+	end
+
+	local speedProfile = profile :: SpeedTuning
+	local zones = speedProfile.Zones
+	local expectedZones: { { number } } = {
+		{ -250, 250, 46, 64 },
+		{ 250, 500, 54, 82 },
+		{ 500, 1100, 52, 80 },
+		{ 1100, 1500, 54, 84 },
+		{ 1500, 2100, 52, 80 },
+		{ 2100, 2550, 55, 86 },
+		{ 2550, 3150, 54, 84 },
+		{ 3150, 3650, 58, 92 },
+		{ 3650, 4200, 56, 88 },
+		{ 4200, 4750, 60, 96 },
+		{ 4750, 5300, 58, 92 },
+		{ 5300, 5500, 62, 100 },
+		{ 5500, 5700, 70, 112 },
+		{ 5700, 5850, 80, 128 },
+		{ 5850, 6000, 90, 142 },
+		{ 6000, 6100, 94, 146 },
+		{ 6100, 6350, 96, 150 },
+	}
+	if #zones ~= #expectedZones then
+		return false, "Frost speed profile must contain exactly 17 zones"
+	end
+	for key in zones do
+		if typeof(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #expectedZones then
+			return false, "Frost speed zone array contains an invalid key"
+		end
+	end
+
+	local previousEnd: number? = nil
+	local maximumTarget = speedProfile.AbsoluteMaximumTargetSpeed
+	for index, zone in ipairs(zones) do
+		local expected = expectedZones[index]
+		if typeof(zone) ~= "table" or not table.isfrozen(zone) then
+			return false, "Frost speed zone is unavailable or unfrozen"
+		elseif typeof(zone.StartLongitudinal) ~= "number"
+			or typeof(zone.EndLongitudinal) ~= "number"
+			or typeof(zone.StandardTargetSpeed) ~= "number"
+			or typeof(zone.TuckTargetSpeed) ~= "number"
+		then
+			return false, "Frost speed zone contains a non-numeric value"
+		elseif not isFiniteNumber(zone.StartLongitudinal)
+			or not isFiniteNumber(zone.EndLongitudinal)
+			or not isFinitePositiveNumber(zone.StandardTargetSpeed)
+			or not isFinitePositiveNumber(zone.TuckTargetSpeed)
+			or zone.StartLongitudinal >= zone.EndLongitudinal
+			or zone.StandardTargetSpeed >= zone.TuckTargetSpeed
+			or zone.StandardTargetSpeed > maximumTarget
+			or zone.TuckTargetSpeed > maximumTarget
+		then
+			return false, "Frost speed zone values are invalid"
+		elseif zone.StartLongitudinal ~= expected[1]
+			or zone.EndLongitudinal ~= expected[2]
+			or zone.StandardTargetSpeed ~= expected[3]
+			or zone.TuckTargetSpeed ~= expected[4]
+		then
+			return false, "Frost speed zone envelope is invalid"
+		elseif previousEnd ~= nil and zone.StartLongitudinal ~= previousEnd then
+			return false, "Frost speed zones are not strictly contiguous"
+		elseif zone.TuckTargetSpeed == maximumTarget and index ~= #zones then
+			return false, "Frost speed maximum appears before the final zone"
+		end
+		previousEnd = zone.EndLongitudinal
+	end
+
+	local firstPathPoint = FrostTrailConfig.PathPoints[1]
+	local lastPathPoint = FrostTrailConfig.PathPoints[#FrostTrailConfig.PathPoints]
+	local firstZone = zones[1]
+	local finalZone = zones[#zones]
+	if not isFiniteVector3(firstPathPoint)
+		or not isFiniteVector3(lastPathPoint)
+		or firstZone.StartLongitudinal ~= firstPathPoint.Z
+		or firstPathPoint.Z ~= -250
+		or finalZone.EndLongitudinal ~= lastPathPoint.Z
+		or lastPathPoint.Z ~= FrostTrailConfig.LandingStartLongitudinal
+		or finalZone.EndLongitudinal ~= 6350
+		or finalZone.StartLongitudinal ~= FrostTrailConfig.RampFreedomLongitudinal
+		or finalZone.StartLongitudinal ~= 6100
+		or finalZone.TuckTargetSpeed ~= maximumTarget
+	then
+		return false, "Frost speed zone endpoints are invalid"
+	end
+
+	local gravity = Workspace.Gravity
+	if not isFiniteNumber(gravity) or gravity < 0 then
+		return false, "Workspace gravity is invalid for Frost speed validation"
+	end
+	local gravityVector = Vector3.new(0, -gravity, 0)
+	local maximumGravityComponent = 0
+	for index = 2, #routeData.SampledCenterlinePoints do
+		local chord = routeData.SampledCenterlinePoints[index] - routeData.SampledCenterlinePoints[index - 1]
+		if not isFiniteVector3(chord) or chord.Magnitude <= COURSE_BASIS_EPSILON then
+			return false, "Frost sampled centerline cannot validate force capacity"
+		end
+		local gravityComponent = math.abs(gravityVector:Dot(chord.Unit))
+		if not isFiniteNumber(gravityComponent) then
+			return false, "Frost sampled gravity component is invalid"
+		end
+		maximumGravityComponent = math.max(maximumGravityComponent, gravityComponent)
+	end
+	if speedProfile.MaximumForceAcceleration
+		< speedProfile.EmergencyBrakeAcceleration + maximumGravityComponent
+	then
+		return false, "Frost maximum force cannot contain emergency braking and track gravity"
+	end
+
+	return true, "ok"
+end
+
 local function validateDefinitionNames(definition: CourseDefinition): boolean
 	return isNonEmptyString(definition.CourseId)
 		and isNonEmptyString(definition.DisplayName)
@@ -4413,7 +5078,12 @@ local function validateFrostDefinition(definition: CourseDefinition): (boolean, 
 		return false, steeringReason
 	end
 
-	return validateRouteData(frostRouteData)
+	local routeValid, routeReason = validateRouteData(frostRouteData)
+	if not routeValid then
+		return false, routeReason
+	end
+
+	return FrostSpeedGovernor.validateProfile(FrostTrailConfig.Speed, frostRouteData)
 end
 
 local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedCourse?, string)

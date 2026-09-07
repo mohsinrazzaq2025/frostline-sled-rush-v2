@@ -30,6 +30,32 @@ export type RouteData = {
 	AuthoredPathLengthStuds: number,
 }
 
+export type SpeedZone = {
+	StartLongitudinal: number,
+	EndLongitudinal: number,
+	StandardTargetSpeed: number,
+	TuckTargetSpeed: number,
+}
+
+export type SpeedTuning = {
+	Enabled: boolean,
+	AbsoluteMaximumTargetSpeed: number,
+	PlanningLookaheadStuds: number,
+	PlanningBrakeAcceleration: number,
+	VelocityResponseSeconds: number,
+	StandardMaximumDriveAcceleration: number,
+	TuckMaximumDriveAcceleration: number,
+	MaximumBrakeAcceleration: number,
+	EmergencyOverspeedThreshold: number,
+	EmergencyBrakeAcceleration: number,
+	MaximumForceAcceleration: number,
+	MaximumAccelerationSlewPerSecond: number,
+	AccelerationSnapEpsilon: number,
+	DirectionFallbackSpeed: number,
+	MinimumForwardAlignment: number,
+	Zones: { SpeedZone },
+}
+
 export type SteeringTuning = {
 	Enabled: boolean,
 	InputQuantizationSteps: number,
@@ -86,6 +112,7 @@ export type FrostTrailConfig = {
 	LandingSegmentOverlap: number,
 	PathPoints: { Vector3 },
 	RouteData: RouteData,
+	Speed: SpeedTuning,
 	Steering: SteeringTuning,
 	Sections: { SectionDefinition },
 	WidenedRouteZones: { RouteWidthZone },
@@ -284,6 +311,135 @@ local routeData: RouteData = {
 }
 table.freeze(routeData)
 
+local speedZones: { SpeedZone } = {
+	{
+		StartLongitudinal = -250,
+		EndLongitudinal = 250,
+		StandardTargetSpeed = 46,
+		TuckTargetSpeed = 64,
+	},
+	{
+		StartLongitudinal = 250,
+		EndLongitudinal = 500,
+		StandardTargetSpeed = 54,
+		TuckTargetSpeed = 82,
+	},
+	{
+		StartLongitudinal = 500,
+		EndLongitudinal = 1100,
+		StandardTargetSpeed = 52,
+		TuckTargetSpeed = 80,
+	},
+	{
+		StartLongitudinal = 1100,
+		EndLongitudinal = 1500,
+		StandardTargetSpeed = 54,
+		TuckTargetSpeed = 84,
+	},
+	{
+		StartLongitudinal = 1500,
+		EndLongitudinal = 2100,
+		StandardTargetSpeed = 52,
+		TuckTargetSpeed = 80,
+	},
+	{
+		StartLongitudinal = 2100,
+		EndLongitudinal = 2550,
+		StandardTargetSpeed = 55,
+		TuckTargetSpeed = 86,
+	},
+	{
+		StartLongitudinal = 2550,
+		EndLongitudinal = 3150,
+		StandardTargetSpeed = 54,
+		TuckTargetSpeed = 84,
+	},
+	{
+		StartLongitudinal = 3150,
+		EndLongitudinal = 3650,
+		StandardTargetSpeed = 58,
+		TuckTargetSpeed = 92,
+	},
+	{
+		StartLongitudinal = 3650,
+		EndLongitudinal = 4200,
+		StandardTargetSpeed = 56,
+		TuckTargetSpeed = 88,
+	},
+	{
+		StartLongitudinal = 4200,
+		EndLongitudinal = 4750,
+		StandardTargetSpeed = 60,
+		TuckTargetSpeed = 96,
+	},
+	{
+		StartLongitudinal = 4750,
+		EndLongitudinal = 5300,
+		StandardTargetSpeed = 58,
+		TuckTargetSpeed = 92,
+	},
+	{
+		StartLongitudinal = 5300,
+		EndLongitudinal = 5500,
+		StandardTargetSpeed = 62,
+		TuckTargetSpeed = 100,
+	},
+	{
+		StartLongitudinal = 5500,
+		EndLongitudinal = 5700,
+		StandardTargetSpeed = 70,
+		TuckTargetSpeed = 112,
+	},
+	{
+		StartLongitudinal = 5700,
+		EndLongitudinal = 5850,
+		StandardTargetSpeed = 80,
+		TuckTargetSpeed = 128,
+	},
+	{
+		StartLongitudinal = 5850,
+		EndLongitudinal = 6000,
+		StandardTargetSpeed = 90,
+		TuckTargetSpeed = 142,
+	},
+	{
+		StartLongitudinal = 6000,
+		EndLongitudinal = 6100,
+		StandardTargetSpeed = 94,
+		TuckTargetSpeed = 146,
+	},
+	{
+		StartLongitudinal = 6100,
+		EndLongitudinal = 6350,
+		StandardTargetSpeed = 96,
+		TuckTargetSpeed = 150,
+	},
+}
+for _, zone in speedZones do
+	table.freeze(zone)
+end
+table.freeze(speedZones)
+
+local speed: SpeedTuning = {
+	Enabled = true,
+	AbsoluteMaximumTargetSpeed = 150,
+	PlanningLookaheadStuds = 350,
+	PlanningBrakeAcceleration = 24,
+	VelocityResponseSeconds = 0.35,
+	StandardMaximumDriveAcceleration = 12,
+	TuckMaximumDriveAcceleration = 20,
+	MaximumBrakeAcceleration = 30,
+	EmergencyOverspeedThreshold = 151,
+	EmergencyBrakeAcceleration = 42,
+	MaximumForceAcceleration = 64,
+	MaximumAccelerationSlewPerSecond = 96,
+	AccelerationSnapEpsilon = 0.01,
+	DirectionFallbackSpeed = 4,
+	MinimumForwardAlignment = 0.75,
+	Zones = speedZones,
+}
+table.freeze(speed)
+
 local steering: SteeringTuning = {
 	Enabled = true,
 	InputQuantizationSteps = 20,
@@ -292,14 +448,14 @@ local steering: SteeringTuning = {
 	ServerRateTokensPerSecond = 24,
 	ServerRateBucketCapacity = 8,
 	ServerIntentTimeoutSeconds = 0.45,
-	AppliedInputRisePerSecond = 6,
-	AppliedInputReleasePerSecond = 9,
-	MinimumLateralSpeed = 18,
-	LateralSpeedBase = 15,
-	LateralSpeedPerForwardSpeed = 0.10,
-	MaximumLateralSpeed = 26,
-	LateralVelocityResponseSeconds = 0.45,
-	MaximumLateralAcceleration = 45,
+	AppliedInputRisePerSecond = 4,
+	AppliedInputReleasePerSecond = 7,
+	MinimumLateralSpeed = 10,
+	LateralSpeedBase = 8,
+	LateralSpeedPerForwardSpeed = 0.22,
+	MaximumLateralSpeed = 42,
+	LateralVelocityResponseSeconds = 0.48,
+	MaximumLateralAcceleration = 48,
 	GroundRayDistance = 5,
 	AppliedInputSnapEpsilon = 0.01,
 }
@@ -341,6 +497,7 @@ local config: FrostTrailConfig = {
 	LandingSegmentOverlap = 0.25,
 	PathPoints = pathPoints,
 	RouteData = routeData,
+	Speed = speed,
 	Steering = steering,
 	Sections = sections,
 	WidenedRouteZones = widenedRouteZones,
