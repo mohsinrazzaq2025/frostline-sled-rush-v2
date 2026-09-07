@@ -14,6 +14,8 @@ local AUDIO = GameConfig.Audio
 local MUSIC = AUDIO.Music
 local AUDIO_FOLDER_NAME = "FrostlineAudio"
 local COIN_REWARD_DELAY_SECONDS = 0.28
+local ROUTE_COIN_CUE_COOLDOWN_SECONDS = 0.08
+local ROUTE_OBSTACLE_CUE_COOLDOWN_SECONDS = 0.35
 
 type CueName =
 	"BackgroundMusic"
@@ -59,6 +61,8 @@ type RunAudioState = {
 	ResultPlayed: boolean,
 	ButtonPlayed: boolean,
 	TransientsSuppressed: boolean,
+	LastRouteCoinCueAt: number,
+	LastRouteObstacleCueAt: number,
 }
 
 local CUE_DEFINITIONS: { [CueName]: CueDefinition } = {
@@ -455,8 +459,12 @@ end
 
 local function stopTransientInternal(suppressCurrentRun: boolean)
 	resultGeneration += 1
-	if suppressCurrentRun and currentRun then
-		currentRun.TransientsSuppressed = true
+	if currentRun then
+		currentRun.LastRouteCoinCueAt = -math.huge
+		currentRun.LastRouteObstacleCueAt = -math.huge
+		if suppressCurrentRun then
+			currentRun.TransientsSuppressed = true
+		end
 	end
 
 	for _, cueName in TRANSIENT_CUE_NAMES do
@@ -481,6 +489,8 @@ local function makeRunState(runId: number, phase: string): RunAudioState
 		ResultPlayed = false,
 		ButtonPlayed = false,
 		TransientsSuppressed = false,
+		LastRouteCoinCueAt = -math.huge,
+		LastRouteObstacleCueAt = -math.huge,
 	}
 end
 
@@ -707,6 +717,38 @@ function AudioController.presentRunState(
 		end
 	elseif phase == RunPhase.Reset or phase == RunPhase.Idle then
 		stopTransientInternal(true)
+	end
+end
+
+function AudioController.presentRouteContent(runId: any, hasCoin: any, hasObstacle: any)
+	if not started
+		or destroyed
+		or not isValidRunId(runId)
+		or typeof(hasCoin) ~= "boolean"
+		or typeof(hasObstacle) ~= "boolean"
+		or (not hasCoin and not hasObstacle)
+	then
+		return
+	end
+
+	local runState = currentRun
+	if not runState
+		or runState.RunId ~= (runId :: number)
+		or runState.Phase ~= RunPhase.Descent
+		or not runState.ReleaseAccepted
+		or runState.TransientsSuppressed
+	then
+		return
+	end
+
+	local now = os.clock()
+	if hasCoin and now - runState.LastRouteCoinCueAt >= ROUTE_COIN_CUE_COOLDOWN_SECONDS then
+		runState.LastRouteCoinCueAt = now
+		playOneShot("CoinReward")
+	end
+	if hasObstacle and now - runState.LastRouteObstacleCueAt >= ROUTE_OBSTACLE_CUE_COOLDOWN_SECONDS then
+		runState.LastRouteObstacleCueAt = now
+		playOneShot("SnowImpact")
 	end
 end
 

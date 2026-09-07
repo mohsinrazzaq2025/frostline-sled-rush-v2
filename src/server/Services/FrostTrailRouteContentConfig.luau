@@ -31,10 +31,41 @@ export type ObstaclePlacement = {
 	LateralOffset: number,
 }
 
+export type FrostTrailRouteContentRuntime = {
+	CoinRewardPerPickup: number,
+	MaximumRouteCoins: number,
+	MaximumObstacleEncounters: number,
+	EvaluationStartLongitudinal: number,
+	EvaluationEndLongitudinal: number,
+	CoinPickupRadiusStuds: number,
+	BroadphasePaddingStuds: number,
+	MaximumEvaluationDeltaSeconds: number,
+	MaximumSweepSubstepSeconds: number,
+	MaximumSweepSubsteps: number,
+	MaximumHorizontalSpeedStudsPerSecond: number,
+	MaximumTotalSpeedStudsPerSecond: number,
+	MovementSlackStuds: number,
+	MaximumCandidatesPerUpdate: number,
+	SledRootHalfSize: Vector3,
+	ObstacleContactPaddingStuds: number,
+	ParallelAxisEpsilon: number,
+	TimeOfImpactEpsilon: number,
+	IceBlockerSpeedLoss: number,
+	IceBlockerMinimumSpeedCap: number,
+	IceBlockerPenaltySeconds: number,
+	HopBarrierSpeedLoss: number,
+	HopBarrierMinimumSpeedCap: number,
+	HopBarrierPenaltySeconds: number,
+}
+
 export type FrostTrailRouteContentConfig = {
 	CourseId: string,
 	ContentVersion: number,
 	RuntimeEnabled: boolean,
+	RuntimeVersion: number,
+	MaximumRecoverableEvaluationDeltaSeconds: number,
+	MaximumRecoverableSweepSubsteps: number,
+	Runtime: FrostTrailRouteContentRuntime,
 	GroundCoinHeight: number,
 	CoinSize: Vector3,
 	IceBlockerSize: Vector3,
@@ -59,6 +90,35 @@ local GROUND_COIN_HEIGHT = 3.5
 local COIN_SIZE = Vector3.new(0.75, 3.6, 3.6)
 local ICE_BLOCKER_SIZE = Vector3.new(12, 6, 5)
 local HOP_BARRIER_SIZE = Vector3.new(16, 3, 3)
+local MAXIMUM_RECOVERABLE_EVALUATION_DELTA_SECONDS = 0.25
+local MAXIMUM_RECOVERABLE_SWEEP_SUBSTEPS = 5
+
+local runtime: FrostTrailRouteContentRuntime = table.freeze({
+	CoinRewardPerPickup = 1,
+	MaximumRouteCoins = 160,
+	MaximumObstacleEncounters = 18,
+	EvaluationStartLongitudinal = -200,
+	EvaluationEndLongitudinal = 6100,
+	CoinPickupRadiusStuds = 5.25,
+	BroadphasePaddingStuds = 20,
+	MaximumEvaluationDeltaSeconds = 0.10,
+	MaximumSweepSubstepSeconds = 0.05,
+	MaximumSweepSubsteps = 2,
+	MaximumHorizontalSpeedStudsPerSecond = 165,
+	MaximumTotalSpeedStudsPerSecond = 180,
+	MovementSlackStuds = 12,
+	MaximumCandidatesPerUpdate = 24,
+	SledRootHalfSize = Vector3.new(2.8, 0.4, 4.3),
+	ObstacleContactPaddingStuds = 0.20,
+	ParallelAxisEpsilon = 0.00000001,
+	TimeOfImpactEpsilon = 0.000001,
+	IceBlockerSpeedLoss = 30,
+	IceBlockerMinimumSpeedCap = 18,
+	IceBlockerPenaltySeconds = 1.50,
+	HopBarrierSpeedLoss = 20,
+	HopBarrierMinimumSpeedCap = 22,
+	HopBarrierPenaltySeconds = 1.00,
+})
 
 local function frozenNumberList(values: { number }): { number }
 	return table.freeze(values)
@@ -297,26 +357,116 @@ local function isFinite(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
 end
 
-for _, placement in ipairs(coinPlacements) do
+local function assertExactFinite(value: number, expected: number, name: string)
+	assert(isFinite(value) and value == expected, `{name} must equal the finite authored value {expected}`)
+end
+
+assert(table.isfrozen(runtime), "Frost Trail route runtime configuration must be frozen")
+local runtimeFieldCount = 0
+for _ in (runtime :: any) do
+	runtimeFieldCount += 1
+end
+assert(runtimeFieldCount == 24, "Frost Trail route runtime configuration must contain exactly 24 fields")
+assertExactFinite(runtime.CoinRewardPerPickup, 1, "CoinRewardPerPickup")
+assertExactFinite(runtime.MaximumRouteCoins, 160, "MaximumRouteCoins")
+assertExactFinite(runtime.MaximumObstacleEncounters, 18, "MaximumObstacleEncounters")
+assertExactFinite(runtime.EvaluationStartLongitudinal, -200, "EvaluationStartLongitudinal")
+assertExactFinite(runtime.EvaluationEndLongitudinal, 6100, "EvaluationEndLongitudinal")
+assertExactFinite(runtime.CoinPickupRadiusStuds, 5.25, "CoinPickupRadiusStuds")
+assertExactFinite(runtime.BroadphasePaddingStuds, 20, "BroadphasePaddingStuds")
+assertExactFinite(runtime.MaximumEvaluationDeltaSeconds, 0.10, "MaximumEvaluationDeltaSeconds")
+assertExactFinite(runtime.MaximumSweepSubstepSeconds, 0.05, "MaximumSweepSubstepSeconds")
+assertExactFinite(runtime.MaximumSweepSubsteps, 2, "MaximumSweepSubsteps")
+assertExactFinite(runtime.MaximumHorizontalSpeedStudsPerSecond, 165, "MaximumHorizontalSpeedStudsPerSecond")
+assertExactFinite(runtime.MaximumTotalSpeedStudsPerSecond, 180, "MaximumTotalSpeedStudsPerSecond")
+assertExactFinite(runtime.MovementSlackStuds, 12, "MovementSlackStuds")
+assertExactFinite(runtime.MaximumCandidatesPerUpdate, 24, "MaximumCandidatesPerUpdate")
+assertExactFinite(runtime.ObstacleContactPaddingStuds, 0.20, "ObstacleContactPaddingStuds")
+assertExactFinite(runtime.ParallelAxisEpsilon, 0.00000001, "ParallelAxisEpsilon")
+assertExactFinite(runtime.TimeOfImpactEpsilon, 0.000001, "TimeOfImpactEpsilon")
+assertExactFinite(runtime.IceBlockerSpeedLoss, 30, "IceBlockerSpeedLoss")
+assertExactFinite(runtime.IceBlockerMinimumSpeedCap, 18, "IceBlockerMinimumSpeedCap")
+assertExactFinite(runtime.IceBlockerPenaltySeconds, 1.50, "IceBlockerPenaltySeconds")
+assertExactFinite(runtime.HopBarrierSpeedLoss, 20, "HopBarrierSpeedLoss")
+assertExactFinite(runtime.HopBarrierMinimumSpeedCap, 22, "HopBarrierMinimumSpeedCap")
+assertExactFinite(runtime.HopBarrierPenaltySeconds, 1.00, "HopBarrierPenaltySeconds")
+assertExactFinite(
+	MAXIMUM_RECOVERABLE_EVALUATION_DELTA_SECONDS,
+	0.25,
+	"MaximumRecoverableEvaluationDeltaSeconds"
+)
+assertExactFinite(MAXIMUM_RECOVERABLE_SWEEP_SUBSTEPS, 5, "MaximumRecoverableSweepSubsteps")
+assert(
+	runtime.SledRootHalfSize == Vector3.new(2.8, 0.4, 4.3)
+		and isFinite(runtime.SledRootHalfSize.X)
+		and isFinite(runtime.SledRootHalfSize.Y)
+		and isFinite(runtime.SledRootHalfSize.Z),
+	"SledRootHalfSize must equal the finite authored value"
+)
+
+local seenCoinContentIds: { [string]: boolean } = {}
+for index, placement in ipairs(coinPlacements) do
 	assert(
 		isFinite(placement.Longitudinal)
 			and isFinite(placement.LateralOffset)
 			and isFinite(placement.HeightOffset),
 		`Non-finite coin placement {placement.ContentId}`
 	)
+	assert(table.isfrozen(placement), `Mutable coin placement {placement.ContentId}`)
+	assert(placement.ContentId == string.format("FrostCoin_%03d", index), `Invalid coin ContentId {placement.ContentId}`)
+	assert(not seenCoinContentIds[placement.ContentId], `Duplicate coin ContentId {placement.ContentId}`)
+	seenCoinContentIds[placement.ContentId] = true
+	assert(
+		placement.Longitudinal >= -160 and placement.Longitudinal <= 6060,
+		`Coin placement outside the scoring route {placement.ContentId}`
+	)
 end
+assert(#coinPlacements == runtime.MaximumRouteCoins, "MaximumRouteCoins must match the authored coin count")
 
+local seenEncounterIds: { [string]: boolean } = {}
 for _, row in ipairs(obstacleRows) do
 	assert(isFinite(row.Longitudinal), `Non-finite obstacle row {row.EncounterId}`)
+	assert(table.isfrozen(row), `Mutable obstacle row {row.EncounterId}`)
+	assert(table.isfrozen(row.LaneOffsets), `Mutable obstacle lanes in {row.EncounterId}`)
+	assert(not seenEncounterIds[row.EncounterId], `Duplicate obstacle EncounterId {row.EncounterId}`)
+	seenEncounterIds[row.EncounterId] = true
 	for _, lateralOffset in ipairs(row.LaneOffsets) do
 		assert(isFinite(lateralOffset), `Non-finite obstacle lane in {row.EncounterId}`)
 	end
+end
+local encounterCount = 0
+for _ in seenEncounterIds do
+	encounterCount += 1
+end
+assert(encounterCount == runtime.MaximumObstacleEncounters, "MaximumObstacleEncounters must match the authored row count")
+
+local seenObstacleContentIds: { [string]: boolean } = {}
+for index, placement in ipairs(obstaclePlacements) do
+	assert(table.isfrozen(placement), `Mutable obstacle placement {placement.ContentId}`)
+	assert(
+		isFinite(placement.Longitudinal) and isFinite(placement.LateralOffset),
+		`Non-finite obstacle placement {placement.ContentId}`
+	)
+	assert(
+		placement.ContentId == string.format("FrostObstacle_%03d", index),
+		`Invalid obstacle ContentId {placement.ContentId}`
+	)
+	assert(not seenObstacleContentIds[placement.ContentId], `Duplicate obstacle ContentId {placement.ContentId}`)
+	seenObstacleContentIds[placement.ContentId] = true
+	assert(
+		placement.Longitudinal >= 400 and placement.Longitudinal <= 5390,
+		`Obstacle placement outside the scoring route {placement.ContentId}`
+	)
 end
 
 local config: FrostTrailRouteContentConfig = {
 	CourseId = "FrostTrailV1",
 	ContentVersion = 1,
-	RuntimeEnabled = false,
+	RuntimeEnabled = true,
+	RuntimeVersion = 1,
+	MaximumRecoverableEvaluationDeltaSeconds = MAXIMUM_RECOVERABLE_EVALUATION_DELTA_SECONDS,
+	MaximumRecoverableSweepSubsteps = MAXIMUM_RECOVERABLE_SWEEP_SUBSTEPS,
+	Runtime = runtime,
 	GroundCoinHeight = GROUND_COIN_HEIGHT,
 	CoinSize = COIN_SIZE,
 	IceBlockerSize = ICE_BLOCKER_SIZE,

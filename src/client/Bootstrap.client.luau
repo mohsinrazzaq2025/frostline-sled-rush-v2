@@ -7,6 +7,20 @@ local ResultController = require(script.Parent.Controllers.ResultController)
 
 AudioController.start()
 RunController.start()
+
+local routeContentStarted, routeContentFailure = pcall(function()
+	local FrostTrailRouteContentController = require(script.Parent.Controllers.FrostTrailRouteContentController)
+	FrostTrailRouteContentController.start()
+end)
+if not routeContentStarted then
+	warn(
+		string.format(
+			"[Frostline][RouteContent] Client presentation unavailable: %s",
+			tostring(routeContentFailure)
+		)
+	)
+end
+
 -- RunController waits for the server-created remotes, which means WorldBuilder's
 -- Lighting and sled hierarchy are available before client VFX inspects them.
 VFXController.start()

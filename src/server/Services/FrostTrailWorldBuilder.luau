@@ -338,7 +338,43 @@ local function validateRouteContentConfiguration()
 	requireCondition(table.isfrozen(config), "route-content configuration must be frozen")
 	requireCondition(config.CourseId == "FrostTrailV1", "route-content CourseId mismatch")
 	requireCondition(config.ContentVersion == 1, "route-content version mismatch")
-	requireCondition(config.RuntimeEnabled == false, "route content must remain disabled")
+	requireCondition(config.RuntimeEnabled == true, "route content must be runtime-enabled")
+	requireCondition(config.RuntimeVersion == 1, "route-content runtime version mismatch")
+	local runtime = config.Runtime
+	requireCondition(table.isfrozen(runtime), "route-content Runtime must be separately frozen")
+	requireCondition(tableEntryCount(runtime :: any) == 24, "route-content Runtime field count mismatch")
+	local function validateExactRuntimeNumber(value: number, expected: number, name: string)
+		requireCondition(isFiniteNumber(value) and value == expected, name .. " runtime value mismatch")
+	end
+	validateExactRuntimeNumber(runtime.CoinRewardPerPickup, 1, "CoinRewardPerPickup")
+	validateExactRuntimeNumber(runtime.MaximumRouteCoins, 160, "MaximumRouteCoins")
+	validateExactRuntimeNumber(runtime.MaximumObstacleEncounters, 18, "MaximumObstacleEncounters")
+	validateExactRuntimeNumber(runtime.EvaluationStartLongitudinal, -200, "EvaluationStartLongitudinal")
+	validateExactRuntimeNumber(runtime.EvaluationEndLongitudinal, 6100, "EvaluationEndLongitudinal")
+	validateExactRuntimeNumber(runtime.CoinPickupRadiusStuds, 5.25, "CoinPickupRadiusStuds")
+	validateExactRuntimeNumber(runtime.BroadphasePaddingStuds, 20, "BroadphasePaddingStuds")
+	validateExactRuntimeNumber(runtime.MaximumEvaluationDeltaSeconds, 0.10, "MaximumEvaluationDeltaSeconds")
+	validateExactRuntimeNumber(runtime.MaximumSweepSubstepSeconds, 0.05, "MaximumSweepSubstepSeconds")
+	validateExactRuntimeNumber(runtime.MaximumSweepSubsteps, 2, "MaximumSweepSubsteps")
+	validateExactRuntimeNumber(
+		runtime.MaximumHorizontalSpeedStudsPerSecond,
+		165,
+		"MaximumHorizontalSpeedStudsPerSecond"
+	)
+	validateExactRuntimeNumber(runtime.MaximumTotalSpeedStudsPerSecond, 180, "MaximumTotalSpeedStudsPerSecond")
+	validateExactRuntimeNumber(runtime.MovementSlackStuds, 12, "MovementSlackStuds")
+	validateExactRuntimeNumber(runtime.MaximumCandidatesPerUpdate, 24, "MaximumCandidatesPerUpdate")
+	validateExactVector(runtime.SledRootHalfSize, Vector3.new(2.8, 0.4, 4.3), "route-content SledRootHalfSize")
+	requireCondition(isFiniteVector3(runtime.SledRootHalfSize), "route-content SledRootHalfSize must be finite")
+	validateExactRuntimeNumber(runtime.ObstacleContactPaddingStuds, 0.20, "ObstacleContactPaddingStuds")
+	validateExactRuntimeNumber(runtime.ParallelAxisEpsilon, 0.00000001, "ParallelAxisEpsilon")
+	validateExactRuntimeNumber(runtime.TimeOfImpactEpsilon, 0.000001, "TimeOfImpactEpsilon")
+	validateExactRuntimeNumber(runtime.IceBlockerSpeedLoss, 30, "IceBlockerSpeedLoss")
+	validateExactRuntimeNumber(runtime.IceBlockerMinimumSpeedCap, 18, "IceBlockerMinimumSpeedCap")
+	validateExactRuntimeNumber(runtime.IceBlockerPenaltySeconds, 1.50, "IceBlockerPenaltySeconds")
+	validateExactRuntimeNumber(runtime.HopBarrierSpeedLoss, 20, "HopBarrierSpeedLoss")
+	validateExactRuntimeNumber(runtime.HopBarrierMinimumSpeedCap, 22, "HopBarrierMinimumSpeedCap")
+	validateExactRuntimeNumber(runtime.HopBarrierPenaltySeconds, 1.00, "HopBarrierPenaltySeconds")
 	requireCondition(config.GroundCoinHeight == 3.5, "ground-coin height mismatch")
 	validateExactVector(config.CoinSize, Vector3.new(0.75, 3.6, 3.6), "route-content CoinSize")
 	validateExactVector(config.IceBlockerSize, Vector3.new(12, 6, 5), "route-content IceBlockerSize")
@@ -404,7 +440,14 @@ local function validateRouteContentConfiguration()
 			else
 				requireCondition(placement.HeightOffset == config.GroundCoinHeight, expectedId .. " ground height mismatch")
 			end
-			requireCondition(placement.Longitudinal < 6100, expectedId .. " enters the clear launch interval")
+			requireCondition(
+				placement.Longitudinal >= -160 and placement.Longitudinal <= 6060,
+				expectedId .. " is outside the authored scoring interval"
+			)
+			requireCondition(
+				placement.Longitudinal < runtime.EvaluationEndLongitudinal,
+				expectedId .. " enters the clear launch interval"
+			)
 			local previousSectionCount = coinSectionCounts[placement.SectionId]
 			requireCondition(previousSectionCount ~= nil, expectedId .. " has an unknown section")
 			coinSectionCounts[placement.SectionId] = (previousSectionCount :: number) + 1
@@ -416,6 +459,7 @@ local function validateRouteContentConfiguration()
 	local iceBlockerCount = 0
 	local hopBarrierCount = 0
 	local seenObstacleIds: { [string]: boolean } = {}
+	local seenEncounterIds: { [string]: boolean } = {}
 	for rowIndex, expectedRow in ipairs(EXPECTED_OBSTACLE_ROWS) do
 		local row = config.ObstacleRows[rowIndex]
 		requireCondition(row ~= nil, "missing obstacle row")
@@ -423,6 +467,8 @@ local function validateRouteContentConfiguration()
 		requireCondition(table.isfrozen(row.LaneOffsets), expectedRow.EncounterId .. " lanes must be frozen")
 		requireCondition(tableEntryCount(row :: any) == 5, expectedRow.EncounterId .. " field count mismatch")
 		requireCondition(row.EncounterId == expectedRow.EncounterId, expectedRow.EncounterId .. " ID mismatch")
+		requireCondition(not seenEncounterIds[row.EncounterId], expectedRow.EncounterId .. " ID is duplicated")
+		seenEncounterIds[row.EncounterId] = true
 		requireCondition(row.SectionId == expectedRow.SectionId, expectedRow.EncounterId .. " section mismatch")
 		requireCondition(row.Longitudinal == expectedRow.Longitudinal, expectedRow.EncounterId .. " longitudinal mismatch")
 		requireCondition(row.ObstacleKind == expectedRow.ObstacleKind, expectedRow.EncounterId .. " kind mismatch")
@@ -481,7 +527,14 @@ local function validateRouteContentConfiguration()
 				isFiniteNumber(placement.Longitudinal) and isFiniteNumber(placement.LateralOffset),
 				expectedId .. " placement must be finite"
 			)
-			requireCondition(placement.Longitudinal <= 5390, expectedId .. " exceeds the final obstacle row")
+			requireCondition(
+				placement.Longitudinal >= 400 and placement.Longitudinal <= 5390,
+				expectedId .. " is outside the authored obstacle interval"
+			)
+			requireCondition(
+				placement.Longitudinal < runtime.EvaluationEndLongitudinal,
+				expectedId .. " enters the clear launch interval"
+			)
 			local previousSectionCount = obstacleSectionCounts[placement.SectionId]
 			requireCondition(previousSectionCount ~= nil, expectedId .. " has an unknown section")
 			obstacleSectionCounts[placement.SectionId] = (previousSectionCount :: number) + 1
@@ -493,6 +546,10 @@ local function validateRouteContentConfiguration()
 		end
 	end
 	requireCondition(obstacleIndex == EXPECTED_OBSTACLE_COUNT, "obstacle rows did not consume exactly 21 placements")
+	requireCondition(
+		tableEntryCount(seenEncounterIds :: any) == EXPECTED_OBSTACLE_ROW_COUNT,
+		"obstacle EncounterId count mismatch"
+	)
 	requireCondition(iceBlockerCount == EXPECTED_ICE_BLOCKER_COUNT, "ice-blocker count mismatch")
 	requireCondition(hopBarrierCount == EXPECTED_HOP_BARRIER_COUNT, "hop-barrier count mismatch")
 	requireCondition(config.ObstacleRows[11].Longitudinal == 3300, "AvalanchePass seam repair must remain at 3300")
@@ -1124,7 +1181,7 @@ local function setCoinAttributes(part: Part, placement: CoinPlacement)
 	part:SetAttribute("Longitudinal", placement.Longitudinal)
 	part:SetAttribute("LateralOffset", placement.LateralOffset)
 	part:SetAttribute("HeightOffset", placement.HeightOffset)
-	part:SetAttribute("RuntimeEnabled", false)
+	part:SetAttribute("RuntimeEnabled", FrostTrailRouteContentConfig.RuntimeEnabled)
 end
 
 local function setObstacleAttributes(part: Part, placement: ObstaclePlacement)
@@ -1135,7 +1192,7 @@ local function setObstacleAttributes(part: Part, placement: ObstaclePlacement)
 	part:SetAttribute("ObstacleKind", placement.ObstacleKind)
 	part:SetAttribute("Longitudinal", placement.Longitudinal)
 	part:SetAttribute("LateralOffset", placement.LateralOffset)
-	part:SetAttribute("RuntimeEnabled", false)
+	part:SetAttribute("RuntimeEnabled", FrostTrailRouteContentConfig.RuntimeEnabled)
 end
 
 local function buildRouteContent(gameplay: Folder, geometryPoints: { RouteGeometryPoint })
@@ -2441,7 +2498,7 @@ local function validateRouteContent(candidate: Model, geometryPoints: { RouteGeo
 		requireCondition(part:GetAttribute("Longitudinal") == placement.Longitudinal, placement.ContentId .. " Longitudinal mismatch")
 		requireCondition(part:GetAttribute("LateralOffset") == placement.LateralOffset, placement.ContentId .. " LateralOffset mismatch")
 		requireCondition(part:GetAttribute("HeightOffset") == placement.HeightOffset, placement.ContentId .. " HeightOffset mismatch")
-		requireCondition(part:GetAttribute("RuntimeEnabled") == false, placement.ContentId .. " must remain runtime-disabled")
+		requireCondition(part:GetAttribute("RuntimeEnabled") == true, placement.ContentId .. " must be runtime-enabled")
 		local routeSample = routeSampleAtLongitudinal(geometryPoints, placement.Longitudinal)
 		requireCondition(
 			math.abs(part.CFrame.RightVector:Dot(routeSample.Frame.LookVector)) >= 1 - FrostTrailConfig.ValidationEpsilon,
@@ -2500,7 +2557,7 @@ local function validateRouteContent(candidate: Model, geometryPoints: { RouteGeo
 		requireCondition(part:GetAttribute("ObstacleKind") == placement.ObstacleKind, placement.ContentId .. " ObstacleKind mismatch")
 		requireCondition(part:GetAttribute("Longitudinal") == placement.Longitudinal, placement.ContentId .. " Longitudinal mismatch")
 		requireCondition(part:GetAttribute("LateralOffset") == placement.LateralOffset, placement.ContentId .. " LateralOffset mismatch")
-		requireCondition(part:GetAttribute("RuntimeEnabled") == false, placement.ContentId .. " must remain runtime-disabled")
+		requireCondition(part:GetAttribute("RuntimeEnabled") == true, placement.ContentId .. " must be runtime-enabled")
 		validateContentSection(placement.SectionId, placement.Longitudinal, placement.ContentId)
 		validateContentFootprint(
 			geometryPoints,
@@ -2868,8 +2925,12 @@ local function validateAttributes(candidate: Model, authoredLength: number)
 	requireCondition(candidate:GetAttribute("LaunchLongitudinal") == 6350, "launch attribute mismatch")
 	requireCondition(candidate:GetAttribute("RouteContentVersion") == 1, "route-content version attribute mismatch")
 	requireCondition(
-		candidate:GetAttribute("RouteContentRuntimeEnabled") == false,
+		candidate:GetAttribute("RouteContentRuntimeEnabled") == true,
 		"route-content runtime attribute mismatch"
+	)
+	requireCondition(
+		candidate:GetAttribute("RouteContentRuntimeVersion") == 1,
+		"route-content runtime-version attribute mismatch"
 	)
 	requireCondition(candidate:GetAttribute("RouteCoinCount") == 160, "route coin-count attribute mismatch")
 	requireCondition(candidate:GetAttribute("RouteObstacleCount") == 21, "route obstacle-count attribute mismatch")
@@ -2936,6 +2997,7 @@ local function setWorldAttributes(candidate: Model, authoredLength: number)
 	candidate:SetAttribute("AuthoredPathLengthStuds", authoredLength)
 	candidate:SetAttribute("RouteContentVersion", FrostTrailRouteContentConfig.ContentVersion)
 	candidate:SetAttribute("RouteContentRuntimeEnabled", FrostTrailRouteContentConfig.RuntimeEnabled)
+	candidate:SetAttribute("RouteContentRuntimeVersion", FrostTrailRouteContentConfig.RuntimeVersion)
 	candidate:SetAttribute("RouteCoinCount", #FrostTrailRouteContentConfig.CoinPlacements)
 	candidate:SetAttribute("RouteObstacleCount", #FrostTrailRouteContentConfig.ObstaclePlacements)
 	candidate:SetAttribute("RouteObstacleRowCount", #FrostTrailRouteContentConfig.ObstacleRows)

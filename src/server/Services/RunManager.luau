@@ -175,6 +175,7 @@ type ResolvedCourse = {
 	MaximumRunDurationSeconds: number,
 	SafetyMaximumLateralDistance: number,
 	SafetyMinimumWorldY: number,
+	RouteContent: any?,
 }
 
 type ResolvedCourseDictionary = { [CourseId]: ResolvedCourse }
@@ -210,6 +211,7 @@ type Session = {
 	SpeedGovernorAppliedAcceleration: number,
 	SpeedGovernorDisqualified: boolean,
 	SpeedGovernorReleaseAuthorized: boolean,
+	RouteContentState: any?,
 	HopProfile: HopTuning?,
 	HopState: HopState?,
 	SteeringForce: VectorForce?,
@@ -300,6 +302,19 @@ type FrostSpeedGovernorApi = {
 	updateGroundedControls: (Session, number, number) -> (),
 	createForce: (Part, Attachment) -> VectorForce,
 	validateProfile: (any, RouteData) -> (boolean, string),
+	resolveRouteContent: (Model) -> (any?, string),
+	validateRouteContent: (ResolvedCourse) -> (boolean, string),
+	isRouteContentReady: (ResolvedCourse) -> (boolean, string),
+	createRouteContentState: (Player, number, ResolvedCourse) -> (any?, string),
+	beginRouteContent: (Session) -> (boolean, string),
+	armRouteContent: (Session, number) -> (),
+	updateRouteContent: (Session, number, number, number) -> (),
+	clampRouteContentTargetSpeed: (Session, number, number) -> number,
+	sealRouteContent: (Session) -> (),
+	captureRouteCoins: (Session) -> number,
+	invalidateRouteContent: (Session, string) -> (),
+	clearRouteContent: (Session) -> (),
+	bindRouteContentRemote: (RemoteEvent) -> (boolean, string),
 }
 
 local FrostSpeedGovernor: FrostSpeedGovernorApi
@@ -1410,6 +1425,13 @@ local function transitionTo(session: Session, nextPhase: Phase, deferStateDispat
 	then
 		FrostSpeedGovernor.invalidateHop(session)
 	end
+	if session.RouteContentState ~= nil
+		and not session.CleanupStarted
+		and session.Phase == RunPhase.Descent
+		and nextPhase ~= RunPhase.Descent
+	then
+		FrostSpeedGovernor.sealRouteContent(session)
+	end
 	session.Phase = nextPhase
 	if nextPhase ~= RunPhase.Countdown then
 		session.CountdownValue = nil
@@ -1805,9 +1827,368 @@ local function updateFrostSteering(
 end
 
 do
+	local routeContentController: any? = nil
+	local routeContentFailure = "route-content controller is unavailable"
+	local routeContentRemoteBound = false
+	local routeContentRemote: RemoteEvent? = nil
+	local routeContentDependencyWarningEmitted = false
+	local routeContentLoaded, routeContentOrError = pcall(require, script.Parent.FrostTrailRouteContentController)
+	if routeContentLoaded and typeof(routeContentOrError) == "table" then
+		local candidate = routeContentOrError :: any
+		local requiredFunctions = {
+			"resolve",
+			"validateResolved",
+			"bindRemote",
+			"createState",
+			"begin",
+			"arm",
+			"update",
+			"getActiveSpeedCap",
+			"clampTargetSpeed",
+			"sealProvisional",
+			"captureFinalRouteCoins",
+			"invalidate",
+			"clearAbort",
+			"clearAfterResult",
+		}
+		local validApi = true
+		for _, functionName in ipairs(requiredFunctions) do
+			if typeof(candidate[functionName]) ~= "function" then
+				validApi = false
+				routeContentFailure = "route-content API is missing " .. functionName
+				break
+			end
+		end
+		if validApi then
+			routeContentController = candidate
+			routeContentFailure = "ok"
+		end
+	else
+		routeContentFailure = if routeContentLoaded
+			then "route-content module did not return a table"
+			else tostring(routeContentOrError)
+	end
+
+	local function warnRouteContentOnce(message: string)
+		if routeContentDependencyWarningEmitted then
+			return
+		end
+		routeContentDependencyWarningEmitted = true
+		warn("[Frostline][RouteContent] " .. message)
+	end
+
+	if routeContentController == nil then
+		warnRouteContentOnce(routeContentFailure)
+	end
+
 	local controller = {
 		Hop = require(script.Parent.FrostTrailHopController),
 	} :: FrostSpeedGovernorApi
+
+	local function makeRouteContentContext(session: Session): any
+		local course = session.ResolvedCourse
+		local courses = resolvedCourses
+		return table.freeze({
+			IsCurrentSession = isSameSession(session, session.RunId),
+			IsResolvedCourseCurrent = courses ~= nil
+				and table.isfrozen(courses)
+				and courses[session.CourseId] == course,
+			Player = session.Player,
+			RunId = session.RunId,
+			CourseId = session.CourseId,
+			Playable = course.World:GetAttribute("Playable") == true,
+			ActivationMode = course.World:GetAttribute("ActivationMode"),
+			ResolvedContent = course.RouteContent,
+			World = course.World,
+			ActiveSleds = course.ActiveSleds,
+			Character = session.Character,
+			Humanoid = session.Humanoid,
+			Sled = session.Sled.Model,
+			Root = session.Sled.Root,
+			DriverSeat = session.Sled.DriverSeat,
+			GovernorAttachment = session.TuckAttachment,
+			GovernorForce = session.SpeedGovernorForce,
+			SpeedProfile = session.SpeedProfile,
+			Phase = session.Phase,
+			CleanupStarted = session.CleanupStarted,
+			ReleaseInProgress = session.ReleaseInProgress,
+			TuckActivationReady = session.TuckActivationReady,
+			SpeedGovernorReleaseAuthorized = session.SpeedGovernorReleaseAuthorized,
+			SpeedGovernorDisqualified = session.SpeedGovernorDisqualified,
+			RampFreedomEntered = session.RampFreedomEntered,
+		})
+	end
+
+	function controller.resolveRouteContent(world: Model): (any?, string)
+		local routeController = routeContentController
+		if routeController == nil then
+			return nil, routeContentFailure
+		end
+		local succeeded, resolvedOrError, reason = pcall(routeController.resolve, world)
+		if not succeeded then
+			warnRouteContentOnce("resolution failed: " .. tostring(resolvedOrError))
+			return nil, tostring(resolvedOrError)
+		end
+		if resolvedOrError == nil then
+			return nil, if typeof(reason) == "string" then reason else "route-content resolution failed"
+		end
+		return resolvedOrError, "ok"
+	end
+
+	function controller.validateRouteContent(course: ResolvedCourse): (boolean, string)
+		local routeController = routeContentController
+		local resolvedContent = course.RouteContent
+		if routeController == nil then
+			return false, routeContentFailure
+		elseif resolvedContent == nil then
+			return false, "resolved route content is unavailable"
+		end
+		local succeeded, validOrError, reason = pcall(
+			routeController.validateResolved,
+			resolvedContent,
+			course.World
+		)
+		if not succeeded then
+			warnRouteContentOnce("live validation failed: " .. tostring(validOrError))
+			return false, tostring(validOrError)
+		end
+		if validOrError ~= true then
+			return false, if typeof(reason) == "string" then reason else "route-content identity is invalid"
+		end
+		return true, "ok"
+	end
+
+	function controller.isRouteContentReady(course: ResolvedCourse): (boolean, string)
+		if course.CourseId ~= FROST_TRAIL_COURSE_ID then
+			return true, "ok"
+		elseif not RunService:IsStudio() then
+			return false, "route content is Studio-only"
+		end
+		local remote = routeContentRemote
+		local remoteFolder = if remote then remote.Parent else nil
+		if not routeContentRemoteBound
+			or remote == nil
+			or remote.Name ~= "FrostTrailContentEvent"
+			or remote.ClassName ~= "RemoteEvent"
+			or remoteFolder == nil
+			or remoteFolder.Name ~= REMOTES_FOLDER_NAME
+			or remoteFolder.ClassName ~= "Folder"
+			or remoteFolder.Parent ~= ReplicatedStorage
+			or remoteFolder:FindFirstChild("FrostTrailContentEvent") ~= remote
+		then
+			local reason = "route-content presentation remote is unavailable"
+			warnRouteContentOnce(reason)
+			return false, reason
+		end
+		local valid, reason = controller.validateRouteContent(course)
+		if not valid then
+			warnRouteContentOnce("controlled Frost run unavailable: " .. reason)
+		end
+		return valid, reason
+	end
+
+	function controller.createRouteContentState(
+		player: Player,
+		runId: number,
+		course: ResolvedCourse
+	): (any?, string)
+		if course.CourseId ~= FROST_TRAIL_COURSE_ID then
+			return nil, "ok"
+		end
+		local routeController = routeContentController
+		local resolvedContent = course.RouteContent
+		if routeController == nil then
+			return nil, routeContentFailure
+		elseif resolvedContent == nil then
+			return nil, "resolved route content is unavailable"
+		end
+		local succeeded, stateOrError, reason = pcall(
+			routeController.createState,
+			player,
+			runId,
+			resolvedContent
+		)
+		if not succeeded then
+			warnRouteContentOnce("state creation failed: " .. tostring(stateOrError))
+			return nil, tostring(stateOrError)
+		elseif stateOrError == nil then
+			local failureReason = if typeof(reason) == "string" then reason else "route-content state creation failed"
+			warnRouteContentOnce(failureReason)
+			return nil, failureReason
+		end
+		return stateOrError, "ok"
+	end
+
+	function controller.beginRouteContent(session: Session): (boolean, string)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if state == nil then
+			return session.CourseId ~= FROST_TRAIL_COURSE_ID, "route-content state is unavailable"
+		elseif routeController == nil then
+			return false, routeContentFailure
+		end
+		local succeeded, beganOrError, reason = pcall(routeController.begin, state, makeRouteContentContext(session))
+		if not succeeded then
+			return false, tostring(beganOrError)
+		elseif beganOrError ~= true then
+			return false, if typeof(reason) == "string" then reason else "route-content Begin failed"
+		end
+		return true, "ok"
+	end
+
+	function controller.invalidateRouteContent(session: Session, reason: string)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return
+		end
+		local succeeded, failure = pcall(routeController.invalidate, state, reason)
+		if not succeeded then
+			warnRouteContentOnce("invalidation failed: " .. tostring(failure))
+		end
+	end
+
+	function controller.armRouteContent(session: Session, now: number)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return
+		end
+		local succeeded, armedOrError, reason = pcall(
+			routeController.arm,
+			state,
+			makeRouteContentContext(session),
+			now
+		)
+		if not succeeded then
+			controller.invalidateRouteContent(session, "arm error: " .. tostring(armedOrError))
+		elseif armedOrError ~= true then
+			controller.invalidateRouteContent(
+				session,
+				if typeof(reason) == "string" then reason else "route-content arm rejected"
+			)
+		end
+	end
+
+	function controller.updateRouteContent(session: Session, runId: number, deltaTime: number, now: number)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil or session.RunId ~= runId then
+			return
+		end
+		local succeeded, failure = pcall(
+			routeController.update,
+			state,
+			makeRouteContentContext(session),
+			deltaTime,
+			now
+		)
+		if not succeeded then
+			controller.invalidateRouteContent(session, "update error: " .. tostring(failure))
+		end
+	end
+
+	function controller.clampRouteContentTargetSpeed(
+		session: Session,
+		plannedTargetSpeed: number,
+		now: number
+	): number
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return plannedTargetSpeed
+		end
+		local succeeded, clampedOrError = pcall(
+			routeController.clampTargetSpeed,
+			state,
+			plannedTargetSpeed,
+			now
+		)
+		if not succeeded
+			or typeof(clampedOrError) ~= "number"
+			or not isFiniteNumber(clampedOrError)
+			or clampedOrError < 0
+			or clampedOrError > plannedTargetSpeed
+		then
+			controller.invalidateRouteContent(session, "speed-cap error: " .. tostring(clampedOrError))
+			return plannedTargetSpeed
+		end
+		return clampedOrError :: number
+	end
+
+	function controller.sealRouteContent(session: Session)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return
+		end
+		local succeeded, failure = pcall(
+			routeController.sealProvisional,
+			state,
+			makeRouteContentContext(session)
+		)
+		if not succeeded then
+			controller.invalidateRouteContent(session, "seal error: " .. tostring(failure))
+		end
+	end
+
+	function controller.captureRouteCoins(session: Session): number
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return 0
+		end
+		local succeeded, countOrError = pcall(
+			routeController.captureFinalRouteCoins,
+			state,
+			makeRouteContentContext(session)
+		)
+		if not succeeded
+			or typeof(countOrError) ~= "number"
+			or not isFiniteNumber(countOrError)
+			or countOrError < 0
+			or countOrError > 160
+			or countOrError % 1 ~= 0
+		then
+			controller.invalidateRouteContent(session, "final capture error: " .. tostring(countOrError))
+			return 0
+		end
+		return countOrError :: number
+	end
+
+	function controller.clearRouteContent(session: Session)
+		local routeController = routeContentController
+		local state = session.RouteContentState
+		if routeController == nil or state == nil then
+			return
+		end
+		local clearMethod = if session.ResultFinalized and session.ResultPayload ~= nil
+			then routeController.clearAfterResult
+			else routeController.clearAbort
+		local succeeded, failure = pcall(clearMethod, state)
+		if not succeeded then
+			warnRouteContentOnce("cleanup failed: " .. tostring(failure))
+		end
+	end
+
+	function controller.bindRouteContentRemote(remote: RemoteEvent): (boolean, string)
+		local routeController = routeContentController
+		if routeController == nil then
+			return false, routeContentFailure
+		end
+		local succeeded, boundOrError, reason = pcall(routeController.bindRemote, remote)
+		if not succeeded then
+			warnRouteContentOnce("remote binding failed: " .. tostring(boundOrError))
+			return false, tostring(boundOrError)
+		elseif boundOrError ~= true then
+			local failureReason = if typeof(reason) == "string" then reason else "route-content remote binding failed"
+			warnRouteContentOnce(failureReason)
+			return false, failureReason
+		end
+		routeContentRemoteBound = true
+		routeContentRemote = remote
+		return true, "ok"
+	end
 
 	function controller.invalidateHop(session: Session)
 		if session.CourseId == FROST_TRAIL_COURSE_ID then
@@ -2260,6 +2641,7 @@ function controller.update(
 		controller.clear(session)
 		return
 	end
+	plannedTargetSpeed = controller.clampRouteContentTargetSpeed(session, plannedTargetSpeed, os.clock())
 	local currentControlledSpeed = math.max(0, controlledVelocity)
 	local velocityErrorAcceleration = (plannedTargetSpeed - currentControlledSpeed)
 		/ profile.VelocityResponseSeconds
@@ -2843,6 +3225,9 @@ local function enterRampFreedom(session: Session, runId: number)
 		return
 	end
 
+	if session.RouteContentState ~= nil then
+		FrostSpeedGovernor.sealRouteContent(session)
+	end
 	session.RampFreedomEntered = true
 	FrostSpeedGovernor.invalidateHop(session)
 	resetStallObservation(session)
@@ -3443,6 +3828,7 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 
 	-- This flag is deliberately first: changing Reset state, seating, or physics can fire callbacks.
 	session.CleanupStarted = true
+	FrostSpeedGovernor.clearRouteContent(session)
 	FrostSpeedGovernor.invalidateHop(session)
 	session.FirstCleanupReason = reason
 	session.LastAirborneContactSnapshot = nil
@@ -3524,6 +3910,8 @@ local function finalizeResult(session: Session, runId: number, outcome: ResultOu
 	then
 		return false
 	end
+	FrostSpeedGovernor.sealRouteContent(session)
+	local routeCoinsCollected = FrostSpeedGovernor.captureRouteCoins(session)
 
 	local facts: ResultTypes.ServerFacts = {
 		RunId = runId,
@@ -3536,7 +3924,7 @@ local function finalizeResult(session: Session, runId: number, outcome: ResultOu
 		SeatSeparatedAfterAirborne = session.SeatSeparatedAfterAirborne,
 		FinalUprightDot = finalUprightDot,
 	}
-	local payload, failureReason = ResultService.finalize(session.Player, courseId, facts)
+	local payload, failureReason = ResultService.finalize(session.Player, courseId, facts, routeCoinsCollected)
 	if not payload then
 		warn(
 			string.format(
@@ -3863,6 +4251,7 @@ local function monitorSession(session: Session, runId: number)
 				return
 			end
 			local now = os.clock()
+			FrostSpeedGovernor.updateRouteContent(session, runId, deltaTime, now)
 			updateRampFreedom(session, runId)
 			if session.Phase == RunPhase.Descent
 				and crossedForwardPlane(course, root.Position, course.LaunchLongitudinal)
@@ -4163,6 +4552,7 @@ local function runCountdown(session: Session, runId: number)
 	session.TuckActivationReady = true
 	if session.CourseId == FROST_TRAIL_COURSE_ID then
 		session.SpeedGovernorReleaseAuthorized = true
+		FrostSpeedGovernor.armRouteContent(session, os.clock())
 	end
 	local activateQueuedTuck = session.TuckQueued and session.TuckIntentHeld
 	session.TuckQueued = false
@@ -4369,6 +4759,7 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 			or definition.RouteMode ~= "FixedBasis"
 			or definition.RouteData ~= nil
 			or course.ExactLandingSurfaces ~= nil
+			or course.RouteContent ~= nil
 			or world:GetAttribute("CourseId") ~= CLASSIC_COURSE_ID
 		then
 			return false, "Classic routing identity changed"
@@ -4410,11 +4801,16 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 			or not runoffLandingPart:IsA("BasePart")
 			or runoffLandingPart.Parent ~= landingSurfaces
 			or exactLandingSurfaces == nil
+			or course.RouteContent == nil
 			or not table.isfrozen(exactLandingSurfaces)
 			or exactLandingSurfaces[markedLandingPart] ~= true
 			or exactLandingSurfaces[runoffLandingPart] ~= true
 		then
 			return false, "Frost routing or lifecycle identity changed"
+		end
+		local routeContentValid, routeContentReason = FrostSpeedGovernor.validateRouteContent(course)
+		if not routeContentValid then
+			return false, routeContentReason
 		end
 		local validatedLandingSurfaces = exactLandingSurfaces :: { [BasePart]: boolean }
 
@@ -4681,6 +5077,12 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		)
 		return
 	end
+	if course.CourseId == FROST_TRAIL_COURSE_ID then
+		local routeContentReady = FrostSpeedGovernor.isRouteContentReady(course)
+		if not routeContentReady then
+			return
+		end
+	end
 
 	local character = player.Character
 	if not character then
@@ -4715,6 +5117,16 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 
 	latestRunId += 1
 	local runId = latestRunId
+	local routeContentState: any? = nil
+	if course.CourseId == FROST_TRAIL_COURSE_ID then
+		local state = FrostSpeedGovernor.createRouteContentState(player, runId, course)
+		if state == nil then
+			sled.Model:Destroy()
+			refreshStartPrompts()
+			return
+		end
+		routeContentState = state
+	end
 	local tuckAttachment, tuckForce, antiStallForce, stabilityTorque = createSledActuators(sled.Root)
 	local speedProfile: SpeedTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
 		then FrostTrailConfig.Speed
@@ -4757,6 +5169,7 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		SpeedGovernorAppliedAcceleration = 0,
 		SpeedGovernorDisqualified = false,
 		SpeedGovernorReleaseAuthorized = false,
+		RouteContentState = routeContentState,
 		HopProfile = hopProfile,
 		HopState = hopState,
 		SteeringForce = steeringForce,
@@ -4825,6 +5238,13 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 	if not transitionTo(session, RunPhase.Countdown) then
 		requestCleanup(session, runId, "could not start countdown", true)
 		return
+	end
+	if routeContentState ~= nil then
+		local began, beginReason = FrostSpeedGovernor.beginRouteContent(session)
+		if not began then
+			requestCleanup(session, runId, "route-content Begin failed: " .. beginReason, true)
+			return
+		end
 	end
 
 	session.OriginalMassless = makeCharacterMassless(character)
@@ -5465,6 +5885,7 @@ local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedC
 	local landingSurfaces = landingSurfacesInstance
 	local playerSpawn = playerSpawnInstance
 	local exactLandingSurfaces: { [BasePart]: boolean }? = nil
+	local resolvedRouteContent: any? = nil
 
 	if not geometry:IsDescendantOf(world)
 		or not markers:IsDescendantOf(world)
@@ -5555,6 +5976,11 @@ local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedC
 		then
 			return nil, "Frost world identity or lifecycle attributes are invalid"
 		end
+		local routeContent, routeContentReason = FrostSpeedGovernor.resolveRouteContent(world)
+		if routeContent == nil then
+			return nil, "Frost route content is unavailable: " .. routeContentReason
+		end
+		resolvedRouteContent = routeContent
 	end
 
 	local launchLongitudinal = (launchEdge.Position - coordinateOrigin):Dot(forwardDirection)
@@ -5612,6 +6038,7 @@ local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedC
 		MaximumRunDurationSeconds = definition.MaximumRunDurationSeconds,
 		SafetyMaximumLateralDistance = definition.SafetyMaximumLateralDistance,
 		SafetyMinimumWorldY = definition.SafetyMinimumWorldY,
+		RouteContent = resolvedRouteContent,
 	}
 	table.freeze(resolvedCourse)
 	if not table.isfrozen(resolvedCourse) then
@@ -6114,6 +6541,7 @@ function RunManager.start()
 		local steeringRemote = getOrCreateRemote(remoteFolder, STEERING_REMOTE_NAME)
 		steeringRemote.OnServerEvent:Connect(onSteeringIntent)
 		getOrCreateRemote(remoteFolder, "HopIntent").OnServerEvent:Connect(FrostSpeedGovernor.handleHopIntent)
+		FrostSpeedGovernor.bindRouteContentRemote(getOrCreateRemote(remoteFolder, "FrostTrailContentEvent"))
 	end
 	trustedReplay = function(player: Player, courseId: CourseId)
 		startRunSafely(player, courseId, true)
@@ -6145,7 +6573,10 @@ function RunManager.start()
 	end
 
 	connectCoursePrompt(CLASSIC_COURSE_ID)
-	if RunService:IsStudio() and courses[FROST_TRAIL_COURSE_ID] ~= nil then
+	if RunService:IsStudio()
+		and courses[FROST_TRAIL_COURSE_ID] ~= nil
+		and FrostSpeedGovernor.isRouteContentReady(courses[FROST_TRAIL_COURSE_ID])
+	then
 		connectCoursePrompt(FROST_TRAIL_COURSE_ID)
 	end
 	refreshStartPrompts()

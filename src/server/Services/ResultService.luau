@@ -9,6 +9,17 @@ local PlayerDataService = require(script.Parent.PlayerDataService)
 
 local RESULT = GameConfig.Result
 
+type FrostRouteRuntime = {
+	CoinRewardPerPickup: number,
+	MaximumRouteCoins: number,
+}
+
+type FrostRouteContentConfig = {
+	RuntimeEnabled: boolean,
+	RuntimeVersion: number,
+	Runtime: FrostRouteRuntime,
+}
+
 type CourseId = PlayerDataTypes.CourseId
 type Outcome = ResultTypes.Outcome
 type Payload = ResultTypes.Payload
@@ -26,6 +37,19 @@ type PlayerResultState = {
 local ResultService = {}
 
 local playerResultState: { [Player]: PlayerResultState } = {}
+local frostRouteContentConfig: FrostRouteContentConfig? = nil
+local frostRouteContentLoadFailure: string? = nil
+
+do
+	local loaded, result = pcall(function()
+		return require(script.Parent.FrostTrailRouteContentConfig)
+	end)
+	if loaded and typeof(result) == "table" then
+		frostRouteContentConfig = result :: FrostRouteContentConfig
+	else
+		frostRouteContentLoadFailure = if loaded then "module returned a non-table value" else tostring(result)
+	end
+end
 
 local function isFiniteNumber(value: number): boolean
 	return value == value and value > -math.huge and value < math.huge
@@ -39,6 +63,47 @@ local function isKnownOutcome(outcome: Outcome): boolean
 	return outcome == ResultTypes.Outcomes.CleanLanding
 		or outcome == ResultTypes.Outcomes.Crashed
 		or outcome == ResultTypes.Outcomes.Stalled
+end
+
+local function validateRouteCoinCount(courseId: CourseId, value: any): (number?, string?)
+	if typeof(value) ~= "number"
+		or not isFiniteNumber(value)
+		or value % 1 ~= 0
+		or value < 0
+	then
+		return nil, "invalid route coin count"
+	end
+
+	local routeCoinsCollected = value :: number
+	if courseId == "FrozenLakeV2" then
+		if routeCoinsCollected ~= 0 then
+			return nil, "Classic route coin count must equal zero"
+		end
+		return routeCoinsCollected, nil
+	elseif courseId ~= "FrostTrailV1" then
+		return nil, "invalid CourseId"
+	end
+
+	local config = frostRouteContentConfig
+	if config == nil then
+		return nil, "Frost route configuration unavailable: " .. (frostRouteContentLoadFailure or "unknown load failure")
+	end
+	local runtime = config.Runtime
+	if not table.isfrozen(config)
+		or typeof(runtime) ~= "table"
+		or not table.isfrozen(runtime)
+		or config.RuntimeEnabled ~= true
+		or config.RuntimeVersion ~= 1
+		or runtime.CoinRewardPerPickup ~= 1
+		or runtime.MaximumRouteCoins ~= 160
+	then
+		return nil, "Frost route configuration is invalid"
+	end
+	if routeCoinsCollected > runtime.MaximumRouteCoins then
+		return nil, "Frost route coin count exceeds the configured maximum"
+	end
+
+	return routeCoinsCollected, nil
 end
 
 local function getOrCreatePlayerResultState(player: Player): PlayerResultState
@@ -93,9 +158,18 @@ local function validateOutcomeFacts(facts: ServerFacts): string?
 	return nil
 end
 
-function ResultService.finalize(player: Player, courseId: CourseId, facts: ServerFacts): (Payload?, string?)
+function ResultService.finalize(
+	player: Player,
+	courseId: CourseId,
+	facts: ServerFacts,
+	routeCoinsCollectedValue: any
+): (Payload?, string?)
 	if not PlayerDataService.isSupportedCourseId(courseId) then
 		return nil, "invalid CourseId"
+	end
+	local routeCoinsCollected, routeCoinError = validateRouteCoinCount(courseId, routeCoinsCollectedValue)
+	if routeCoinsCollected == nil then
+		return nil, routeCoinError
 	elseif facts.RunId <= 0 or facts.RunId % 1 ~= 0 then
 		return nil, "invalid RunId"
 	elseif not isKnownOutcome(facts.Outcome) then
@@ -124,7 +198,9 @@ function ResultService.finalize(player: Player, courseId: CourseId, facts: Serve
 	resultState.FinalizingRuns[facts.RunId] = true
 
 	local finalDistanceMeters = math.max(0, facts.FinalStopDistanceMeters)
-	local frostCoinsEarned = calculateCoins(facts.Outcome, finalDistanceMeters)
+	local legacyReward = calculateCoins(facts.Outcome, finalDistanceMeters)
+	local routeReward = routeCoinsCollected * 1
+	local frostCoinsEarned = legacyReward + routeReward
 	local rewardUpdate, mutationError = PlayerDataService.applyRunReward(
 		player,
 		courseId,
