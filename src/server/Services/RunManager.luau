@@ -72,7 +72,17 @@ type CourseDefinition = CourseRegistry.CourseDefinition
 type RouteData = CourseRegistry.RouteData
 type SpeedZone = FrostTrailConfig.SpeedZone
 type SpeedTuning = FrostTrailConfig.SpeedTuning
+type HopTuning = FrostTrailConfig.HopTuning
 type SteeringTuning = FrostTrailConfig.SteeringTuning
+type HopState = {
+	LastSeenSequence: number,
+	LastAcceptedAt: number,
+	RateTokens: number,
+	RateRefillAt: number,
+	Active: boolean,
+	SawSeparation: boolean,
+	Invalidated: boolean,
+}
 type StallObservationKind = "recovery" | "missed-launch"
 type RunOutcome = "missed-launch"
 type ResultAction = ResultTypes.Action
@@ -200,6 +210,8 @@ type Session = {
 	SpeedGovernorAppliedAcceleration: number,
 	SpeedGovernorDisqualified: boolean,
 	SpeedGovernorReleaseAuthorized: boolean,
+	HopProfile: HopTuning?,
+	HopState: HopState?,
 	SteeringForce: VectorForce?,
 	SteeringProfile: SteeringTuning?,
 	SteeringTarget: number,
@@ -260,7 +272,23 @@ type Session = {
 }
 
 type FrostSpeedGovernorApi = {
+	Hop: {
+		validateProfile: (any) -> (boolean, string),
+		createState: (HopTuning, number) -> HopState,
+		admitIntent: (HopState, HopTuning, number, number) -> boolean,
+		isCloseGround: (HopTuning, BasePart, RaycastResult?) -> boolean,
+		tryHop: (HopState, HopTuning, BasePart, number) -> boolean,
+		updateActive: (HopState, HopTuning, BasePart, RaycastResult?) -> boolean,
+		completeLanding: (HopState) -> (),
+		invalidate: (HopState?) -> (),
+	},
 	clear: (Session) -> (),
+	invalidateHop: (Session) -> (),
+	isHopActive: (Session) -> boolean,
+	shouldSuppressStabilityForHop: (Session) -> boolean,
+	suppressGroundedControlsForHop: (Session) -> (),
+	hasExactHopAuthorization: (Session) -> boolean,
+	handleHopIntent: (Player, any, any) -> (),
 	isReleaseAuthoritative: (Session) -> boolean,
 	disqualifyForSeatLoss: (Session) -> (),
 	hasExactAuthorization: (Session) -> boolean,
@@ -1350,6 +1378,13 @@ end
 
 local function transitionTo(session: Session, nextPhase: Phase, deferStateDispatch: boolean?): boolean
 	if session.Phase == nextPhase then
+		if nextPhase == RunPhase.Airborne
+			or nextPhase == RunPhase.Landed
+			or nextPhase == RunPhase.Results
+			or nextPhase == RunPhase.Reset
+		then
+			FrostSpeedGovernor.invalidateHop(session)
+		end
 		if not deferStateDispatch then
 			sendState(session)
 		end
@@ -1368,6 +1403,13 @@ local function transitionTo(session: Session, nextPhase: Phase, deferStateDispat
 		return false
 	end
 
+	if nextPhase == RunPhase.Airborne
+		or nextPhase == RunPhase.Landed
+		or nextPhase == RunPhase.Results
+		or nextPhase == RunPhase.Reset
+	then
+		FrostSpeedGovernor.invalidateHop(session)
+	end
 	session.Phase = nextPhase
 	if nextPhase ~= RunPhase.Countdown then
 		session.CountdownValue = nil
@@ -1763,7 +1805,197 @@ local function updateFrostSteering(
 end
 
 do
-	local controller = {} :: FrostSpeedGovernorApi
+	local controller = {
+		Hop = require(script.Parent.FrostTrailHopController),
+	} :: FrostSpeedGovernorApi
+
+	function controller.invalidateHop(session: Session)
+		if session.CourseId == FROST_TRAIL_COURSE_ID then
+			controller.Hop.invalidate(session.HopState)
+		end
+	end
+
+	function controller.isHopActive(session: Session): boolean
+		local state = session.HopState
+		return session.CourseId == FROST_TRAIL_COURSE_ID
+			and state ~= nil
+			and state.Active
+			and not state.Invalidated
+	end
+
+	function controller.shouldSuppressStabilityForHop(session: Session): boolean
+		local state = session.HopState
+		return session.CourseId == FROST_TRAIL_COURSE_ID
+			and state ~= nil
+			and (state.Active or state.Invalidated)
+	end
+
+	function controller.suppressGroundedControlsForHop(session: Session)
+		disableSteeringForce(session)
+		controller.clear(session)
+
+		local root = session.Sled.Root
+		local stabilityTorque = session.StabilityTorque
+		if stabilityTorque.Name == "GroundedDescentStability"
+			and stabilityTorque.Parent == root
+			and stabilityTorque.Attachment0 == session.TuckAttachment
+			and stabilityTorque.RelativeTo == Enum.ActuatorRelativeTo.World
+		then
+			stabilityTorque.Torque = Vector3.zero
+			stabilityTorque.Enabled = false
+		end
+	end
+
+	function controller.hasExactHopAuthorization(session: Session): boolean
+		local courses = resolvedCourses
+		local course = session.ResolvedCourse
+		local definition = CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID]
+		local profile = session.HopProfile
+		local state = session.HopState
+		return RunService:IsStudio()
+			and courses ~= nil
+			and table.isfrozen(courses)
+			and table.isfrozen(CourseRegistry)
+			and table.isfrozen(CourseRegistry.Definitions)
+			and session.CourseId == FROST_TRAIL_COURSE_ID
+			and courses[FROST_TRAIL_COURSE_ID] == course
+			and table.isfrozen(course)
+			and course.CourseId == FROST_TRAIL_COURSE_ID
+			and course.Definition == definition
+			and table.isfrozen(definition)
+			and definition.ActivationMode == "StudioControlledTest"
+			and definition.RouteMode == "MonotonicZCenterline"
+			and course.World:GetAttribute("CourseId") == FROST_TRAIL_COURSE_ID
+			and course.World:GetAttribute("Playable") == false
+			and course.World:GetAttribute("ActivationMode") == "StudioControlledTest"
+			and FrostTrailConfig.ActivationMode == "StudioControlledTest"
+			and FrostTrailConfig.Playable == false
+			and table.isfrozen(FrostTrailConfig)
+			and profile ~= nil
+			and profile == FrostTrailConfig.Hop
+			and table.isfrozen(profile)
+			and profile.Enabled == true
+			and state ~= nil
+			and not state.Invalidated
+			and hasExactSteeringAuthorization(session)
+			and controller.hasExactAuthorization(session)
+	end
+
+	function controller.handleHopIntent(player: Player, requestedRunId: any, sequenceValue: any)
+		if typeof(requestedRunId) ~= "number"
+			or typeof(sequenceValue) ~= "number"
+			or not isFiniteNumber(requestedRunId)
+			or not isFiniteNumber(sequenceValue)
+			or requestedRunId % 1 ~= 0
+			or sequenceValue % 1 ~= 0
+			or requestedRunId <= 0
+			or sequenceValue < 1
+			or sequenceValue > 2147483647
+		then
+			return
+		end
+
+		local session = sessions[player]
+		if session == nil
+			or sessions[player] ~= session
+			or session.Player ~= player
+			or requestedRunId ~= session.RunId
+			or not isSameSession(session, session.RunId)
+			or session.CleanupStarted
+			or session.Phase ~= RunPhase.Descent
+			or session.ReleaseInProgress
+			or not session.TuckActivationReady
+			or not controller.isReleaseAuthoritative(session)
+			or not controller.hasExactHopAuthorization(session)
+			or session.RampFreedomEntered
+			or not hasExactSteeringOccupant(session)
+		then
+			return
+		end
+
+		local profile = session.HopProfile :: HopTuning
+		local state = session.HopState :: HopState
+		local course = session.ResolvedCourse
+		local sled = session.Sled
+		local root = sled.Root
+		local attachment = session.TuckAttachment
+		local steeringForce = session.SteeringForce
+		local governorForce = session.SpeedGovernorForce
+		local stabilityTorque = session.StabilityTorque
+		if state.Invalidated
+			or player.Parent ~= Players
+			or player.Character ~= session.Character
+			or session.Character.Parent ~= Workspace
+			or session.Humanoid.Parent ~= session.Character
+			or session.Humanoid.Health <= 0
+			or course.World.Parent ~= Workspace
+			or course.Geometry.Parent ~= course.World
+			or course.ActiveSleds.Parent ~= course.World
+			or sled.Model.Parent ~= course.ActiveSleds
+			or sled.Model.PrimaryPart ~= root
+			or root.Parent ~= sled.Model
+			or not root:IsDescendantOf(Workspace)
+			or sled.DriverSeat.Parent ~= sled.Model
+			or sled.DriverSeat.Occupant ~= session.Humanoid
+			or attachment.Name ~= "SledPhysicsAttachment"
+			or attachment.Parent ~= root
+			or steeringForce == nil
+			or steeringForce.Name ~= "FrostTrailSteeringForce"
+			or steeringForce.Parent ~= root
+			or steeringForce.Attachment0 ~= attachment
+			or steeringForce.RelativeTo ~= Enum.ActuatorRelativeTo.World
+			or steeringForce.ApplyAtCenterOfMass ~= true
+			or governorForce == nil
+			or governorForce.Name ~= "FrostTrailSpeedGovernorForce"
+			or governorForce.Parent ~= root
+			or governorForce.Attachment0 ~= attachment
+			or governorForce.RelativeTo ~= Enum.ActuatorRelativeTo.World
+			or governorForce.ApplyAtCenterOfMass ~= true
+			or stabilityTorque.Name ~= "GroundedDescentStability"
+			or stabilityTorque.Parent ~= root
+			or stabilityTorque.Attachment0 ~= attachment
+			or stabilityTorque.RelativeTo ~= Enum.ActuatorRelativeTo.World
+			or root.Anchored
+			or not isFinitePositiveNumber(root.AssemblyMass)
+			or not isFiniteVector3(root.Position)
+			or not isFiniteVector3(root.AssemblyLinearVelocity)
+			or not isFiniteVector3(root.AssemblyAngularVelocity)
+		then
+			controller.invalidateHop(session)
+			return
+		end
+
+		local ownership = captureNetworkOwnership(root)
+		if ownership.OwnerIsServer ~= true or ownership.AutomaticLabel ~= "manual" then
+			return
+		end
+
+		local longitudinal = forwardCoordinate(course, root.Position)
+		local velocity = root.AssemblyLinearVelocity
+		local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+		if not isFiniteNumber(longitudinal)
+			or longitudinal < profile.StartLongitudinal
+			or longitudinal >= profile.EndLongitudinal
+			or not isFiniteNumber(horizontalSpeed)
+			or horizontalSpeed < profile.MinimumHorizontalSpeed
+		then
+			return
+		end
+
+		local now = os.clock()
+		local sequence = sequenceValue :: number
+		if not controller.Hop.admitIntent(state, profile, sequence, now) then
+			return
+		end
+
+		local groundResult = controller.getValidatedGroundResult(session, root)
+		if not controller.Hop.isCloseGround(profile, root, groundResult) then
+			return
+		end
+		if controller.Hop.tryHop(state, profile, root, now) then
+			controller.suppressGroundedControlsForHop(session)
+		end
+	end
 
 	function controller.clear(session: Session)
 		if session.CourseId ~= FROST_TRAIL_COURSE_ID then
@@ -2098,54 +2330,71 @@ function controller.update(
 	governorForce.Enabled = true
 end
 
-function controller.updateGroundedControls(session: Session, runId: number, deltaTime: number)
-	if not isSameSession(session, runId)
-		or session.CleanupStarted
-		or not hasExactSteeringAuthorization(session)
-		or not controller.hasExactAuthorization(session)
-	then
-		clearSteeringState(session)
-		controller.clear(session)
-		return
-	end
+	function controller.updateGroundedControls(session: Session, runId: number, deltaTime: number)
+		if not isSameSession(session, runId)
+			or session.CleanupStarted
+			or not hasExactSteeringAuthorization(session)
+			or not controller.hasExactAuthorization(session)
+		then
+			controller.invalidateHop(session)
+			clearSteeringState(session)
+			controller.clear(session)
+			return
+		end
 
-	if session.Phase == RunPhase.Countdown then
-		disableSteeringForce(session)
-		controller.clear(session)
-		return
-	elseif session.Phase ~= RunPhase.Descent then
-		clearSteeringState(session)
-		controller.clear(session)
-		return
-	end
+		if session.Phase == RunPhase.Countdown then
+			disableSteeringForce(session)
+			controller.clear(session)
+			return
+		elseif session.Phase ~= RunPhase.Descent then
+			clearSteeringState(session)
+			controller.clear(session)
+			return
+		end
 
-	if not hasExactSteeringOccupant(session) then
-		clearSteeringState(session)
-		controller.disqualifyForSeatLoss(session)
-		return
-	elseif session.ReleaseInProgress or not session.TuckActivationReady then
-		disableSteeringForce(session)
-		controller.clear(session)
-		return
-	end
+		if not hasExactSteeringOccupant(session) then
+			controller.invalidateHop(session)
+			clearSteeringState(session)
+			controller.disqualifyForSeatLoss(session)
+			return
+		elseif session.ReleaseInProgress or not session.TuckActivationReady then
+			disableSteeringForce(session)
+			controller.clear(session)
+			return
+		end
 
-	local root = session.Sled.Root
-	local longitudinal = forwardCoordinate(session.ResolvedCourse, root.Position)
-	if root.Parent ~= session.Sled.Model
-		or root.Anchored
-		or not isFiniteVector3(root.Position)
-		or not isFiniteNumber(longitudinal)
-		or longitudinal >= session.ResolvedCourse.LaunchLongitudinal
-	then
-		clearSteeringState(session)
-		controller.clear(session)
-		return
-	end
+		local root = session.Sled.Root
+		local longitudinal = forwardCoordinate(session.ResolvedCourse, root.Position)
+		if root.Parent ~= session.Sled.Model
+			or session.TuckAttachment.Name ~= "SledPhysicsAttachment"
+			or session.TuckAttachment.Parent ~= root
+			or session.HopProfile ~= FrostTrailConfig.Hop
+			or session.HopState == nil
+			or root.Anchored
+			or not isFiniteVector3(root.Position)
+			or not isFiniteNumber(longitudinal)
+			or longitudinal >= session.ResolvedCourse.LaunchLongitudinal
+		then
+			controller.invalidateHop(session)
+			clearSteeringState(session)
+			controller.clear(session)
+			return
+		end
 
-	local groundResult = controller.getValidatedGroundResult(session, root)
-	updateFrostSteering(session, runId, deltaTime, groundResult)
-	controller.update(session, runId, deltaTime, groundResult)
-end
+		local groundResult = controller.getValidatedGroundResult(session, root)
+		controller.Hop.updateActive(
+			session.HopState :: HopState,
+			session.HopProfile :: HopTuning,
+			root,
+			groundResult
+		)
+		if controller.isHopActive(session) then
+			controller.suppressGroundedControlsForHop(session)
+			return
+		end
+		updateFrostSteering(session, runId, deltaTime, groundResult)
+		controller.update(session, runId, deltaTime, groundResult)
+	end
 
 	FrostSpeedGovernor = controller :: FrostSpeedGovernorApi
 end
@@ -2510,6 +2759,10 @@ local function setStabilityActive(session: Session, active: boolean)
 end
 
 local function updateGroundStability(session: Session)
+	if FrostSpeedGovernor.shouldSuppressStabilityForHop(session) then
+		setStabilityActive(session, false)
+		return
+	end
 	if session.Phase ~= RunPhase.Descent
 		or session.CleanupStarted
 		or session.RampFreedomEntered
@@ -2591,6 +2844,7 @@ local function enterRampFreedom(session: Session, runId: number)
 	end
 
 	session.RampFreedomEntered = true
+	FrostSpeedGovernor.invalidateHop(session)
 	resetStallObservation(session)
 	setAntiStallActive(session, runId, false)
 	setStabilityActive(session, false)
@@ -3012,6 +3266,7 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 end
 
 local function cleanupSession(session: Session, runId: number, teleportPlayer: boolean, reason: string)
+	FrostSpeedGovernor.invalidateHop(session)
 	clearSteeringState(session)
 	FrostSpeedGovernor.clear(session)
 	if not isSameSession(session, runId) then
@@ -3188,6 +3443,7 @@ local function requestCleanup(session: Session, runId: number, reason: string, t
 
 	-- This flag is deliberately first: changing Reset state, seating, or physics can fire callbacks.
 	session.CleanupStarted = true
+	FrostSpeedGovernor.invalidateHop(session)
 	session.FirstCleanupReason = reason
 	session.LastAirborneContactSnapshot = nil
 	session.LandingContactDiagnosticsConsumed = nil
@@ -3313,6 +3569,7 @@ local function finishMissedLaunch(session: Session, runId: number, snapshot: Sta
 	end
 
 	session.MissedLaunchConfirmed = true
+	FrostSpeedGovernor.invalidateHop(session)
 	session.Outcome = MISSED_LAUNCH_OUTCOME
 	session.MaximumDescentProgress = math.max(session.MaximumDescentProgress, snapshot.Progress)
 	local root = session.Sled.Root
@@ -3582,6 +3839,7 @@ local function monitorSession(session: Session, runId: number)
 		RunService.Heartbeat:Connect(function(deltaTime: number)
 			if not isSameSession(session, runId) or session.CleanupStarted then
 				if session.CourseId == FROST_TRAIL_COURSE_ID then
+					FrostSpeedGovernor.invalidateHop(session)
 					clearSteeringState(session)
 					FrostSpeedGovernor.clear(session)
 				end
@@ -3599,6 +3857,7 @@ local function monitorSession(session: Session, runId: number)
 			local root = session.Sled.Root
 			local course = session.ResolvedCourse
 			if not root.Parent then
+				FrostSpeedGovernor.invalidateHop(session)
 				local removalReason = if session.ReleaseInProgress then "sled removed during release" else "sled removed"
 				requestCleanup(session, runId, removalReason, true)
 				return
@@ -3733,6 +3992,7 @@ local function connectRunEvents(session: Session, runId: number)
 			session.Sled.DriverSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
 			local seatSeparated = session.Sled.DriverSeat.Occupant ~= session.Humanoid
 			if seatSeparated then
+				FrostSpeedGovernor.invalidateHop(session)
 				FrostSpeedGovernor.disqualifyForSeatLoss(session)
 			end
 			if not isSameSession(session, runId)
@@ -4459,6 +4719,12 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 	local speedProfile: SpeedTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
 		then FrostTrailConfig.Speed
 		else nil
+	local hopProfile: HopTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
+		then FrostTrailConfig.Hop
+		else nil
+	local hopState = if hopProfile
+		then FrostSpeedGovernor.Hop.createState(hopProfile, os.clock())
+		else nil
 	local steeringProfile: SteeringTuning? = if course.CourseId == FROST_TRAIL_COURSE_ID
 		then FrostTrailConfig.Steering
 		else nil
@@ -4491,6 +4757,8 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		SpeedGovernorAppliedAcceleration = 0,
 		SpeedGovernorDisqualified = false,
 		SpeedGovernorReleaseAuthorized = false,
+		HopProfile = hopProfile,
+		HopState = hopState,
 		SteeringForce = steeringForce,
 		SteeringProfile = steeringProfile,
 		SteeringTarget = 0,
@@ -5083,6 +5351,11 @@ local function validateFrostDefinition(definition: CourseDefinition): (boolean, 
 		return false, routeReason
 	end
 
+	local hopValid, hopReason = FrostSpeedGovernor.Hop.validateProfile(FrostTrailConfig.Hop)
+	if not hopValid then
+		return false, hopReason
+	end
+
 	return FrostSpeedGovernor.validateProfile(FrostTrailConfig.Speed, frostRouteData)
 end
 
@@ -5489,6 +5762,7 @@ local function onSteeringIntent(player: Player, requestedRunId: any, sequenceVal
 		or (session.Phase ~= RunPhase.Countdown and session.Phase ~= RunPhase.Descent)
 		or not hasExactSteeringOccupant(session)
 		or session.RampFreedomEntered
+		or FrostSpeedGovernor.isHopActive(session)
 	then
 		return
 	end
@@ -5839,6 +6113,7 @@ function RunManager.start()
 	if RunService:IsStudio() and courses[FROST_TRAIL_COURSE_ID] ~= nil then
 		local steeringRemote = getOrCreateRemote(remoteFolder, STEERING_REMOTE_NAME)
 		steeringRemote.OnServerEvent:Connect(onSteeringIntent)
+		getOrCreateRemote(remoteFolder, "HopIntent").OnServerEvent:Connect(FrostSpeedGovernor.handleHopIntent)
 	end
 	trustedReplay = function(player: Player, courseId: CourseId)
 		startRunSafely(player, courseId, true)

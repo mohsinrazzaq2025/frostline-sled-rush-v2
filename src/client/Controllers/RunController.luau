@@ -122,16 +122,16 @@ end
 local function getFrostSteeringTutorialDetail(): string
 	local lastInputType = UserInputService:GetLastInputType()
 	if lastInputType == Enum.UserInputType.Touch then
-		return "Left thumbstick to steer. Hold TUCK for speed."
+		return "Left thumbstick steers. Tap JUMP to hop. Hold TUCK for speed."
 	elseif isGamepadInput(lastInputType) then
-		return "Left Stick to steer. Hold L2 to TUCK."
+		return "Left Stick steers. Press A to hop. Hold L2 to TUCK."
 	elseif UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
-		return "Left thumbstick to steer. Hold TUCK for speed."
+		return "Left thumbstick steers. Tap JUMP to hop. Hold TUCK for speed."
 	elseif UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
-		return "Left Stick to steer. Hold L2 to TUCK."
+		return "Left Stick steers. Press A to hop. Hold L2 to TUCK."
 	end
 
-	return "A / D or arrow keys to steer. Hold Shift to TUCK."
+	return "A / D or arrows steer. Press SPACE to hop. Hold Shift to TUCK."
 end
 
 local function createHud(defaultTuckInstruction: string, tutorialDetail: string): Hud
@@ -764,6 +764,10 @@ function RunController.start()
 	local tuckTouchSessionCharacter: Model? = nil
 	local tuckTouchButton: GuiObject? = nil
 	local tuckTouchButtonVisible = false
+	local hopSequenceRunId: number? = nil
+	local hopSequence = 0
+	local hopInputHeld = false
+	local hopLastBeginAt = -math.huge
 	local releaseHeldTuckForLifecycle: (() -> ())? = nil
 	local endSteeringForCharacterLifecycle: (() -> ())? = nil
 	local windowFocused = true
@@ -810,6 +814,59 @@ function RunController.start()
 		-- This callback runs only after deferred discovery or a live DescendantAdded
 		-- event, so it always derives visibility from the latest accepted run state.
 		reconcileTuckTouchButtonVisibility()
+	end
+
+	local function clearHopInputState()
+		hopInputHeld = false
+		hopLastBeginAt = -math.huge
+	end
+
+	local function sendHopIntent(): boolean
+		local runId = currentRunId
+		local character = player.Character
+		local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+		local remote = remoteFolder:FindFirstChild("HopIntent")
+		if controllerCleanupStarted
+			or currentPresentationCourseId ~= FROST_TRAIL_COURSE_ID
+			or currentPhase ~= RunPhase.Descent
+			or not serverReleaseAccepted
+			or runId == nil
+			or runId <= 0
+			or runId ~= latestRunId
+			or hopSequenceRunId ~= runId
+			or hopSequence >= 2147483647
+			or character == nil
+			or character ~= tuckTouchSessionCharacter
+			or character.Parent == nil
+			or humanoid == nil
+			or humanoid.Parent ~= character
+			or humanoid.Health <= 0
+			or not windowFocused
+			or GuiService.MenuIsOpen
+			or UserInputService:GetFocusedTextBox() ~= nil
+			or remote == nil
+			or not remote:IsA("RemoteEvent")
+			or remote.Parent ~= remoteFolder
+		then
+			return false
+		end
+
+		hopSequence += 1
+		return pcall(function()
+			(remote :: RemoteEvent):FireServer(runId, hopSequence)
+		end)
+	end
+
+	local function attemptHopIntent(): boolean
+		local now = os.clock()
+		if now - hopLastBeginAt < 0.08 then
+			return false
+		end
+
+		-- Record the physical attempt before validation so a second notification for
+		-- the same press cannot retry or queue an intent that was locally rejected.
+		hopLastBeginAt = now
+		return sendHopIntent()
 	end
 
 	local jumpBlockActive = false
@@ -871,9 +928,36 @@ function RunController.start()
 		humanoid.Jump = false
 	end
 
-	local function hideJumpButton(jumpButton: GuiObject, captureBaseline: boolean)
+	local function shouldShowNativeJumpButton(): boolean
+		local runId = currentRunId
+		local character = tuckTouchSessionCharacter
+		local humanoid = blockedHumanoid
+		return UserInputService.TouchEnabled
+			and jumpBlockActive
+			and not jumpBlockDestroyed
+			and not controllerCleanupStarted
+			and currentPresentationCourseId == FROST_TRAIL_COURSE_ID
+			and currentPhase == RunPhase.Descent
+			and serverReleaseAccepted
+			and windowFocused
+			and character ~= nil
+			and player.Character == character
+			and character.Parent ~= nil
+			and humanoid ~= nil
+			and humanoid.Parent == character
+			and humanoid.Health > 0
+			and runId ~= nil
+			and runId > 0
+			and runId == latestRunId
+	end
+
+	local function reconcileJumpButton(jumpButton: GuiObject, captureBaseline: boolean)
+		if not jumpBlockActive then
+			return
+		end
+
 		if jumpButtonVisibilityConnections[jumpButton] == nil then
-			if captureBaseline then
+			if captureBaseline or jumpVisibilityBaseline == nil then
 				jumpVisibilityBaseline = jumpButton.Visible
 			end
 			if jumpVisibilityBaseline ~= nil then
@@ -882,19 +966,25 @@ function RunController.start()
 			jumpButtonVisibilityConnections[jumpButton] = jumpButton
 				:GetPropertyChangedSignal("Visible")
 				:Connect(function()
-					if jumpBlockActive and jumpButton.Parent and jumpButton.Visible then
-						jumpButton.Visible = false
+					if jumpBlockActive and jumpButton.Parent then
+						local shouldBeVisible = shouldShowNativeJumpButton()
+						if jumpButton.Visible ~= shouldBeVisible then
+							jumpButton.Visible = shouldBeVisible
+						end
 					end
 				end)
 		end
 
-		jumpButton.Visible = false
+		local shouldBeVisible = shouldShowNativeJumpButton()
+		if jumpButton.Visible ~= shouldBeVisible then
+			jumpButton.Visible = shouldBeVisible
+		end
 	end
 
-	local function hideCurrentJumpButton(captureBaseline: boolean)
+	local function reconcileCurrentJumpButtonVisibility(captureBaseline: boolean)
 		local jumpButton = findDefaultJumpButton(playerGui)
 		if jumpButton then
-			hideJumpButton(jumpButton, captureBaseline)
+			reconcileJumpButton(jumpButton, captureBaseline)
 		end
 	end
 
@@ -915,15 +1005,24 @@ function RunController.start()
 
 	local function handleBlockedJump(
 		_actionName: string,
-		_inputState: Enum.UserInputState,
+		inputState: Enum.UserInputState,
 		_inputObject: InputObject
 	): Enum.ContextActionResult
 		clearPendingJump()
+		if inputState == Enum.UserInputState.Begin then
+			if not hopInputHeld then
+				hopInputHeld = true
+				attemptHopIntent()
+			end
+		elseif inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel then
+			hopInputHeld = false
+		end
 		return Enum.ContextActionResult.Sink
 	end
 
 	local function deactivateJumpBlock()
 		clearPendingJump()
+		clearHopInputState()
 		jumpBlockActive = false
 		if jumpActionBound then
 			jumpActionBound = false
@@ -941,7 +1040,7 @@ function RunController.start()
 		end
 		if jumpBlockActive then
 			clearPendingJump()
-			hideCurrentJumpButton(false)
+			reconcileCurrentJumpButtonVisibility(false)
 			return true
 		end
 
@@ -957,8 +1056,11 @@ function RunController.start()
 				Enum.KeyCode.ButtonA
 			)
 			jumpActionBound = true
-			hideCurrentJumpButton(true)
+			-- Capture Roblox's visibility before disabling the Humanoid Jumping state,
+			-- then reconcile again once the blocker owns that Humanoid.
+			reconcileCurrentJumpButtonVisibility(true)
 			blockCurrentHumanoid()
+			reconcileCurrentJumpButtonVisibility(false)
 		end)
 		if not succeeded then
 			deactivateJumpBlock()
@@ -1007,6 +1109,9 @@ function RunController.start()
 	table.insert(jumpLifecycleConnections, UserInputService.JumpRequest:Connect(function()
 		if jumpBlockActive then
 			clearPendingJump()
+			if not hopInputHeld then
+				attemptHopIntent()
+			end
 		end
 	end))
 	table.insert(jumpLifecycleConnections, playerGui.DescendantAdded:Connect(function(descendant: Instance)
@@ -1018,10 +1123,11 @@ function RunController.start()
 			and touchGui
 			and descendant:IsDescendantOf(touchGui)
 		then
-			hideJumpButton(descendant, false)
+			reconcileJumpButton(descendant, false)
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterRemoving:Connect(function(_character: Model)
+		clearHopInputState()
 		local endSteering = endSteeringForCharacterLifecycle
 		if endSteering then
 			endSteering()
@@ -1032,11 +1138,13 @@ function RunController.start()
 		end
 		tuckTouchSessionCharacter = nil
 		reconcileTuckTouchButtonVisibility()
+		reconcileCurrentJumpButtonVisibility(false)
 		if jumpBlockActive then
 			cancelJumpBlockForCurrentRun()
 		end
 	end))
 	table.insert(jumpLifecycleConnections, player.CharacterAdded:Connect(function(_character: Model)
+		clearHopInputState()
 		local endSteering = endSteeringForCharacterLifecycle
 		if endSteering then
 			endSteering()
@@ -1047,6 +1155,7 @@ function RunController.start()
 		end
 		tuckTouchSessionCharacter = nil
 		reconcileTuckTouchButtonVisibility()
+		reconcileCurrentJumpButtonVisibility(false)
 		if jumpBlockActive then
 			cancelJumpBlockForCurrentRun()
 		end
@@ -1194,7 +1303,7 @@ function RunController.start()
 	local function refreshInputCopy()
 		defaultTuckInstruction, prepareTuckInstruction, tutorialDetail, activeTuckInstruction = getTuckInputCopy()
 		if isFrostPresentation() then
-			hud.TutorialTitle.Text = "STEER THE FROST TRAIL"
+			hud.TutorialTitle.Text = "CONTROL THE FROST TRAIL"
 			hud.TutorialDetail.Text = getFrostSteeringTutorialDetail()
 		else
 			hud.TutorialTitle.Text = "TUCK FOR MORE SPEED"
@@ -1464,6 +1573,7 @@ function RunController.start()
 		local nextCourseId = if typeof(attributeValue) == "string" then attributeValue else nil
 		local previousCourseId = currentPresentationCourseId
 		if nextCourseId ~= previousCourseId then
+			clearHopInputState()
 			if previousCourseId == FROST_TRAIL_COURSE_ID and nextCourseId ~= FROST_TRAIL_COURSE_ID then
 				endSteeringSender(true)
 			end
@@ -1479,6 +1589,7 @@ function RunController.start()
 			updatePhaseFeedback()
 		end
 		reconcileSteeringSender()
+		reconcileCurrentJumpButtonVisibility(false)
 	end
 
 	local function sendTuckIntent(
@@ -1608,9 +1719,13 @@ function RunController.start()
 	reconcilePresentationCourse()
 	table.insert(runControllerConnections, UserInputService.WindowFocusReleased:Connect(function()
 		windowFocused = false
+		clearHopInputState()
+		reconcileCurrentJumpButtonVisibility(false)
 	end))
 	table.insert(runControllerConnections, UserInputService.WindowFocused:Connect(function()
 		windowFocused = true
+		clearHopInputState()
+		reconcileCurrentJumpButtonVisibility(false)
 	end))
 
 	table.insert(runControllerConnections, UserInputService.LastInputTypeChanged:Connect(function(_lastInputType)
@@ -1630,6 +1745,7 @@ function RunController.start()
 		if typeof(phase) ~= "string"
 			or typeof(runId) ~= "number"
 			or runId % 1 ~= 0
+			or runId <= 0
 		then
 			return
 		end
@@ -1651,7 +1767,12 @@ function RunController.start()
 		then
 			releaseHeldTuck()
 		end
+		if runChanged or previousPhase ~= phase then
+			clearHopInputState()
+		end
 		if runId > latestRunId then
+			hopSequenceRunId = runId
+			hopSequence = 0
 			latestRunId = runId
 		end
 		if runChanged then
@@ -1677,9 +1798,6 @@ function RunController.start()
 		end
 
 		currentPhase = phase
-		reconcileSteeringSender()
-		reconcileTuckTouchButtonVisibility()
-		updateJumpBlockForPhase(runId)
 		serverTuckQueued = if typeof(tuckQueued) == "boolean" then tuckQueued else false
 		serverTucking = if typeof(tucking) == "boolean" then tucking else false
 		serverReleaseAccepted = if typeof(releaseAccepted) == "boolean" then releaseAccepted else false
@@ -1688,6 +1806,10 @@ function RunController.start()
 			and outcome == MISSED_LAUNCH_OUTCOME
 			then MISSED_LAUNCH_OUTCOME
 			else nil
+		reconcileSteeringSender()
+		reconcileTuckTouchButtonVisibility()
+		updateJumpBlockForPhase(runId)
+		reconcileCurrentJumpButtonVisibility(false)
 
 		updatePhaseFeedback()
 		local presentationSpeed = 0
@@ -1744,9 +1866,13 @@ function RunController.start()
 		end
 		endSteeringSender(true)
 		releaseHeldTuck()
+		clearHopInputState()
+		hopSequenceRunId = nil
+		hopSequence = 0
 		controllerCleanupStarted = true
 		tuckTouchSessionCharacter = nil
 		reconcileTuckTouchButtonVisibility()
+		reconcileCurrentJumpButtonVisibility(false)
 		tuckBadgePulseGeneration += 1
 		if touchLayoutCleanup then
 			touchLayoutCleanup()

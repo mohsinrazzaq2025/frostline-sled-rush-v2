@@ -56,6 +56,23 @@ export type SpeedTuning = {
 	Zones: { SpeedZone },
 }
 
+export type HopTuning = {
+	Enabled: boolean,
+	VerticalDeltaVelocity: number,
+	CooldownSeconds: number,
+	StartLongitudinal: number,
+	EndLongitudinal: number,
+	MinimumHorizontalSpeed: number,
+	GroundRayDistance: number,
+	MaximumGroundHitDistance: number,
+	MinimumGroundNormalY: number,
+	MaximumAbsoluteGroundNormalSpeed: number,
+	MaximumSequence: number,
+	MaximumSequenceJump: number,
+	ServerRateTokensPerSecond: number,
+	ServerRateBucketCapacity: number,
+}
+
 export type SteeringTuning = {
 	Enabled: boolean,
 	InputQuantizationSteps: number,
@@ -113,6 +130,7 @@ export type FrostTrailConfig = {
 	PathPoints: { Vector3 },
 	RouteData: RouteData,
 	Speed: SpeedTuning,
+	Hop: HopTuning,
 	Steering: SteeringTuning,
 	Sections: { SectionDefinition },
 	WidenedRouteZones: { RouteWidthZone },
@@ -440,6 +458,24 @@ local speed: SpeedTuning = {
 }
 table.freeze(speed)
 
+local hop: HopTuning = {
+	Enabled = true,
+	VerticalDeltaVelocity = 59.4,
+	CooldownSeconds = 0.10,
+	StartLongitudinal = -200,
+	EndLongitudinal = 6000,
+	MinimumHorizontalSpeed = 12,
+	GroundRayDistance = 5,
+	MaximumGroundHitDistance = 1.10,
+	MinimumGroundNormalY = 0.90,
+	MaximumAbsoluteGroundNormalSpeed = 8,
+	MaximumSequence = 2147483647,
+	MaximumSequenceJump = 32,
+	ServerRateTokensPerSecond = 6,
+	ServerRateBucketCapacity = 3,
+}
+table.freeze(hop)
+
 local steering: SteeringTuning = {
 	Enabled = true,
 	InputQuantizationSteps = 20,
@@ -498,6 +534,7 @@ local config: FrostTrailConfig = {
 	PathPoints = pathPoints,
 	RouteData = routeData,
 	Speed = speed,
+	Hop = hop,
 	Steering = steering,
 	Sections = sections,
 	WidenedRouteZones = widenedRouteZones,
