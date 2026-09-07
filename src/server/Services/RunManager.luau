@@ -4395,7 +4395,7 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 			or world:GetAttribute("TrackStartLongitudinal") ~= FrostTrailConfig.PathPoints[1].Z
 			or world:GetAttribute("LaunchLongitudinal") ~= 6350
 			or world:GetAttribute("AuthoredPathLengthStuds") ~= FrostTrailConfig.RouteData.AuthoredPathLengthStuds
-			or world:GetAttribute("BasePartCount") ~= 447
+			or world:GetAttribute("BasePartCount") ~= 628
 			or launchEdge.Anchored ~= true
 			or launchEdge.Transparency ~= 1
 			or launchEdge.CanCollide ~= false
@@ -5540,8 +5540,8 @@ local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedC
 			or world:GetAttribute("OriginY") ~= FrostTrailConfig.WorldOrigin.Y
 			or world:GetAttribute("OriginZ") ~= FrostTrailConfig.WorldOrigin.Z
 			or world:GetAttribute("TrackStartLongitudinal") ~= FrostTrailConfig.PathPoints[1].Z
-			or world:GetAttribute("BasePartCount") ~= 447
-			or frostPartCount ~= 447
+			or world:GetAttribute("BasePartCount") ~= 628
+			or frostPartCount ~= 628
 			or world:GetAttribute("LaunchLongitudinal") ~= 6350
 			or world:GetAttribute("AuthoredPathLengthStuds") ~= FrostTrailConfig.RouteData.AuthoredPathLengthStuds
 			or launchEdge.Anchored ~= true

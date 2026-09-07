@@ -112,9 +112,9 @@ if frostTrailWorldBuilder then
 				verifiedPartCount += 1
 			end
 		end
-		if basePartCount ~= 447 or verifiedPartCount ~= 447
+		if basePartCount ~= 628 or verifiedPartCount ~= 628
 		then
-			warn("[Frostline][FrostTrail] World model does not contain the validated 447 parts")
+			warn("[Frostline][FrostTrail] World model does not contain the validated 628 parts")
 		else
 			print(string.format("[Frostline] Frost Trail controlled test world generated (%d parts)", basePartCount))
 		end

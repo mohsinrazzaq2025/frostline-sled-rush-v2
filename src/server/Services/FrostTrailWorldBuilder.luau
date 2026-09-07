@@ -4,6 +4,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
 local FrostTrailConfig = require(script.Parent.FrostTrailConfig)
+local FrostTrailRouteContentConfig = require(script.Parent.FrostTrailRouteContentConfig)
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local PHYSICS = GameConfig.Physics
@@ -16,11 +17,18 @@ local EXPECTED_BASE_CHORDS = 56
 local EXPECTED_GEOMETRY_POINTS = 75
 local EXPECTED_GEOMETRY_SEGMENTS = 74
 local EXPECTED_AUTHORED_LENGTH = 6696.671726289
-local EXPECTED_BASE_PART_COUNT = 447
+local EXPECTED_BASE_PART_COUNT = 628
 local EXPECTED_COLLIDABLE_COUNT = 229
-local EXPECTED_SHADOW_COUNT = 68
+local EXPECTED_SHADOW_COUNT = 89
 local EXPECTED_MARKER_COUNT = 15
 local EXPECTED_DECOR_COUNT = 129
+local EXPECTED_GAMEPLAY_PART_COUNT = 181
+local EXPECTED_COIN_COUNT = 160
+local EXPECTED_OBSTACLE_COUNT = 21
+local EXPECTED_OBSTACLE_ROW_COUNT = 18
+local EXPECTED_ICE_BLOCKER_COUNT = 14
+local EXPECTED_HOP_BARRIER_COUNT = 7
+local NOMINAL_HOP_APEX_GAIN = 8.9917
 local TRACK_SURFACE_ATTRIBUTE = "FrostlineTrackSurface"
 local SHOULDER_THICKNESS = 4
 local SHOULDER_SURFACE_GAP = 0.05
@@ -66,6 +74,11 @@ local REQUIRED_SECTIONS = table.freeze({
 local RIGHT_DIRECTION = FrostTrailConfig.ForwardDirection:Cross(Vector3.yAxis).Unit
 
 type RouteGeometryPoint = FrostTrailConfig.RouteGeometryPoint
+type CoinPattern = FrostTrailRouteContentConfig.CoinPattern
+type CoinPlacement = FrostTrailRouteContentConfig.CoinPlacement
+type ObstacleKind = FrostTrailRouteContentConfig.ObstacleKind
+type ObstacleRowDefinition = FrostTrailRouteContentConfig.ObstacleRowDefinition
+type ObstaclePlacement = FrostTrailRouteContentConfig.ObstaclePlacement
 
 type SegmentPlan = {
 	PointA: Vector3,
@@ -84,6 +97,175 @@ type Bounds = {
 	Minimum: Vector3,
 	Maximum: Vector3,
 }
+
+type RouteSample = {
+	Frame: CFrame,
+	TrackWidth: number,
+	ClearPlayableWidth: number,
+}
+
+type CoinGroupExpectation = {
+	GroupId: string,
+	SectionId: string,
+	Pattern: CoinPattern,
+	Count: number,
+	StartLongitudinal: number,
+	EndLongitudinal: number,
+	LaneOffsets: { number },
+	HeightOffsets: { number },
+}
+
+type ObstacleRowExpectation = {
+	EncounterId: string,
+	SectionId: string,
+	Longitudinal: number,
+	ObstacleKind: ObstacleKind,
+	LaneOffsets: { number },
+}
+
+local function frozenNumbers(values: { number }): { number }
+	return table.freeze(values)
+end
+
+local function expectedCoinGroup(
+	groupId: string,
+	sectionId: string,
+	pattern: CoinPattern,
+	count: number,
+	startLongitudinal: number,
+	endLongitudinal: number,
+	laneOffsets: { number },
+	heightOffsets: { number }
+): CoinGroupExpectation
+	return table.freeze({
+		GroupId = groupId,
+		SectionId = sectionId,
+		Pattern = pattern,
+		Count = count,
+		StartLongitudinal = startLongitudinal,
+		EndLongitudinal = endLongitudinal,
+		LaneOffsets = frozenNumbers(laneOffsets),
+		HeightOffsets = frozenNumbers(heightOffsets),
+	})
+end
+
+local EXPECTED_COIN_GROUPS: { CoinGroupExpectation } = table.freeze({
+	expectedCoinGroup("SC01", "SummitCamp", "Line", 6, -160, 40, { 0 }, { 3.5 }),
+	expectedCoinGroup("SC02", "SummitCamp", "Sweep", 5, 100, 260, { 0, -24 }, { 3.5 }),
+	expectedCoinGroup("SC03", "SummitCamp", "Arc", 3, 388, 412, { 0 }, { 3.5, 8.5, 3.5 }),
+	expectedCoinGroup("PS01", "PineSlalom", "Parallel", 10, 520, 680, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("PS02", "PineSlalom", "Line", 7, 760, 1180, { -24 }, { 3.5 }),
+	expectedCoinGroup("PS03", "PineSlalom", "Arc", 5, 1264, 1296, { 0 }, { 3.5, 6.25, 8.5, 6.25, 3.5 }),
+	expectedCoinGroup("CC01", "CrystalCave", "Parallel", 8, 1400, 1550, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("CC02", "CrystalCave", "Line", 4, 1630, 1810, { 24 }, { 3.5 }),
+	expectedCoinGroup("CC03", "CrystalCave", "Line", 3, 1880, 2000, { 0 }, { 3.5 }),
+	expectedCoinGroup("CC04", "CrystalCave", "Arc", 5, 2094, 2126, { 24 }, { 3.5, 6.25, 8.5, 6.25, 3.5 }),
+	expectedCoinGroup("GB01", "GlacierBridge", "Line", 4, 2270, 2450, { 0 }, { 3.5 }),
+	expectedCoinGroup("GB02", "GlacierBridge", "Parallel", 8, 2520, 2700, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("GB03", "GlacierBridge", "Line", 3, 2770, 2890, { 24 }, { 3.5 }),
+	expectedCoinGroup("GB04", "GlacierBridge", "Arc", 3, 2928, 2952, { -24 }, { 3.5, 8.5, 3.5 }),
+	expectedCoinGroup("AP01", "AvalanchePass", "Line", 3, 3040, 3160, { 0 }, { 3.5 }),
+	expectedCoinGroup("AP02", "AvalanchePass", "Parallel", 10, 3200, 3440, { -42, 42 }, { 3.5 }),
+	expectedCoinGroup("AP03", "AvalanchePass", "Arc", 5, 3442, 3498, { 0 }, { 3.5, 6.25, 8.5, 6.25, 3.5 }),
+	expectedCoinGroup("AP04", "AvalanchePass", "Parallel", 6, 3510, 3710, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("FV01", "FrozenVillage", "Parallel", 8, 3860, 4070, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("FV02", "FrozenVillage", "Line", 5, 4150, 4350, { 24 }, { 3.5 }),
+	expectedCoinGroup("FV03", "FrozenVillage", "Arc", 5, 4364, 4396, { -24 }, { 3.5, 6.25, 8.5, 6.25, 3.5 }),
+	expectedCoinGroup("FV04", "FrozenVillage", "Parallel", 4, 4540, 4640, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("FR01", "FrozenRiver", "Parallel", 6, 4700, 4800, { -24, 24 }, { 3.5 }),
+	expectedCoinGroup("FR02", "FrozenRiver", "Line", 4, 4870, 5050, { 24 }, { 3.5 }),
+	expectedCoinGroup("FR03", "FrozenRiver", "Arc", 5, 5084, 5116, { 0 }, { 3.5, 6.25, 8.5, 6.25, 3.5 }),
+	expectedCoinGroup("FR04", "FrozenRiver", "Line", 5, 5160, 5360, { 24 }, { 3.5 }),
+	expectedCoinGroup("FR05", "FrozenRiver", "Sweep", 4, 5430, 5550, { 24, 0 }, { 3.5 }),
+	expectedCoinGroup("AC01", "AlpineChute", "Line", 3, 5580, 5660, { 24 }, { 3.5 }),
+	expectedCoinGroup("AC02", "AlpineChute", "Sweep", 5, 5700, 5860, { 24, 0 }, { 3.5 }),
+	expectedCoinGroup("AC03", "AlpineChute", "Arc", 3, 5896, 5944, { 0 }, { 3.5, 8.5, 3.5 }),
+	expectedCoinGroup("AC04", "AlpineChute", "Line", 5, 5980, 6060, { 0 }, { 3.5 }),
+})
+
+local function expectedObstacleRow(
+	encounterId: string,
+	sectionId: string,
+	longitudinal: number,
+	obstacleKind: ObstacleKind,
+	laneOffsets: { number }
+): ObstacleRowExpectation
+	return table.freeze({
+		EncounterId = encounterId,
+		SectionId = sectionId,
+		Longitudinal = longitudinal,
+		ObstacleKind = obstacleKind,
+		LaneOffsets = frozenNumbers(laneOffsets),
+	})
+end
+
+local EXPECTED_OBSTACLE_ROWS: { ObstacleRowExpectation } = table.freeze({
+	expectedObstacleRow("FrostRow_01", "SummitCamp", 400, "HopBarrier", { 0 }),
+	expectedObstacleRow("FrostRow_02", "PineSlalom", 720, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_03", "PineSlalom", 1040, "IceBlocker", { 24 }),
+	expectedObstacleRow("FrostRow_04", "PineSlalom", 1280, "HopBarrier", { 0 }),
+	expectedObstacleRow("FrostRow_05", "CrystalCave", 1600, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_06", "CrystalCave", 1840, "IceBlocker", { -24 }),
+	expectedObstacleRow("FrostRow_07", "CrystalCave", 2110, "HopBarrier", { 24 }),
+	expectedObstacleRow("FrostRow_08", "GlacierBridge", 2460, "IceBlocker", { -24, 24 }),
+	expectedObstacleRow("FrostRow_09", "GlacierBridge", 2720, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_10", "GlacierBridge", 2940, "HopBarrier", { -24 }),
+	expectedObstacleRow("FrostRow_11", "AvalanchePass", 3300, "IceBlocker", { -24, 24 }),
+	expectedObstacleRow("FrostRow_12", "AvalanchePass", 3470, "HopBarrier", { 0 }),
+	expectedObstacleRow("FrostRow_13", "AvalanchePass", 3740, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_14", "FrozenVillage", 4110, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_15", "FrozenVillage", 4380, "HopBarrier", { -24 }),
+	expectedObstacleRow("FrostRow_16", "FrozenRiver", 4820, "IceBlocker", { 0 }),
+	expectedObstacleRow("FrostRow_17", "FrozenRiver", 5100, "HopBarrier", { 0 }),
+	expectedObstacleRow("FrostRow_18", "FrozenRiver", 5390, "IceBlocker", { -24, 0 }),
+})
+
+local EXPECTED_COIN_SECTION_COUNTS: { [string]: number } = table.freeze({
+	SummitCamp = 14,
+	PineSlalom = 22,
+	CrystalCave = 20,
+	GlacierBridge = 18,
+	AvalanchePass = 24,
+	FrozenVillage = 22,
+	FrozenRiver = 24,
+	AlpineChute = 16,
+	LandingLake = 0,
+})
+
+local EXPECTED_OBSTACLE_SECTION_COUNTS: { [string]: number } = table.freeze({
+	SummitCamp = 1,
+	PineSlalom = 3,
+	CrystalCave = 3,
+	GlacierBridge = 4,
+	AvalanchePass = 4,
+	FrozenVillage = 2,
+	FrozenRiver = 4,
+	AlpineChute = 0,
+	LandingLake = 0,
+})
+
+local COIN_ATTRIBUTE_NAMES: { string } = table.freeze({
+	"ContentId",
+	"ContentKind",
+	"SectionId",
+	"GroupId",
+	"Pattern",
+	"Longitudinal",
+	"LateralOffset",
+	"HeightOffset",
+	"RuntimeEnabled",
+})
+
+local OBSTACLE_ATTRIBUTE_NAMES: { string } = table.freeze({
+	"ContentId",
+	"ContentKind",
+	"SectionId",
+	"EncounterId",
+	"ObstacleKind",
+	"Longitudinal",
+	"LateralOffset",
+	"RuntimeEnabled",
+})
 
 local function fail(message: string): never
 	error("Frost Trail world: " .. message, 0)
@@ -113,6 +295,214 @@ end
 
 local function validateExactVector(actual: Vector3, expected: Vector3, name: string)
 	requireCondition(actual == expected, name .. " does not match the authored value")
+end
+
+local function inclusiveValue(startValue: number, endValue: number, index: number, count: number): number
+	if count == 1 then
+		return startValue
+	end
+	return startValue + (endValue - startValue) * ((index - 1) / (count - 1))
+end
+
+local function expectedCoinValues(group: CoinGroupExpectation, index: number): (number, number, number)
+	if group.Pattern == "Parallel" then
+		local perLane = group.Count / 2
+		local laneIndex = math.floor((index - 1) / perLane) + 1
+		local indexInLane = ((index - 1) % perLane) + 1
+		return inclusiveValue(group.StartLongitudinal, group.EndLongitudinal, indexInLane, perLane),
+			group.LaneOffsets[laneIndex],
+			group.HeightOffsets[1]
+	end
+
+	local longitudinal = inclusiveValue(group.StartLongitudinal, group.EndLongitudinal, index, group.Count)
+	if group.Pattern == "Sweep" then
+		return longitudinal,
+			inclusiveValue(group.LaneOffsets[1], group.LaneOffsets[2], index, group.Count),
+			group.HeightOffsets[1]
+	elseif group.Pattern == "Arc" then
+		return longitudinal, group.LaneOffsets[1], group.HeightOffsets[index]
+	end
+	return longitudinal, group.LaneOffsets[1], group.HeightOffsets[1]
+end
+
+local function tableEntryCount(value: { [any]: any }): number
+	local count = 0
+	for _ in value do
+		count += 1
+	end
+	return count
+end
+
+local function validateRouteContentConfiguration()
+	local config = FrostTrailRouteContentConfig
+	requireCondition(table.isfrozen(config), "route-content configuration must be frozen")
+	requireCondition(config.CourseId == "FrostTrailV1", "route-content CourseId mismatch")
+	requireCondition(config.ContentVersion == 1, "route-content version mismatch")
+	requireCondition(config.RuntimeEnabled == false, "route content must remain disabled")
+	requireCondition(config.GroundCoinHeight == 3.5, "ground-coin height mismatch")
+	validateExactVector(config.CoinSize, Vector3.new(0.75, 3.6, 3.6), "route-content CoinSize")
+	validateExactVector(config.IceBlockerSize, Vector3.new(12, 6, 5), "route-content IceBlockerSize")
+	validateExactVector(config.HopBarrierSize, Vector3.new(16, 3, 3), "route-content HopBarrierSize")
+	for _, size in ipairs({ config.CoinSize, config.IceBlockerSize, config.HopBarrierSize }) do
+		requireCondition(
+			isFiniteVector3(size) and size.X > 0 and size.Y > 0 and size.Z > 0,
+			"route-content sizes must be finite and positive"
+		)
+	end
+
+	requireCondition(table.isfrozen(config.CoinPlacements), "CoinPlacements must be frozen")
+	requireCondition(table.isfrozen(config.ObstacleRows), "ObstacleRows must be frozen")
+	requireCondition(table.isfrozen(config.ObstaclePlacements), "ObstaclePlacements must be frozen")
+	requireCondition(#config.CoinPlacements == EXPECTED_COIN_COUNT, "coin-placement count mismatch")
+	requireCondition(#config.ObstacleRows == EXPECTED_OBSTACLE_ROW_COUNT, "obstacle-row count mismatch")
+	requireCondition(#config.ObstaclePlacements == EXPECTED_OBSTACLE_COUNT, "obstacle-placement count mismatch")
+
+	local coinSectionCounts: { [string]: number } = {}
+	local obstacleSectionCounts: { [string]: number } = {}
+	for _, section in ipairs(FrostTrailConfig.Sections) do
+		coinSectionCounts[section.SectionId] = 0
+		obstacleSectionCounts[section.SectionId] = 0
+	end
+
+	local coinIndex = 0
+	local seenCoinIds: { [string]: boolean } = {}
+	for _, expectedGroup in ipairs(EXPECTED_COIN_GROUPS) do
+		for indexInGroup = 1, expectedGroup.Count do
+			coinIndex += 1
+			local placement = config.CoinPlacements[coinIndex]
+			requireCondition(placement ~= nil, "missing expanded coin placement")
+			local expectedLongitudinal, expectedLateral, expectedHeight = expectedCoinValues(expectedGroup, indexInGroup)
+			local expectedId = string.format("FrostCoin_%03d", coinIndex)
+			requireCondition(table.isfrozen(placement), expectedId .. " placement must be frozen")
+			requireCondition(tableEntryCount(placement :: any) == 7, expectedId .. " placement field count mismatch")
+			requireCondition(placement.ContentId == expectedId, expectedId .. " stable ID mismatch")
+			requireCondition(not seenCoinIds[placement.ContentId], expectedId .. " stable ID is duplicated")
+			seenCoinIds[placement.ContentId] = true
+			requireCondition(placement.SectionId == expectedGroup.SectionId, expectedId .. " section mismatch")
+			requireCondition(placement.GroupId == expectedGroup.GroupId, expectedId .. " group mismatch")
+			requireCondition(placement.Pattern == expectedGroup.Pattern, expectedId .. " pattern mismatch")
+			requireCondition(
+				isFiniteNumber(placement.Longitudinal)
+					and isFiniteNumber(placement.LateralOffset)
+					and isFiniteNumber(placement.HeightOffset),
+				expectedId .. " placement must be finite"
+			)
+			requireCondition(
+				approximatelyEqual(placement.Longitudinal, expectedLongitudinal, FrostTrailConfig.ValidationEpsilon),
+				expectedId .. " longitudinal mismatch"
+			)
+			requireCondition(
+				approximatelyEqual(placement.LateralOffset, expectedLateral, FrostTrailConfig.ValidationEpsilon),
+				expectedId .. " lateral offset mismatch"
+			)
+			requireCondition(
+				approximatelyEqual(placement.HeightOffset, expectedHeight, FrostTrailConfig.ValidationEpsilon),
+				expectedId .. " height offset mismatch"
+			)
+			if placement.Pattern == "Arc" then
+				requireCondition(placement.HeightOffset <= NOMINAL_HOP_APEX_GAIN, expectedId .. " exceeds the hop envelope")
+			else
+				requireCondition(placement.HeightOffset == config.GroundCoinHeight, expectedId .. " ground height mismatch")
+			end
+			requireCondition(placement.Longitudinal < 6100, expectedId .. " enters the clear launch interval")
+			local previousSectionCount = coinSectionCounts[placement.SectionId]
+			requireCondition(previousSectionCount ~= nil, expectedId .. " has an unknown section")
+			coinSectionCounts[placement.SectionId] = (previousSectionCount :: number) + 1
+		end
+	end
+	requireCondition(coinIndex == EXPECTED_COIN_COUNT, "coin groups did not consume exactly 160 placements")
+
+	local obstacleIndex = 0
+	local iceBlockerCount = 0
+	local hopBarrierCount = 0
+	local seenObstacleIds: { [string]: boolean } = {}
+	for rowIndex, expectedRow in ipairs(EXPECTED_OBSTACLE_ROWS) do
+		local row = config.ObstacleRows[rowIndex]
+		requireCondition(row ~= nil, "missing obstacle row")
+		requireCondition(table.isfrozen(row), expectedRow.EncounterId .. " must be frozen")
+		requireCondition(table.isfrozen(row.LaneOffsets), expectedRow.EncounterId .. " lanes must be frozen")
+		requireCondition(tableEntryCount(row :: any) == 5, expectedRow.EncounterId .. " field count mismatch")
+		requireCondition(row.EncounterId == expectedRow.EncounterId, expectedRow.EncounterId .. " ID mismatch")
+		requireCondition(row.SectionId == expectedRow.SectionId, expectedRow.EncounterId .. " section mismatch")
+		requireCondition(row.Longitudinal == expectedRow.Longitudinal, expectedRow.EncounterId .. " longitudinal mismatch")
+		requireCondition(row.ObstacleKind == expectedRow.ObstacleKind, expectedRow.EncounterId .. " kind mismatch")
+		requireCondition(#row.LaneOffsets == #expectedRow.LaneOffsets, expectedRow.EncounterId .. " lane count mismatch")
+		for laneIndex, expectedLane in ipairs(expectedRow.LaneOffsets) do
+			requireCondition(row.LaneOffsets[laneIndex] == expectedLane, expectedRow.EncounterId .. " lane mismatch")
+		end
+		if rowIndex > 1 then
+			requireCondition(
+				row.Longitudinal - config.ObstacleRows[rowIndex - 1].Longitudinal >= 170,
+				expectedRow.EncounterId .. " is too close to its preceding row"
+			)
+		end
+
+		local occupiedNormalLanes: { [number]: boolean } = {}
+		for _, laneOffset in ipairs(row.LaneOffsets) do
+			occupiedNormalLanes[laneOffset] = true
+		end
+		local hasGroundBypass = false
+		for _, normalLane in ipairs(FrostTrailConfig.LaneCenterOffsets) do
+			if not occupiedNormalLanes[normalLane] then
+				hasGroundBypass = true
+				break
+			end
+		end
+		requireCondition(hasGroundBypass, expectedRow.EncounterId .. " must leave a normal ground bypass")
+		if row.ObstacleKind == "HopBarrier" then
+			requireCondition(#row.LaneOffsets < 3, expectedRow.EncounterId .. " must leave a steering bypass")
+			for otherIndex, otherRow in ipairs(config.ObstacleRows) do
+				if otherIndex ~= rowIndex then
+					local relative = otherRow.Longitudinal - row.Longitudinal
+					requireCondition(
+						relative < -50 or relative > 100,
+						expectedRow.EncounterId .. " has another obstacle inside its hop-clearance interval"
+					)
+				end
+			end
+		end
+
+		for _, expectedLane in ipairs(expectedRow.LaneOffsets) do
+			obstacleIndex += 1
+			local placement = config.ObstaclePlacements[obstacleIndex]
+			local expectedId = string.format("FrostObstacle_%03d", obstacleIndex)
+			requireCondition(placement ~= nil, "missing expanded obstacle placement")
+			requireCondition(table.isfrozen(placement), expectedId .. " placement must be frozen")
+			requireCondition(tableEntryCount(placement :: any) == 6, expectedId .. " placement field count mismatch")
+			requireCondition(placement.ContentId == expectedId, expectedId .. " stable ID mismatch")
+			requireCondition(not seenObstacleIds[placement.ContentId], expectedId .. " stable ID is duplicated")
+			seenObstacleIds[placement.ContentId] = true
+			requireCondition(placement.SectionId == expectedRow.SectionId, expectedId .. " section mismatch")
+			requireCondition(placement.EncounterId == expectedRow.EncounterId, expectedId .. " encounter mismatch")
+			requireCondition(placement.ObstacleKind == expectedRow.ObstacleKind, expectedId .. " kind mismatch")
+			requireCondition(placement.Longitudinal == expectedRow.Longitudinal, expectedId .. " longitudinal mismatch")
+			requireCondition(placement.LateralOffset == expectedLane, expectedId .. " lane mismatch")
+			requireCondition(
+				isFiniteNumber(placement.Longitudinal) and isFiniteNumber(placement.LateralOffset),
+				expectedId .. " placement must be finite"
+			)
+			requireCondition(placement.Longitudinal <= 5390, expectedId .. " exceeds the final obstacle row")
+			local previousSectionCount = obstacleSectionCounts[placement.SectionId]
+			requireCondition(previousSectionCount ~= nil, expectedId .. " has an unknown section")
+			obstacleSectionCounts[placement.SectionId] = (previousSectionCount :: number) + 1
+			if placement.ObstacleKind == "IceBlocker" then
+				iceBlockerCount += 1
+			else
+				hopBarrierCount += 1
+			end
+		end
+	end
+	requireCondition(obstacleIndex == EXPECTED_OBSTACLE_COUNT, "obstacle rows did not consume exactly 21 placements")
+	requireCondition(iceBlockerCount == EXPECTED_ICE_BLOCKER_COUNT, "ice-blocker count mismatch")
+	requireCondition(hopBarrierCount == EXPECTED_HOP_BARRIER_COUNT, "hop-barrier count mismatch")
+	requireCondition(config.ObstacleRows[11].Longitudinal == 3300, "AvalanchePass seam repair must remain at 3300")
+
+	for sectionId, expectedCount in EXPECTED_COIN_SECTION_COUNTS do
+		requireCondition(coinSectionCounts[sectionId] == expectedCount, sectionId .. " coin count mismatch")
+	end
+	for sectionId, expectedCount in EXPECTED_OBSTACLE_SECTION_COUNTS do
+		requireCondition(obstacleSectionCounts[sectionId] == expectedCount, sectionId .. " obstacle count mismatch")
+	end
 end
 
 local function validateConfiguration()
@@ -436,6 +826,80 @@ local function courseAlignedFrame(localPoint: Vector3): CFrame
 	return CFrame.lookAt(worldPoint, worldPoint + FrostTrailConfig.ForwardDirection, Vector3.yAxis)
 end
 
+local function routeSampleAtLongitudinal(
+	geometryPoints: { RouteGeometryPoint },
+	longitudinal: number
+): RouteSample
+	requireCondition(isFiniteNumber(longitudinal), "route-content longitudinal must be finite")
+	requireCondition(#geometryPoints >= 2, "route-content placement requires at least two geometry points")
+	requireCondition(
+		longitudinal >= geometryPoints[1].LocalPosition.Z
+			and longitudinal <= geometryPoints[#geometryPoints].LocalPosition.Z,
+		"route-content longitudinal is outside the authored geometry"
+	)
+
+	local low = 1
+	local high = #geometryPoints
+	while low < high do
+		local midpoint = math.floor((low + high + 1) * 0.5)
+		if geometryPoints[midpoint].LocalPosition.Z <= longitudinal then
+			low = midpoint
+		else
+			high = midpoint - 1
+		end
+	end
+	local segmentIndex = math.min(low, #geometryPoints - 1)
+	local routePointA = geometryPoints[segmentIndex]
+	local routePointB = geometryPoints[segmentIndex + 1]
+	local pointA = routePointA.LocalPosition
+	local pointB = routePointB.LocalPosition
+	local localChord = pointB - pointA
+	requireCondition(localChord.Magnitude > FrostTrailConfig.ValidationEpsilon, "route-content chord must be nonzero")
+	requireCondition(localChord.Z > 0, "route-content chord must progress forward")
+	local alpha = (longitudinal - pointA.Z) / (pointB.Z - pointA.Z)
+	requireCondition(alpha >= 0 and alpha <= 1, "route-content interpolation alpha is invalid")
+	local localCenter = pointA:Lerp(pointB, alpha)
+	local worldA = localToWorldPoint(pointA)
+	local worldB = localToWorldPoint(pointB)
+	local worldChord = worldB - worldA
+	requireCondition(worldChord.Magnitude > FrostTrailConfig.ValidationEpsilon, "route-content world chord must be nonzero")
+	local worldCenter = localToWorldPoint(localCenter)
+	local frame = CFrame.lookAt(worldCenter, worldCenter + worldChord.Unit, Vector3.yAxis)
+	local trackWidth = routePointA.TrackWidth + (routePointB.TrackWidth - routePointA.TrackWidth) * alpha
+	local clearPlayableWidth = routePointA.ClearPlayableWidth
+		+ (routePointB.ClearPlayableWidth - routePointA.ClearPlayableWidth) * alpha
+	requireCondition(
+		isFiniteVector3(frame.Position)
+			and isFiniteVector3(frame.RightVector)
+			and isFiniteVector3(frame.UpVector)
+			and isFiniteVector3(frame.LookVector),
+		"route-content frame must be finite"
+	)
+	validatePositiveFinite(trackWidth, "route-content TrackWidth")
+	validatePositiveFinite(clearPlayableWidth, "route-content ClearPlayableWidth")
+	return {
+		Frame = frame,
+		TrackWidth = trackWidth,
+		ClearPlayableWidth = clearPlayableWidth,
+	}
+end
+
+local function coinFrameAtPlacement(geometryPoints: { RouteGeometryPoint }, placement: CoinPlacement): CFrame
+	local sample = routeSampleAtLongitudinal(geometryPoints, placement.Longitudinal)
+	return sample.Frame
+		* CFrame.new(placement.LateralOffset, placement.HeightOffset, 0)
+		* CFrame.Angles(0, math.rad(90), 0)
+end
+
+local function obstacleFrameAtPlacement(
+	geometryPoints: { RouteGeometryPoint },
+	placement: ObstaclePlacement,
+	size: Vector3
+): CFrame
+	local sample = routeSampleAtLongitudinal(geometryPoints, placement.Longitudinal)
+	return sample.Frame * CFrame.new(placement.LateralOffset, size.Y * 0.5, 0)
+end
+
 local function validateAndMeasureSampledPath(sampled: { Vector3 }): number
 	requireCondition(#sampled == EXPECTED_BASE_SAMPLES, "sampled centerline must contain exactly 57 points")
 	local authoredLength = 0
@@ -649,6 +1113,73 @@ local function createPart(
 	configureBasePart(part, name, size, cframe, color, material, canCollide, canQuery, castShadow, transparency)
 	part.Parent = parent
 	return part
+end
+
+local function setCoinAttributes(part: Part, placement: CoinPlacement)
+	part:SetAttribute("ContentId", placement.ContentId)
+	part:SetAttribute("ContentKind", "Coin")
+	part:SetAttribute("SectionId", placement.SectionId)
+	part:SetAttribute("GroupId", placement.GroupId)
+	part:SetAttribute("Pattern", placement.Pattern)
+	part:SetAttribute("Longitudinal", placement.Longitudinal)
+	part:SetAttribute("LateralOffset", placement.LateralOffset)
+	part:SetAttribute("HeightOffset", placement.HeightOffset)
+	part:SetAttribute("RuntimeEnabled", false)
+end
+
+local function setObstacleAttributes(part: Part, placement: ObstaclePlacement)
+	part:SetAttribute("ContentId", placement.ContentId)
+	part:SetAttribute("ContentKind", "Obstacle")
+	part:SetAttribute("SectionId", placement.SectionId)
+	part:SetAttribute("EncounterId", placement.EncounterId)
+	part:SetAttribute("ObstacleKind", placement.ObstacleKind)
+	part:SetAttribute("Longitudinal", placement.Longitudinal)
+	part:SetAttribute("LateralOffset", placement.LateralOffset)
+	part:SetAttribute("RuntimeEnabled", false)
+end
+
+local function buildRouteContent(gameplay: Folder, geometryPoints: { RouteGeometryPoint })
+	local coins = createFolder(gameplay, "Coins")
+	local obstacles = createFolder(gameplay, "Obstacles")
+	for _, placement in ipairs(FrostTrailRouteContentConfig.CoinPlacements) do
+		local coin = createPart(
+			coins,
+			placement.ContentId,
+			FrostTrailRouteContentConfig.CoinSize,
+			coinFrameAtPlacement(geometryPoints, placement),
+			PALETTE.Gold,
+			Enum.Material.Neon,
+			false,
+			false,
+			false,
+			0
+		)
+		coin.Shape = Enum.PartType.Cylinder
+		coin.Reflectance = 0.05
+		setCoinAttributes(coin, placement)
+	end
+
+	for _, placement in ipairs(FrostTrailRouteContentConfig.ObstaclePlacements) do
+		local isIceBlocker = placement.ObstacleKind == "IceBlocker"
+		local size = if isIceBlocker
+			then FrostTrailRouteContentConfig.IceBlockerSize
+			else FrostTrailRouteContentConfig.HopBarrierSize
+		local obstacle = createPart(
+			obstacles,
+			placement.ContentId,
+			size,
+			obstacleFrameAtPlacement(geometryPoints, placement, size),
+			if isIceBlocker then PALETTE.IceDeep else PALETTE.Red,
+			if isIceBlocker then Enum.Material.Ice else Enum.Material.SmoothPlastic,
+			false,
+			false,
+			true,
+			if isIceBlocker then 0.05 else 0
+		)
+		obstacle.Shape = Enum.PartType.Block
+		obstacle.Reflectance = if isIceBlocker then 0.1 else 0
+		setObstacleAttributes(obstacle, placement)
+	end
 end
 
 local function createDecorPart(
@@ -1688,11 +2219,12 @@ end
 
 local function validateHierarchy(candidate: Model)
 	requireCondition(candidate.Parent == nil, "candidate must remain unpublished during validation")
-	requireCondition(#candidate:GetChildren() == 4, "candidate must have exactly four high-level folders")
+	requireCondition(#candidate:GetChildren() == 5, "candidate must have exactly five high-level folders")
 	local geometry = directChild(candidate, "Geometry", "Folder") :: Folder
 	local decor = directChild(candidate, "Decor", "Folder") :: Folder
 	local markers = directChild(candidate, "Markers", "Folder") :: Folder
 	local presentation = directChild(candidate, "Presentation", "Folder") :: Folder
+	local gameplay = directChild(candidate, "Gameplay", "Folder") :: Folder
 	requireCondition(#geometry:GetChildren() == 5, "Geometry hierarchy mismatch")
 	directChild(geometry, "SummitPlatform", "Part")
 	directChild(geometry, "PlayerSpawn", "SpawnLocation")
@@ -1715,8 +2247,272 @@ local function validateHierarchy(candidate: Model)
 	directChild(markers, "StartSlots", "Folder")
 	directChild(markers, "SectionAnchors", "Folder")
 	requireCondition(#presentation:GetChildren() == 0, "Presentation must not contain interactive or duplicate content")
+	requireCondition(#gameplay:GetChildren() == 2, "Gameplay must contain exactly Coins and Obstacles")
+	local coins = directChild(gameplay, "Coins", "Folder") :: Folder
+	local obstacles = directChild(gameplay, "Obstacles", "Folder") :: Folder
+	requireCondition(#coins:GetChildren() == EXPECTED_COIN_COUNT, "Coins must contain exactly 160 direct Parts")
+	requireCondition(#obstacles:GetChildren() == EXPECTED_OBSTACLE_COUNT, "Obstacles must contain exactly 21 direct Parts")
+	for _, child in ipairs(coins:GetChildren()) do
+		requireCondition(child.ClassName == "Part", "Coins may contain only primitive Parts")
+		requireCondition(#child:GetChildren() == 0, "coin Parts may not contain descendants")
+	end
+	for _, child in ipairs(obstacles:GetChildren()) do
+		requireCondition(child.ClassName == "Part", "Obstacles may contain only primitive Parts")
+		requireCondition(#child:GetChildren() == 0, "obstacle Parts may not contain descendants")
+	end
 	requireCondition(candidate:FindFirstChild("ActiveSleds", true) == nil, "ActiveSleds must not be created")
 	requireCondition(candidate:FindFirstChild("Leaderboards", true) == nil, "Leaderboards must not be created")
+end
+
+local function cframesApproximatelyEqual(actual: CFrame, expected: CFrame): boolean
+	local epsilon = FrostTrailConfig.ValidationEpsilon * 10
+	return (actual.Position - expected.Position).Magnitude <= epsilon
+		and (actual.RightVector - expected.RightVector).Magnitude <= epsilon
+		and (actual.UpVector - expected.UpVector).Magnitude <= epsilon
+		and (actual.LookVector - expected.LookVector).Magnitude <= epsilon
+end
+
+local function validateExactAttributeNames(instance: Instance, expectedNames: { string })
+	local attributes = instance:GetAttributes()
+	requireCondition(tableEntryCount(attributes) == #expectedNames, instance.Name .. " attribute count mismatch")
+	for _, attributeName in ipairs(expectedNames) do
+		requireCondition(attributes[attributeName] ~= nil, instance.Name .. " is missing attribute " .. attributeName)
+	end
+end
+
+local function directPartMap(folder: Folder, expectedCount: number): { [string]: Part }
+	local parts: { [string]: Part } = {}
+	local count = 0
+	for _, child in ipairs(folder:GetChildren()) do
+		requireCondition(child.ClassName == "Part", folder.Name .. " may contain only primitive Parts")
+		requireCondition(parts[child.Name] == nil, folder.Name .. " contains duplicate Part name " .. child.Name)
+		parts[child.Name] = child :: Part
+		count += 1
+	end
+	requireCondition(count == expectedCount, folder.Name .. " direct Part count mismatch")
+	return parts
+end
+
+local function validateContentSection(sectionId: string, longitudinal: number, contentId: string)
+	local matchedSection = false
+	for _, section in ipairs(FrostTrailConfig.Sections) do
+		if section.SectionId == sectionId then
+			matchedSection = true
+			requireCondition(
+				longitudinal >= section.StartLongitudinal and longitudinal <= section.EndLongitudinal,
+				contentId .. " lies outside its declared section"
+			)
+			break
+		end
+	end
+	requireCondition(matchedSection, contentId .. " references an unknown section")
+end
+
+local function validateContentFootprint(
+	geometryPoints: { RouteGeometryPoint },
+	longitudinal: number,
+	lateralOffset: number,
+	lateralHalfWidth: number,
+	contentId: string
+)
+	local sample = routeSampleAtLongitudinal(geometryPoints, longitudinal)
+	requireCondition(
+		math.abs(lateralOffset) + lateralHalfWidth
+			<= sample.ClearPlayableWidth * 0.5 + FrostTrailConfig.ValidationEpsilon,
+		contentId .. " exceeds the clear playable width"
+	)
+	if approximatelyEqual(math.abs(lateralOffset), 42, FrostTrailConfig.ValidationEpsilon) then
+		requireCondition(
+			longitudinal >= 3150
+				and longitudinal <= 3600
+				and approximatelyEqual(
+					sample.ClearPlayableWidth,
+					FrostTrailConfig.WidenedClearPlayableWidth,
+					FrostTrailConfig.ValidationEpsilon
+				),
+			contentId .. " uses an outer lane outside a fully widened zone"
+		)
+	else
+		requireCondition(math.abs(lateralOffset) <= 24, contentId .. " uses an unsupported lane offset")
+	end
+	requireCondition(
+		longitudinal < 6100 or longitudinal > 6350,
+		contentId .. " enters the clear final launch interval"
+	)
+end
+
+local function validateCommonContentPart(
+	part: Part,
+	expectedSize: Vector3,
+	expectedCFrame: CFrame,
+	expectedShadow: boolean
+)
+	requireCondition(
+		part.Anchored
+			and not part.CanCollide
+			and not part.CanTouch
+			and not part.CanQuery,
+		part.Name .. " must remain static and inert"
+	)
+	requireCondition(part.CastShadow == expectedShadow, part.Name .. " shadow flag mismatch")
+	requireCondition(part.Size == expectedSize, part.Name .. " size mismatch")
+	requireCondition(
+		isFiniteVector3(part.Size)
+			and isFiniteVector3(part.CFrame.Position)
+			and isFiniteVector3(part.CFrame.RightVector)
+			and isFiniteVector3(part.CFrame.UpVector)
+			and isFiniteVector3(part.CFrame.LookVector),
+		part.Name .. " has a nonfinite size or CFrame"
+	)
+	requireCondition(cframesApproximatelyEqual(part.CFrame, expectedCFrame), part.Name .. " tangent CFrame mismatch")
+	requireCondition(part:GetAttribute(TRACK_SURFACE_ATTRIBUTE) == nil, part.Name .. " may not be a track surface")
+	requireCondition(part.TopSurface == Enum.SurfaceType.Smooth, part.Name .. " top surface mismatch")
+	requireCondition(part.BottomSurface == Enum.SurfaceType.Smooth, part.Name .. " bottom surface mismatch")
+end
+
+local function validateObstaclePlacementSafety(
+	part: Part,
+	placement: ObstaclePlacement,
+	geometryPoints: { RouteGeometryPoint }
+)
+	local halfLongitudinal = part.Size.Z * 0.5
+	local footprintStart = placement.Longitudinal - halfLongitudinal
+	local footprintEnd = placement.Longitudinal + halfLongitudinal
+	for _, geometryPoint in ipairs(geometryPoints) do
+		local seamDistance = math.abs(placement.Longitudinal - geometryPoint.LocalPosition.Z) - halfLongitudinal
+		requireCondition(
+			seamDistance >= 7 - FrostTrailConfig.ValidationEpsilon,
+			placement.ContentId .. " is within seven studs of a geometry seam"
+		)
+	end
+	for _, taper in ipairs(FrostTrailConfig.TaperZones) do
+		requireCondition(
+			footprintEnd <= taper.StartLongitudinal or footprintStart >= taper.EndLongitudinal,
+			placement.ContentId .. " overlaps a track-width taper"
+		)
+	end
+
+	local halfSize = part.Size * 0.5
+	for _, xSign in ipairs({ -1, 1 }) do
+		for _, zSign in ipairs({ -1, 1 }) do
+			local bottomCorner = part.CFrame:PointToWorldSpace(Vector3.new(
+				halfSize.X * xSign,
+				-halfSize.Y,
+				halfSize.Z * zSign
+			))
+			local cornerLocal = worldToLocalPoint(bottomCorner)
+			local cornerSample = routeSampleAtLongitudinal(geometryPoints, cornerLocal.Z)
+			local surfaceSeparation = math.abs((bottomCorner - cornerSample.Frame.Position):Dot(cornerSample.Frame.UpVector))
+			requireCondition(
+				surfaceSeparation <= 0.25 + FrostTrailConfig.ValidationEpsilon,
+				placement.ContentId .. " floats or penetrates the route at a footprint corner"
+			)
+		end
+	end
+end
+
+local function validateRouteContent(candidate: Model, geometryPoints: { RouteGeometryPoint })
+	local gameplay = candidate.Gameplay :: Folder
+	local coins = gameplay.Coins :: Folder
+	local obstacles = gameplay.Obstacles :: Folder
+	local coinParts = directPartMap(coins, EXPECTED_COIN_COUNT)
+	local obstacleParts = directPartMap(obstacles, EXPECTED_OBSTACLE_COUNT)
+
+	for _, placement in ipairs(FrostTrailRouteContentConfig.CoinPlacements) do
+		local part = coinParts[placement.ContentId]
+		requireCondition(part ~= nil, placement.ContentId .. " is missing from the runtime world")
+		local expectedCFrame = coinFrameAtPlacement(geometryPoints, placement)
+		validateCommonContentPart(part, FrostTrailRouteContentConfig.CoinSize, expectedCFrame, false)
+		requireCondition(part.Parent == coins, placement.ContentId .. " must be a direct Coins child")
+		requireCondition(part.Shape == Enum.PartType.Cylinder, placement.ContentId .. " must be a Cylinder")
+		requireCondition(part.Material == Enum.Material.Neon, placement.ContentId .. " material mismatch")
+		requireCondition(part.Color == PALETTE.Gold, placement.ContentId .. " color mismatch")
+		requireCondition(part.Transparency == 0, placement.ContentId .. " transparency mismatch")
+		requireCondition(
+			approximatelyEqual(part.Reflectance, 0.05, FrostTrailConfig.ValidationEpsilon),
+			placement.ContentId .. " reflectance mismatch"
+		)
+		validateExactAttributeNames(part, COIN_ATTRIBUTE_NAMES)
+		requireCondition(part:GetAttribute("ContentId") == placement.ContentId, placement.ContentId .. " ContentId mismatch")
+		requireCondition(part:GetAttribute("ContentKind") == "Coin", placement.ContentId .. " ContentKind mismatch")
+		requireCondition(part:GetAttribute("SectionId") == placement.SectionId, placement.ContentId .. " SectionId mismatch")
+		requireCondition(part:GetAttribute("GroupId") == placement.GroupId, placement.ContentId .. " GroupId mismatch")
+		requireCondition(part:GetAttribute("Pattern") == placement.Pattern, placement.ContentId .. " Pattern mismatch")
+		requireCondition(part:GetAttribute("Longitudinal") == placement.Longitudinal, placement.ContentId .. " Longitudinal mismatch")
+		requireCondition(part:GetAttribute("LateralOffset") == placement.LateralOffset, placement.ContentId .. " LateralOffset mismatch")
+		requireCondition(part:GetAttribute("HeightOffset") == placement.HeightOffset, placement.ContentId .. " HeightOffset mismatch")
+		requireCondition(part:GetAttribute("RuntimeEnabled") == false, placement.ContentId .. " must remain runtime-disabled")
+		local routeSample = routeSampleAtLongitudinal(geometryPoints, placement.Longitudinal)
+		requireCondition(
+			math.abs(part.CFrame.RightVector:Dot(routeSample.Frame.LookVector)) >= 1 - FrostTrailConfig.ValidationEpsilon,
+			placement.ContentId .. " cylinder face is not aligned to route travel"
+		)
+		validateContentSection(placement.SectionId, placement.Longitudinal, placement.ContentId)
+		validateContentFootprint(
+			geometryPoints,
+			placement.Longitudinal,
+			placement.LateralOffset,
+			FrostTrailRouteContentConfig.CoinSize.Z * 0.5,
+			placement.ContentId
+		)
+	end
+
+	for _, placement in ipairs(FrostTrailRouteContentConfig.ObstaclePlacements) do
+		local part = obstacleParts[placement.ContentId]
+		requireCondition(part ~= nil, placement.ContentId .. " is missing from the runtime world")
+		local isIceBlocker = placement.ObstacleKind == "IceBlocker"
+		local expectedSize = if isIceBlocker
+			then FrostTrailRouteContentConfig.IceBlockerSize
+			else FrostTrailRouteContentConfig.HopBarrierSize
+		local expectedCFrame = obstacleFrameAtPlacement(geometryPoints, placement, expectedSize)
+		validateCommonContentPart(part, expectedSize, expectedCFrame, true)
+		requireCondition(part.Parent == obstacles, placement.ContentId .. " must be a direct Obstacles child")
+		requireCondition(part.Shape == Enum.PartType.Block, placement.ContentId .. " must be a Block")
+		requireCondition(
+			part.Material == (if isIceBlocker then Enum.Material.Ice else Enum.Material.SmoothPlastic),
+			placement.ContentId .. " material mismatch"
+		)
+		requireCondition(
+			part.Color == (if isIceBlocker then PALETTE.IceDeep else PALETTE.Red),
+			placement.ContentId .. " color mismatch"
+		)
+		requireCondition(
+			approximatelyEqual(
+				part.Transparency,
+				if isIceBlocker then 0.05 else 0,
+				FrostTrailConfig.ValidationEpsilon
+			),
+			placement.ContentId .. " transparency mismatch"
+		)
+		requireCondition(
+			approximatelyEqual(
+				part.Reflectance,
+				if isIceBlocker then 0.1 else 0,
+				FrostTrailConfig.ValidationEpsilon
+			),
+			placement.ContentId .. " reflectance mismatch"
+		)
+		validateExactAttributeNames(part, OBSTACLE_ATTRIBUTE_NAMES)
+		requireCondition(part:GetAttribute("ContentId") == placement.ContentId, placement.ContentId .. " ContentId mismatch")
+		requireCondition(part:GetAttribute("ContentKind") == "Obstacle", placement.ContentId .. " ContentKind mismatch")
+		requireCondition(part:GetAttribute("SectionId") == placement.SectionId, placement.ContentId .. " SectionId mismatch")
+		requireCondition(part:GetAttribute("EncounterId") == placement.EncounterId, placement.ContentId .. " EncounterId mismatch")
+		requireCondition(part:GetAttribute("ObstacleKind") == placement.ObstacleKind, placement.ContentId .. " ObstacleKind mismatch")
+		requireCondition(part:GetAttribute("Longitudinal") == placement.Longitudinal, placement.ContentId .. " Longitudinal mismatch")
+		requireCondition(part:GetAttribute("LateralOffset") == placement.LateralOffset, placement.ContentId .. " LateralOffset mismatch")
+		requireCondition(part:GetAttribute("RuntimeEnabled") == false, placement.ContentId .. " must remain runtime-disabled")
+		validateContentSection(placement.SectionId, placement.Longitudinal, placement.ContentId)
+		validateContentFootprint(
+			geometryPoints,
+			placement.Longitudinal,
+			placement.LateralOffset,
+			expectedSize.X * 0.5,
+			placement.ContentId
+		)
+		validateObstaclePlacementSafety(part, placement, geometryPoints)
+	end
+
+	requireCondition(#collectBaseParts(gameplay) == EXPECTED_GAMEPLAY_PART_COUNT, "Gameplay must contain exactly 181 BaseParts")
 end
 
 local function physicalPropertiesMatch(actual: PhysicalProperties, expected: PhysicalProperties): boolean
@@ -2024,11 +2820,11 @@ local function validateBudgetsAndAllowedInstances(candidate: Model)
 			end
 		end
 	end
-	requireCondition(basePartCount == EXPECTED_BASE_PART_COUNT, "BasePart count must equal the authored 447")
-	requireCondition(basePartCount <= 450, "BasePart budget exceeded")
+	requireCondition(basePartCount == EXPECTED_BASE_PART_COUNT, "BasePart count must equal the authored 628")
+	requireCondition(basePartCount <= 650, "BasePart budget exceeded")
 	requireCondition(collidableCount == EXPECTED_COLLIDABLE_COUNT, "collidable count must equal the authored 229")
 	requireCondition(collidableCount <= 230, "collidable-part budget exceeded")
-	requireCondition(shadowCount == EXPECTED_SHADOW_COUNT, "shadow count must equal the authored 68")
+	requireCondition(shadowCount == EXPECTED_SHADOW_COUNT, "shadow count must equal the authored 89")
 	requireCondition(shadowCount <= 170, "shadow-caster budget exceeded")
 	requireCondition(touchableCount == 3, "exactly LaunchEdge and two lake parts must be touchable")
 	for part in allowedTouchableParts do
@@ -2070,6 +2866,16 @@ local function validateAttributes(candidate: Model, authoredLength: number)
 	requireCondition(candidate:GetAttribute("OriginZ") == 0, "OriginZ attribute mismatch")
 	requireCondition(candidate:GetAttribute("TrackStartLongitudinal") == -250, "track-start attribute mismatch")
 	requireCondition(candidate:GetAttribute("LaunchLongitudinal") == 6350, "launch attribute mismatch")
+	requireCondition(candidate:GetAttribute("RouteContentVersion") == 1, "route-content version attribute mismatch")
+	requireCondition(
+		candidate:GetAttribute("RouteContentRuntimeEnabled") == false,
+		"route-content runtime attribute mismatch"
+	)
+	requireCondition(candidate:GetAttribute("RouteCoinCount") == 160, "route coin-count attribute mismatch")
+	requireCondition(candidate:GetAttribute("RouteObstacleCount") == 21, "route obstacle-count attribute mismatch")
+	requireCondition(candidate:GetAttribute("RouteObstacleRowCount") == 18, "route row-count attribute mismatch")
+	requireCondition(candidate:GetAttribute("RouteGameplayPartCount") == 181, "route gameplay-count attribute mismatch")
+	requireCondition(candidate:GetAttribute("BasePartCount") == 628, "route-content BasePartCount attribute mismatch")
 	local storedLength = candidate:GetAttribute("AuthoredPathLengthStuds")
 	requireCondition(type(storedLength) == "number", "authored-length attribute must be numeric")
 	requireCondition(
@@ -2093,11 +2899,18 @@ local function validateSpatialSeparation(candidate: Model)
 	)
 end
 
-local function validateCandidate(candidate: Model, sampled: { Vector3 }, plans: { SegmentPlan }, authoredLength: number)
+local function validateCandidate(
+	candidate: Model,
+	sampled: { Vector3 },
+	geometryPoints: { RouteGeometryPoint },
+	plans: { SegmentPlan },
+	authoredLength: number
+)
 	validateHierarchy(candidate)
 	validateTrackAndSafety(candidate, plans)
 	validateSummitAndMarkers(candidate, sampled)
 	validateLake(candidate)
+	validateRouteContent(candidate, geometryPoints)
 	validateCrystalCaveEnvelope(candidate, sampled)
 	validateLocalPartBounds(candidate)
 	validateBudgetsAndAllowedInstances(candidate)
@@ -2121,11 +2934,21 @@ local function setWorldAttributes(candidate: Model, authoredLength: number)
 	candidate:SetAttribute("TrackStartLongitudinal", FrostTrailConfig.PathPoints[1].Z)
 	candidate:SetAttribute("LaunchLongitudinal", FrostTrailConfig.PathPoints[#FrostTrailConfig.PathPoints].Z)
 	candidate:SetAttribute("AuthoredPathLengthStuds", authoredLength)
+	candidate:SetAttribute("RouteContentVersion", FrostTrailRouteContentConfig.ContentVersion)
+	candidate:SetAttribute("RouteContentRuntimeEnabled", FrostTrailRouteContentConfig.RuntimeEnabled)
+	candidate:SetAttribute("RouteCoinCount", #FrostTrailRouteContentConfig.CoinPlacements)
+	candidate:SetAttribute("RouteObstacleCount", #FrostTrailRouteContentConfig.ObstaclePlacements)
+	candidate:SetAttribute("RouteObstacleRowCount", #FrostTrailRouteContentConfig.ObstacleRows)
+	candidate:SetAttribute(
+		"RouteGameplayPartCount",
+		#FrostTrailRouteContentConfig.CoinPlacements + #FrostTrailRouteContentConfig.ObstaclePlacements
+	)
 	candidate:SetAttribute("BasePartCount", #collectBaseParts(candidate))
 end
 
 local function constructCandidate(candidate: Model)
 	validateConfiguration()
+	validateRouteContentConfiguration()
 	local routeData = FrostTrailConfig.RouteData
 	local sampled = routeData.SampledCenterlinePoints
 	local authoredLength = validateAndMeasureSampledPath(sampled)
@@ -2137,6 +2960,7 @@ local function constructCandidate(candidate: Model)
 	local decor = createFolder(candidate, "Decor")
 	local markers = createFolder(candidate, "Markers")
 	createFolder(candidate, "Presentation")
+	local gameplay = createFolder(candidate, "Gameplay")
 	local track = createFolder(geometry, "Track")
 	local safety = createFolder(geometry, "Safety")
 
@@ -2145,8 +2969,9 @@ local function constructCandidate(candidate: Model)
 	buildLandingLake(geometry)
 	buildMarkers(markers, sampled)
 	buildDecor(decor, sampled)
+	buildRouteContent(gameplay, geometryPoints)
 	setWorldAttributes(candidate, authoredLength)
-	validateCandidate(candidate, sampled, plans, authoredLength)
+	validateCandidate(candidate, sampled, geometryPoints, plans, authoredLength)
 end
 
 function FrostTrailWorldBuilder.build(): Model
