@@ -571,10 +571,10 @@ local function validateConfiguration()
 	requireCondition(FrostTrailConfig.WorldModelName == "FrostTrailWorld", "WorldModelName mismatch")
 	requireCondition(FrostTrailConfig.WorldVersion == 1, "WorldVersion mismatch")
 	requireCondition(FrostTrailConfig.StaticFoundationOnly == false, "static-foundation flag must be false")
-	requireCondition(FrostTrailConfig.Playable == false, "playable flag must be false")
+	requireCondition(FrostTrailConfig.Playable == true, "playable flag must be true")
 	requireCondition(
-		FrostTrailConfig.ActivationMode == "StudioControlledTest",
-		"ActivationMode must equal StudioControlledTest"
+		FrostTrailConfig.ActivationMode == "LiveSelectable",
+		"ActivationMode must equal LiveSelectable"
 	)
 	validateExactVector(FrostTrailConfig.WorldOrigin, Vector3.new(3200, 0, 0), "WorldOrigin")
 	validateExactVector(FrostTrailConfig.ForwardDirection, Vector3.zAxis, "ForwardDirection")
@@ -2910,9 +2910,9 @@ local function validateAttributes(candidate: Model, authoredLength: number)
 	requireCondition(candidate:GetAttribute("DisplayName") == "FROST TRAIL", "DisplayName attribute mismatch")
 	requireCondition(candidate:GetAttribute("WorldVersion") == 1, "WorldVersion attribute mismatch")
 	requireCondition(candidate:GetAttribute("StaticFoundationOnly") == false, "static attribute mismatch")
-	requireCondition(candidate:GetAttribute("Playable") == false, "playable attribute mismatch")
+	requireCondition(candidate:GetAttribute("Playable") == true, "playable attribute mismatch")
 	requireCondition(
-		candidate:GetAttribute("ActivationMode") == "StudioControlledTest",
+		candidate:GetAttribute("ActivationMode") == "LiveSelectable",
 		"activation-mode attribute mismatch"
 	)
 	requireCondition(candidate:GetAttribute("ForwardX") == 0, "ForwardX attribute mismatch")

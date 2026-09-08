@@ -6,7 +6,7 @@ local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local FrostTrailConfig = require(script.Parent.FrostTrailConfig)
 
 export type CourseId = "FrozenLakeV2" | "FrostTrailV1"
-export type ActivationMode = "LiveDefault" | "StudioControlledTest"
+export type ActivationMode = "LiveDefault" | "LiveSelectable"
 export type RouteMode = "FixedBasis" | "MonotonicZCenterline"
 export type RouteData = FrostTrailConfig.RouteData
 

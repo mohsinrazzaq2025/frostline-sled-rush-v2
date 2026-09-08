@@ -342,8 +342,8 @@ local function validateConfiguration()
 	requireCondition(table.isfrozen(FrostTrailConfig.RouteData), "Frost route data must be frozen")
 	requireCondition(table.isfrozen(FrostTrailConfig.RouteData.GeometryPoints), "geometry points must be frozen")
 	requireCondition(FrostTrailConfig.CourseId == COURSE_ID, "Frost course ID mismatch")
-	requireCondition(FrostTrailConfig.Playable == false, "Frost must remain non-playable")
-	requireCondition(FrostTrailConfig.ActivationMode == "StudioControlledTest", "Frost activation mode mismatch")
+	requireCondition(FrostTrailConfig.Playable == true, "Frost must be publicly playable")
+	requireCondition(FrostTrailConfig.ActivationMode == "LiveSelectable", "Frost activation mode mismatch")
 	requireCondition(FrostTrailConfig.WorldOrigin == Vector3.new(3200, 0, 0), "Frost origin mismatch")
 	requireCondition(FrostTrailConfig.ForwardDirection == Vector3.new(0, 0, 1), "Frost forward direction mismatch")
 	requireCondition(#FrostTrailConfig.RouteData.GeometryPoints == EXPECTED_GEOMETRY_POINT_COUNT, "geometry-point count mismatch")
@@ -406,8 +406,8 @@ local function validateWorldMetadata(world: Model)
 	requireCondition(world.Name == FrostTrailConfig.WorldModelName, "world name mismatch")
 	requireCondition(world.Parent == Workspace, "world must be published directly under Workspace")
 	requireCondition(world:GetAttribute("CourseId") == COURSE_ID, "world CourseId mismatch")
-	requireCondition(world:GetAttribute("Playable") == false, "world Playable mismatch")
-	requireCondition(world:GetAttribute("ActivationMode") == "StudioControlledTest", "world activation mode mismatch")
+	requireCondition(world:GetAttribute("Playable") == true, "world Playable mismatch")
+	requireCondition(world:GetAttribute("ActivationMode") == "LiveSelectable", "world activation mode mismatch")
 	requireCondition(
 		world:GetAttribute("RouteContentVersion") == FrostTrailRouteContentConfig.ContentVersion,
 		"world content version mismatch"
@@ -566,7 +566,7 @@ end
 
 local function resolveUnsafe(world: Model): ResolvedContent
 	validateConfiguration()
-	requireCondition(RunService:IsStudio(), "route content may resolve only in Studio")
+	requireCondition(RunService:IsServer(), "route content may resolve only on the server")
 	validateWorldMetadata(world)
 
 	local gameplay = exactDirectChild(world, "Gameplay", "Folder") :: Folder
@@ -739,7 +739,7 @@ end
 
 local function validateResolvedUnsafe(resolved: ResolvedContent, world: Model)
 	validateConfiguration()
-	requireCondition(RunService:IsStudio(), "route content may validate only in Studio")
+	requireCondition(RunService:IsServer(), "route content may validate only on the server")
 	requireCondition(table.isfrozen(resolved), "resolved content must be frozen")
 	requireCondition(resolved.World == world, "resolved world identity changed")
 	validateWorldMetadata(world)
@@ -938,7 +938,6 @@ end
 local function remoteIsExact(remote: RemoteEvent): boolean
 	local parent = remote.Parent
 	return RunService:IsServer()
-		and RunService:IsStudio()
 		and remote.ClassName == "RemoteEvent"
 		and remote.Name == REMOTE_NAME
 		and parent ~= nil
@@ -1068,8 +1067,8 @@ local function validateBoundedResolvedIdentity(resolved: ResolvedContent): (bool
 	end
 	local world = resolved.World
 	if world:GetAttribute("CourseId") ~= COURSE_ID
-		or world:GetAttribute("Playable") ~= false
-		or world:GetAttribute("ActivationMode") ~= "StudioControlledTest"
+		or world:GetAttribute("Playable") ~= true
+		or world:GetAttribute("ActivationMode") ~= "LiveSelectable"
 		or world:GetAttribute("RouteContentVersion") ~= FrostTrailRouteContentConfig.ContentVersion
 		or world:GetAttribute("RouteContentRuntimeEnabled") ~= true
 		or world:GetAttribute("RouteContentRuntimeVersion") ~= FrostTrailRouteContentConfig.RuntimeVersion
@@ -1090,8 +1089,8 @@ local function validateContextIdentity(
 	expectedPhase: string?
 ): (boolean, string?)
 	local remote = boundRemote
-	if not RunService:IsServer() or not RunService:IsStudio() then
-		return false, "route runtime requires a Studio server"
+	if not RunService:IsServer() then
+		return false, "route runtime requires the server"
 	elseif remote == nil or not remoteIsExact(remote) then
 		return false, "presentation remote identity changed"
 	elseif state.Cleared then
@@ -1103,8 +1102,8 @@ local function validateContextIdentity(
 	elseif context.Player ~= state.Player or context.RunId ~= state.RunId then
 		return false, "player or RunId identity changed"
 	elseif context.CourseId ~= COURSE_ID
-		or context.Playable ~= false
-		or context.ActivationMode ~= "StudioControlledTest"
+		or context.Playable ~= true
+		or context.ActivationMode ~= "LiveSelectable"
 	then
 		return false, "course authorization changed"
 	elseif context.ResolvedContent ~= state.ResolvedContent
@@ -1211,8 +1210,8 @@ function FrostTrailRouteContentController.createState(
 	runId: number,
 	resolved: ResolvedContent
 ): (State?, string?)
-	if not RunService:IsServer() or not RunService:IsStudio() then
-		return nil, "route state may be created only on a Studio server"
+	if not RunService:IsServer() then
+		return nil, "route state may be created only on the server"
 	elseif not isPositiveInteger(runId) then
 		return nil, "RunId must be a positive integer"
 	elseif player.Parent ~= Players then

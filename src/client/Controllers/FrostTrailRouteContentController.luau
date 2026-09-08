@@ -2,7 +2,6 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local AudioController = require(script.Parent.AudioController)
@@ -16,7 +15,6 @@ local PROTOCOL_VERSION = 1
 local MAXIMUM_ROUTE_COINS = 160
 local MAXIMUM_OBSTACLE_HITS = 18
 local MAXIMUM_DELTA_ENTRIES = 24
-local STARTUP_TIMEOUT_SECONDS = 5
 local OBSTACLE_FEEDBACK_SECONDS = 0.65
 
 type ObstacleKind = "IceBlocker" | "HopBarrier"
@@ -181,40 +179,6 @@ local function isKnownCoinId(contentId: any): boolean
 		and index >= 1
 		and index <= MAXIMUM_ROUTE_COINS
 		and contentId == string.format("FrostCoin_%03d", index)
-end
-
-local function remainingTime(deadline: number): number
-	return math.max(0, deadline - os.clock())
-end
-
-local function waitForUniqueDirectChild(
-	parent: Instance,
-	name: string,
-	className: string,
-	deadline: number
-): Instance
-	local child = parent:FindFirstChild(name)
-	if child == nil then
-		local remaining = remainingTime(deadline)
-		if remaining <= 0 then
-			error(string.format("timed out waiting for %s/%s", parent:GetFullName(), name), 0)
-		end
-		child = parent:WaitForChild(name, remaining)
-	end
-	if child == nil then
-		error(string.format("timed out waiting for %s/%s", parent:GetFullName(), name), 0)
-	end
-
-	local matchingChildren = 0
-	for _, candidate in ipairs(parent:GetChildren()) do
-		if candidate.Name == name then
-			matchingChildren += 1
-		end
-	end
-	if matchingChildren ~= 1 or child.Parent ~= parent or child.ClassName ~= className then
-		error(string.format("%s/%s must be one direct %s", parent:GetFullName(), name, className), 0)
-	end
-	return child
 end
 
 local function isUniqueDirectChild(parent: Instance, name: string, expected: Instance): boolean
@@ -797,17 +761,36 @@ local function onRoutePacket(rawPacket: any)
 	end
 end
 
-local function resolveStartupReferences(deadline: number): (RemoteEvent, RuntimeReferences)
-	local remoteFolder = waitForUniqueDirectChild(ReplicatedStorage, REMOTES_FOLDER_NAME, "Folder", deadline) :: Folder
-	local remote = waitForUniqueDirectChild(remoteFolder, ROUTE_REMOTE_NAME, "RemoteEvent", deadline) :: RemoteEvent
-	local playerGui = waitForUniqueDirectChild(Players.LocalPlayer, "PlayerGui", "PlayerGui", deadline) :: PlayerGui
-	local runHud = waitForUniqueDirectChild(playerGui, "FrostlineRunHud", "ScreenGui", deadline) :: ScreenGui
-	local statusPanel = waitForUniqueDirectChild(runHud, "StatusPanel", "Frame", deadline) :: Frame
+local function resolveStartupReferences(): (RemoteEvent?, RuntimeReferences?)
+	local remoteFolderInstance = findUniqueDirectChild(ReplicatedStorage, REMOTES_FOLDER_NAME, "Folder")
+	if remoteFolderInstance == nil then
+		return nil, nil
+	end
+	local remoteFolder = remoteFolderInstance :: Folder
+	local remoteInstance = findUniqueDirectChild(remoteFolder, ROUTE_REMOTE_NAME, "RemoteEvent")
+	if remoteInstance == nil then
+		return nil, nil
+	end
+	local playerGuiInstance = findUniqueDirectChild(Players.LocalPlayer, "PlayerGui", "PlayerGui")
+	if playerGuiInstance == nil then
+		return nil, nil
+	end
+	local playerGui = playerGuiInstance :: PlayerGui
+	local runHudInstance = findUniqueDirectChild(playerGui, "FrostlineRunHud", "ScreenGui")
+	if runHudInstance == nil then
+		return nil, nil
+	end
+	local runHud = runHudInstance :: ScreenGui
+	local statusPanelInstance = findUniqueDirectChild(runHud, "StatusPanel", "Frame")
+	if statusPanelInstance == nil then
+		return nil, nil
+	end
+	local statusPanel = statusPanelInstance :: Frame
 	if statusPanel:FindFirstChild("FrostRouteStatus") then
 		error("FrostRouteStatus already exists", 0)
 	end
 
-	return remote, {
+	return remoteInstance :: RemoteEvent, {
 		PlayerGui = playerGui,
 		RunHud = runHud,
 		StatusPanel = statusPanel,
@@ -862,15 +845,11 @@ function FrostTrailRouteContentController.start()
 		return
 	end
 	started = true
-	if not RunService:IsStudio() then
-		return
-	end
 
 	local succeeded, failureReason = pcall(function()
-		local deadline = os.clock() + STARTUP_TIMEOUT_SECONDS
-		local remote, references = resolveStartupReferences(deadline)
-		if os.clock() > deadline then
-			error("route-content startup deadline expired", 0)
+		local remote, references = resolveStartupReferences()
+		if remote == nil or references == nil then
+			return
 		end
 		runtimeReferences = references
 		routeLabel = createRouteLabel(references.StatusPanel)

@@ -15,6 +15,11 @@ type FrostTrailWorldBuilderApi = {
 	build: () -> Model,
 }
 
+type CourseSelectionServiceApi = {
+	start: (RemoteEvent, any) -> (boolean, string),
+	destroy: () -> (),
+}
+
 local leaderboardService: LeaderboardServiceApi? = nil
 local requireSucceeded, requiredService = pcall(function(): any
 	return require(script.Parent.Services.LeaderboardService)
@@ -116,12 +121,30 @@ if frostTrailWorldBuilder then
 		then
 			warn("[Frostline][FrostTrail] World model does not contain the validated 628 parts")
 		else
-			print(string.format("[Frostline] Frost Trail controlled test world generated (%d parts)", basePartCount))
+			print(string.format("[Frostline] Frost Trail selectable world generated (%d parts)", basePartCount))
 		end
 	end
 end
 
-RunManager.start()
+local courseSelectionService: CourseSelectionServiceApi? = nil
+local selectorLoadSucceeded, selectorOrError = pcall(function(): any
+	return require(script.Parent.Services.CourseSelectionService)
+end)
+if selectorLoadSucceeded then
+	local candidate: any = selectorOrError
+	if type(candidate) == "table"
+		and type(candidate.start) == "function"
+		and type(candidate.destroy) == "function"
+	then
+		courseSelectionService = candidate :: CourseSelectionServiceApi
+	else
+		warn("[Frostline][FrostTrail] Course selection service has an invalid API")
+	end
+else
+	warn("[Frostline][FrostTrail] Course selection service failed to load")
+end
+
+RunManager.start(courseSelectionService)
 StoreService.start()
 
 print("[Frostline] Server bootstrap complete")

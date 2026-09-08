@@ -186,10 +186,22 @@ type RouteSample = {
 	TrackWidth: number,
 }
 
+type PendingPreparedRoute = {
+	Character: Model,
+	Generation: number,
+	CourseId: CourseId,
+	Recovery: boolean,
+}
+
 type PreparedCourseState = {
 	CourseId: CourseId,
 	Generation: number,
 	Routing: boolean,
+	RoutingTarget: CourseId?,
+	RoutingDrainActive: boolean,
+	PendingRoute: PendingPreparedRoute?,
+	SafetyReloadToken: any?,
+	SafetyFallbackWarned: boolean,
 	SawInitialCharacter: boolean,
 	CharacterConnection: RBXScriptConnection?,
 }
@@ -315,6 +327,10 @@ type FrostSpeedGovernorApi = {
 	invalidateRouteContent: (Session, string) -> (),
 	clearRouteContent: (Session) -> (),
 	bindRouteContentRemote: (RemoteEvent) -> (boolean, string),
+	validateResolvedCourseLive: (ResolvedCourse) -> (boolean, string),
+	PublicInstall: any?,
+	isPublicFrostReady: (ResolvedCourse?) -> boolean,
+	disablePublicFrostPrompt: () -> (),
 }
 
 local FrostSpeedGovernor: FrostSpeedGovernorApi
@@ -404,15 +420,21 @@ local function setPreparedCourse(player: Player, courseId: CourseId): boolean
 
 	state.CourseId = courseId
 	state.Generation += 1
+	state.RoutingTarget = nil
+	state.PendingRoute = nil
 	player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, courseId)
 	return true
 end
 
 local function refreshStartPrompts()
 	local enabled = next(sessions) == nil
-	for _, prompt in startPrompts do
+	for courseId, prompt in startPrompts do
 		if prompt.Parent then
 			prompt.Enabled = enabled
+				and (courseId ~= FROST_TRAIL_COURSE_ID
+					or FrostSpeedGovernor.isPublicFrostReady(
+						if resolvedCourses then resolvedCourses[FROST_TRAIL_COURSE_ID] else nil
+					))
 		end
 	end
 end
@@ -427,7 +449,7 @@ end
 
 local function hasPreparedCourseRouting(): boolean
 	for _, state in preparedCourses do
-		if state.Routing then
+		if state.Routing or state.RoutingDrainActive then
 			return true
 		end
 	end
@@ -1514,17 +1536,19 @@ local function hasExactSteeringAuthorization(session: Session): boolean
 	local course = session.ResolvedCourse
 	local definition = CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID]
 	local profile = session.SteeringProfile
-	return RunService:IsStudio()
-		and courses ~= nil
+	return courses ~= nil
 		and session.CourseId == FROST_TRAIL_COURSE_ID
 		and courses[FROST_TRAIL_COURSE_ID] == course
 		and course.CourseId == FROST_TRAIL_COURSE_ID
 		and course.Definition == definition
 		and table.isfrozen(definition)
-		and definition.ActivationMode == "StudioControlledTest"
-		and FrostTrailConfig.ActivationMode == "StudioControlledTest"
-		and FrostTrailConfig.Playable == false
+		and definition.ActivationMode == "LiveSelectable"
+		and FrostTrailConfig.ActivationMode == "LiveSelectable"
+		and FrostTrailConfig.Playable == true
 		and table.isfrozen(FrostTrailConfig)
+		and course.World:GetAttribute("Playable") == true
+		and course.World:GetAttribute("ActivationMode") == "LiveSelectable"
+		and FrostSpeedGovernor.isPublicFrostReady(course)
 		and profile ~= nil
 		and profile == FrostTrailConfig.Steering
 		and table.isfrozen(profile)
@@ -1961,8 +1985,12 @@ do
 	function controller.isRouteContentReady(course: ResolvedCourse): (boolean, string)
 		if course.CourseId ~= FROST_TRAIL_COURSE_ID then
 			return true, "ok"
-		elseif not RunService:IsStudio() then
-			return false, "route content is Studio-only"
+		elseif FrostTrailConfig.Playable ~= true
+			or FrostTrailConfig.ActivationMode ~= "LiveSelectable"
+			or course.World:GetAttribute("Playable") ~= true
+			or course.World:GetAttribute("ActivationMode") ~= "LiveSelectable"
+		then
+			return false, "route content public lifecycle is unavailable"
 		end
 		local remote = routeContentRemote
 		local remoteFolder = if remote then remote.Parent else nil
@@ -1982,7 +2010,7 @@ do
 		end
 		local valid, reason = controller.validateRouteContent(course)
 		if not valid then
-			warnRouteContentOnce("controlled Frost run unavailable: " .. reason)
+			warnRouteContentOnce("public Frost run unavailable: " .. reason)
 		end
 		return valid, reason
 	end
@@ -2178,16 +2206,69 @@ do
 		end
 		local succeeded, boundOrError, reason = pcall(routeController.bindRemote, remote)
 		if not succeeded then
-			warnRouteContentOnce("remote binding failed: " .. tostring(boundOrError))
 			return false, tostring(boundOrError)
 		elseif boundOrError ~= true then
 			local failureReason = if typeof(reason) == "string" then reason else "route-content remote binding failed"
-			warnRouteContentOnce(failureReason)
 			return false, failureReason
 		end
 		routeContentRemoteBound = true
 		routeContentRemote = remote
 		return true, "ok"
+	end
+
+	function controller.isPublicFrostReady(course: ResolvedCourse?): boolean
+		local install = controller.PublicInstall
+		if typeof(install) ~= "table"
+			or install.Committed ~= true
+			or course == nil
+			or resolvedCourses == nil
+			or resolvedCourses[FROST_TRAIL_COURSE_ID] ~= course
+			or course.CourseId ~= FROST_TRAIL_COURSE_ID
+			or course.World.Parent ~= Workspace
+			or course.World:GetAttribute("Playable") ~= true
+			or course.World:GetAttribute("ActivationMode") ~= "LiveSelectable"
+			or FrostTrailConfig.Playable ~= true
+			or FrostTrailConfig.ActivationMode ~= "LiveSelectable"
+			or install.RemoteFolder.Parent ~= ReplicatedStorage
+			or install.RemoteFolder.Name ~= REMOTES_FOLDER_NAME
+			or install.SteeringRemote.Parent ~= install.RemoteFolder
+			or install.SteeringRemote.Name ~= STEERING_REMOTE_NAME
+			or install.HopRemote.Parent ~= install.RemoteFolder
+			or install.HopRemote.Name ~= "HopIntent"
+			or install.RouteRemote.Parent ~= install.RemoteFolder
+			or install.RouteRemote.Name ~= "FrostTrailContentEvent"
+			or install.SelectionRemote.Parent ~= install.RemoteFolder
+			or install.SelectionRemote.Name ~= "CourseSelection"
+			or install.RemoteFolder:FindFirstChild(STEERING_REMOTE_NAME) ~= install.SteeringRemote
+			or install.RemoteFolder:FindFirstChild("HopIntent") ~= install.HopRemote
+			or install.RemoteFolder:FindFirstChild("FrostTrailContentEvent") ~= install.RouteRemote
+			or install.RemoteFolder:FindFirstChild("CourseSelection") ~= install.SelectionRemote
+			or install.SteeringConnection.Connected ~= true
+			or install.HopConnection.Connected ~= true
+			or install.PromptConnection.Connected ~= true
+			or install.Prompt.Parent ~= course.StartTrigger
+			or install.Prompt.Name ~= PROMPT_NAME
+			or startPrompts[FROST_TRAIL_COURSE_ID] ~= install.Prompt
+			or install.SelectorAdapter.start ~= install.SelectorStart
+			or install.SelectorAdapter.destroy ~= install.SelectorDestroy
+			or routeContentRemoteBound ~= true
+			or routeContentRemote ~= install.RouteRemote
+		then
+			return false
+		end
+		local courseValid = FrostSpeedGovernor.validateResolvedCourseLive(course)
+		local routeContentReady = controller.isRouteContentReady(course)
+		if not courseValid or not routeContentReady then
+			return false
+		end
+		return true
+	end
+
+	function controller.disablePublicFrostPrompt()
+		local install = controller.PublicInstall
+		if typeof(install) == "table" and install.Prompt ~= nil and install.Prompt.Parent ~= nil then
+			install.Prompt.Enabled = false
+		end
 	end
 
 	function controller.invalidateHop(session: Session)
@@ -2233,8 +2314,7 @@ do
 		local definition = CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID]
 		local profile = session.HopProfile
 		local state = session.HopState
-		return RunService:IsStudio()
-			and courses ~= nil
+		return courses ~= nil
 			and table.isfrozen(courses)
 			and table.isfrozen(CourseRegistry)
 			and table.isfrozen(CourseRegistry.Definitions)
@@ -2244,14 +2324,15 @@ do
 			and course.CourseId == FROST_TRAIL_COURSE_ID
 			and course.Definition == definition
 			and table.isfrozen(definition)
-			and definition.ActivationMode == "StudioControlledTest"
+			and definition.ActivationMode == "LiveSelectable"
 			and definition.RouteMode == "MonotonicZCenterline"
 			and course.World:GetAttribute("CourseId") == FROST_TRAIL_COURSE_ID
-			and course.World:GetAttribute("Playable") == false
-			and course.World:GetAttribute("ActivationMode") == "StudioControlledTest"
-			and FrostTrailConfig.ActivationMode == "StudioControlledTest"
-			and FrostTrailConfig.Playable == false
+			and course.World:GetAttribute("Playable") == true
+			and course.World:GetAttribute("ActivationMode") == "LiveSelectable"
+			and FrostTrailConfig.ActivationMode == "LiveSelectable"
+			and FrostTrailConfig.Playable == true
 			and table.isfrozen(FrostTrailConfig)
+			and controller.isPublicFrostReady(course)
 			and profile ~= nil
 			and profile == FrostTrailConfig.Hop
 			and table.isfrozen(profile)
@@ -2410,20 +2491,20 @@ do
 		local course = session.ResolvedCourse
 		local definition = CourseRegistry.Definitions[FROST_TRAIL_COURSE_ID]
 		local profile = session.SpeedProfile
-		return RunService:IsStudio()
-			and courses ~= nil
+		return courses ~= nil
 			and session.CourseId == FROST_TRAIL_COURSE_ID
 			and courses[FROST_TRAIL_COURSE_ID] == course
 			and course.CourseId == FROST_TRAIL_COURSE_ID
 			and course.Definition == definition
 			and table.isfrozen(definition)
-			and definition.ActivationMode == "StudioControlledTest"
+			and definition.ActivationMode == "LiveSelectable"
 			and course.World:GetAttribute("CourseId") == FROST_TRAIL_COURSE_ID
-			and course.World:GetAttribute("Playable") == false
-			and course.World:GetAttribute("ActivationMode") == "StudioControlledTest"
-			and FrostTrailConfig.ActivationMode == "StudioControlledTest"
-			and FrostTrailConfig.Playable == false
+			and course.World:GetAttribute("Playable") == true
+			and course.World:GetAttribute("ActivationMode") == "LiveSelectable"
+			and FrostTrailConfig.ActivationMode == "LiveSelectable"
+			and FrostTrailConfig.Playable == true
 			and table.isfrozen(FrostTrailConfig)
+			and controller.isPublicFrostReady(course)
 			and profile ~= nil
 			and profile == FrostTrailConfig.Speed
 			and table.isfrozen(profile)
@@ -3623,6 +3704,10 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 		if sessions[player] ~= session or session.RunId ~= runId then
 			pendingReplays[player] = nil
 			refreshStartPrompts()
+			local preparedState = preparedCourses[player]
+			if preparedState ~= nil then
+				RunManager._drainPreparedRoute(player, preparedState)
+			end
 			return
 		end
 
@@ -3638,6 +3723,10 @@ local function scheduleTrustedReplay(session: Session, runId: number)
 			lifecycleLog(session, "replay-cancelled", "reason=trusted-replay-unavailable")
 			sessions[player] = nil
 			refreshStartPrompts()
+			local preparedState = preparedCourses[player]
+			if preparedState ~= nil then
+				RunManager._drainPreparedRoute(player, preparedState)
+			end
 			return
 		end
 
@@ -3732,6 +3821,10 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 			sessions[session.Player] = nil
 		end
 		refreshStartPrompts()
+		local preparedState = preparedCourses[session.Player]
+		if preparedState ~= nil then
+			RunManager._drainPreparedRoute(session.Player, preparedState)
+		end
 		return
 	end
 	local replayRequested = session.ReplayRequested and teleportVerified
@@ -3755,6 +3848,12 @@ local function cleanupSession(session: Session, runId: number, teleportPlayer: b
 		sessions[session.Player] = nil
 	end
 	refreshStartPrompts()
+	if not replayRequested then
+		local preparedState = preparedCourses[session.Player]
+		if preparedState ~= nil then
+			RunManager._drainPreparedRoute(session.Player, preparedState)
+		end
+	end
 end
 
 local function formatTelemetryNumber(value: number?): string
@@ -4768,15 +4867,15 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 		local markedLandingPart = landingSurfaces:FindFirstChild(FROST_LAKE_MARKED_PART_NAME)
 		local runoffLandingPart = landingSurfaces:FindFirstChild(FROST_LAKE_RUNOFF_PART_NAME)
 		local exactLandingSurfaces = course.ExactLandingSurfaces
-		if definition.ActivationMode ~= "StudioControlledTest"
+		if definition.ActivationMode ~= "LiveSelectable"
 			or definition.RouteMode ~= "MonotonicZCenterline"
 			or definition.RouteData ~= FrostTrailConfig.RouteData
 			or world:GetAttribute("CourseId") ~= FROST_TRAIL_COURSE_ID
 			or world:GetAttribute("DisplayName") ~= FrostTrailConfig.DisplayName
 			or world:GetAttribute("WorldVersion") ~= FrostTrailConfig.WorldVersion
 			or world:GetAttribute("StaticFoundationOnly") ~= false
-			or world:GetAttribute("Playable") ~= false
-			or world:GetAttribute("ActivationMode") ~= "StudioControlledTest"
+			or world:GetAttribute("Playable") ~= true
+			or world:GetAttribute("ActivationMode") ~= "LiveSelectable"
 			or world:GetAttribute("ForwardX") ~= FrostTrailConfig.ForwardDirection.X
 			or world:GetAttribute("ForwardY") ~= FrostTrailConfig.ForwardDirection.Y
 			or world:GetAttribute("ForwardZ") ~= FrostTrailConfig.ForwardDirection.Z
@@ -4838,6 +4937,8 @@ local function validateResolvedCourseLive(course: ResolvedCourse): (boolean, str
 	return true, "ok"
 end
 
+FrostSpeedGovernor.validateResolvedCourseLive = validateResolvedCourseLive
+
 local function isPreparedRoutingCurrent(
 	player: Player,
 	state: PreparedCourseState,
@@ -4850,12 +4951,13 @@ local function isPreparedRoutingCurrent(
 		and player.Parent == Players
 		and preparedCourses[player] == state
 		and state.Generation == generation
-		and state.CourseId == course.CourseId
 		and state.Routing
+		and state.RoutingTarget == course.CourseId
 		and player.Character == character
 		and character.Parent ~= nil
-		and next(sessions) == nil
-		and next(pendingReplays) == nil
+		and sessions[player] == nil
+		and pendingReplays[player] == nil
+		and storeOperations[player] == nil
 		and courses ~= nil
 		and courses[course.CourseId] == course
 end
@@ -4947,12 +5049,33 @@ local function teleportPreparedCharacter(
 	return callSucceeded and verified == true
 end
 
-local function routePreparedCharacter(player: Player, state: PreparedCourseState, character: Model)
-	if not RunService:IsStudio() or state.Routing then
-		return
+local function routePreparedCharacter(
+	player: Player,
+	state: PreparedCourseState,
+	marker: PendingPreparedRoute
+): (boolean, string)
+	if preparedCourses[player] ~= state
+		or player.Parent ~= Players
+		or state.Generation ~= marker.Generation
+		or state.CourseId ~= marker.CourseId
+		or player.Character ~= marker.Character
+		or marker.Character.Parent == nil
+	then
+		return false, "Discarded"
+	elseif state.Routing
+		or sessions[player] ~= nil
+		or pendingReplays[player] ~= nil
+		or storeOperations[player] ~= nil
+	then
+		return false, "Blocked"
+	elseif not RunService:IsStudio()
+		and marker.CourseId ~= FROST_TRAIL_COURSE_ID
+		and not marker.Recovery
+	then
+		return false, "Discarded"
 	end
 
-	local generation = state.Generation
+	local character = marker.Character
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	local rootInstance = character:FindFirstChild("HumanoidRootPart")
 	if not humanoid then
@@ -4965,12 +5088,12 @@ local function routePreparedCharacter(player: Player, state: PreparedCourseState
 		rootInstance = character:WaitForChild("HumanoidRootPart", RESULT.TeleportCharacterReadyTimeoutSeconds)
 	end
 	if preparedCourses[player] ~= state
-		or state.Generation ~= generation
+		or state.Generation ~= marker.Generation
+		or state.CourseId ~= marker.CourseId
 		or player.Character ~= character
 	then
-		return
-	end
-	if not humanoid
+		return false, "Discarded"
+	elseif not humanoid
 		or humanoid.Health <= 0
 		or not rootInstance
 		or not rootInstance:IsA("BasePart")
@@ -4978,25 +5101,162 @@ local function routePreparedCharacter(player: Player, state: PreparedCourseState
 		or pendingReplays[player] ~= nil
 		or storeOperations[player] ~= nil
 	then
-		return
+		return false, "Blocked"
 	end
 
 	local courses = resolvedCourses
-	local course = if courses then courses[state.CourseId] else nil
-	if course == nil then
-		return
+	local course = if courses then courses[marker.CourseId] else nil
+	if course == nil or course.Definition ~= CourseRegistry.getDefinition(marker.CourseId) then
+		return false, "Failed"
 	end
 	local courseValid = validateResolvedCourseLive(course)
-	if not courseValid then
-		return
+	if not courseValid
+		or (marker.CourseId == FROST_TRAIL_COURSE_ID
+			and (not FrostSpeedGovernor.isPublicFrostReady(course)
+				or not FrostSpeedGovernor.isRouteContentReady(course)))
+	then
+		return false, "Failed"
 	end
 
 	state.Routing = true
+	state.RoutingTarget = marker.CourseId
 	local routeGeneration = state.Generation
-	teleportPreparedCharacter(player, state, routeGeneration, character, humanoid, rootInstance, course)
-	if preparedCourses[player] == state and state.Generation == routeGeneration then
+	local teleported = teleportPreparedCharacter(
+		player,
+		state,
+		routeGeneration,
+		character,
+		humanoid,
+		rootInstance,
+		course
+	)
+	if preparedCourses[player] == state
+		and state.Generation == routeGeneration
+		and state.RoutingTarget == marker.CourseId
+	then
+		state.RoutingTarget = nil
 		state.Routing = false
 	end
+	return teleported, if teleported then "Success" else "Failed"
+end
+
+function RunManager._drainPreparedRoute(player: Player, state: PreparedCourseState): string
+	if preparedCourses[player] ~= state or player.Parent ~= Players then
+		return "Unavailable"
+	elseif state.RoutingDrainActive then
+		return "Busy"
+	end
+
+	state.RoutingDrainActive = true
+	local outcome = "Idle"
+	local attempts = 0
+	while attempts < 2 do
+		local marker = state.PendingRoute
+		if marker == nil then
+			break
+		end
+		state.PendingRoute = nil
+		if preparedCourses[player] ~= state
+			or player.Parent ~= Players
+			or marker.Generation ~= state.Generation
+			or marker.CourseId ~= state.CourseId
+			or marker.Character ~= player.Character
+			or marker.Character.Parent == nil
+		then
+			outcome = "Discarded"
+			continue
+		end
+		if state.Routing
+			or sessions[player] ~= nil
+			or pendingReplays[player] ~= nil
+			or storeOperations[player] ~= nil
+		then
+			state.PendingRoute = marker
+			outcome = "Busy"
+			break
+		end
+
+		attempts += 1
+		local routed, reason = routePreparedCharacter(player, state, marker)
+		if routed then
+			outcome = "Success"
+			if state.PendingRoute == nil then
+				break
+			end
+		elseif reason == "Blocked" then
+			if state.PendingRoute == nil then
+				state.PendingRoute = marker
+			end
+			outcome = "Busy"
+			break
+		elseif reason == "Discarded" then
+			outcome = "Discarded"
+		else
+			if state.PendingRoute == nil
+				and preparedCourses[player] == state
+				and state.Generation == marker.Generation
+				and state.CourseId == marker.CourseId
+				and player.Character == marker.Character
+				and marker.Character.Parent ~= nil
+			then
+				state.PendingRoute = marker
+			end
+			outcome = "Failed"
+		end
+	end
+
+	local needsFallback = attempts >= 2 and state.PendingRoute ~= nil and outcome ~= "Busy"
+	if needsFallback
+		and preparedCourses[player] == state
+		and player.Parent == Players
+		and sessions[player] == nil
+		and pendingReplays[player] == nil
+		and storeOperations[player] == nil
+		and not state.Routing
+	then
+		state.PendingRoute = nil
+		state.Generation += 1
+		state.CourseId = CLASSIC_COURSE_ID
+		player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, CLASSIC_COURSE_ID)
+		state.Routing = true
+		state.RoutingTarget = CLASSIC_COURSE_ID
+		local reloadToken = {
+			Generation = state.Generation,
+			Character = nil,
+		}
+		state.SafetyReloadToken = reloadToken
+		if not state.SafetyFallbackWarned then
+			state.SafetyFallbackWarned = true
+			warn(string.format("[Frostline][CourseSelection] player=%s safety fallback to Classic", player.Name))
+		end
+		pcall(function()
+			player:LoadCharacterAsync()
+		end)
+		if preparedCourses[player] == state
+			and state.Generation == reloadToken.Generation
+			and state.SafetyReloadToken == reloadToken
+		then
+			local reloadCharacter = reloadToken.Character
+			if reloadCharacter ~= nil
+				and (player.Character ~= reloadCharacter
+					or reloadCharacter.Parent == nil
+					or reloadCharacter:FindFirstChildOfClass("Humanoid") == nil
+					or not reloadCharacter:FindFirstChild("HumanoidRootPart")
+					or not (reloadCharacter:FindFirstChild("HumanoidRootPart") :: Instance):IsA("BasePart"))
+			then
+				reloadToken.Character = nil
+			end
+			state.SafetyReloadToken = nil
+			state.RoutingTarget = nil
+			state.Routing = false
+		end
+		outcome = "SafetyFallback"
+	end
+
+	if preparedCourses[player] == state then
+		state.RoutingDrainActive = false
+	end
+	return outcome
 end
 
 local function onPreparedCharacterAdded(player: Player, state: PreparedCourseState, character: Model)
@@ -5007,8 +5267,28 @@ local function onPreparedCharacterAdded(player: Player, state: PreparedCourseSta
 		state.SawInitialCharacter = true
 		return
 	end
+	local reloadToken = state.SafetyReloadToken
+	if reloadToken ~= nil
+		and state.Routing
+		and state.Generation == reloadToken.Generation
+	then
+		reloadToken.Character = character
+		return
+	end
 
-	routePreparedCharacter(player, state, character)
+	state.PendingRoute = nil
+	if player.Character ~= character or character.Parent == nil then
+		return
+	elseif not RunService:IsStudio() and state.CourseId ~= FROST_TRAIL_COURSE_ID then
+		return
+	end
+	state.PendingRoute = {
+		Character = character,
+		Generation = state.Generation,
+		CourseId = state.CourseId,
+		Recovery = false,
+	}
+	RunManager._drainPreparedRoute(player, state)
 end
 
 local function initializePreparedPlayer(player: Player)
@@ -5020,16 +5300,19 @@ local function initializePreparedPlayer(player: Player)
 		CourseId = CLASSIC_COURSE_ID,
 		Generation = 0,
 		Routing = false,
+		RoutingTarget = nil,
+		RoutingDrainActive = false,
+		PendingRoute = nil,
+		SafetyReloadToken = nil,
+		SafetyFallbackWarned = false,
 		SawInitialCharacter = player.Character ~= nil,
 		CharacterConnection = nil,
 	}
 	preparedCourses[player] = state
 	player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, CLASSIC_COURSE_ID)
-	if RunService:IsStudio() then
-		state.CharacterConnection = player.CharacterAdded:Connect(function(character: Model)
-			onPreparedCharacterAdded(player, state, character)
-		end)
-	end
+	state.CharacterConnection = player.CharacterAdded:Connect(function(character: Model)
+		onPreparedCharacterAdded(player, state, character)
+	end)
 end
 
 local function clearPreparedPlayer(player: Player)
@@ -5039,6 +5322,10 @@ local function clearPreparedPlayer(player: Player)
 	end
 	state.Generation += 1
 	state.Routing = false
+	state.RoutingTarget = nil
+	state.RoutingDrainActive = false
+	state.PendingRoute = nil
+	state.SafetyReloadToken = nil
 	local connection = state.CharacterConnection
 	state.CharacterConnection = nil
 	if connection then
@@ -5058,10 +5345,10 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 		return
 	end
 	local preparedState = preparedCourses[player]
-	if preparedState == nil or preparedState.Routing then
-		return
-	elseif course.CourseId == FROST_TRAIL_COURSE_ID
-		and (not RunService:IsStudio() or preparedState.CourseId ~= FROST_TRAIL_COURSE_ID)
+	if preparedState == nil
+		or preparedState.Routing
+		or preparedState.RoutingDrainActive
+		or preparedState.CourseId ~= course.CourseId
 	then
 		return
 	end
@@ -5079,7 +5366,8 @@ local function beginRun(player: Player, course: ResolvedCourse, trustedStart: bo
 	end
 	if course.CourseId == FROST_TRAIL_COURSE_ID then
 		local routeContentReady = FrostSpeedGovernor.isRouteContentReady(course)
-		if not routeContentReady then
+		if not FrostSpeedGovernor.isPublicFrostReady(course) or not routeContentReady then
+			FrostSpeedGovernor.disablePublicFrostPrompt()
 			return
 		end
 	end
@@ -5740,7 +6028,7 @@ local function validateFrostDefinition(definition: CourseDefinition): (boolean, 
 	if not table.isfrozen(FrostTrailConfig)
 		or not table.isfrozen(FrostTrailConfig.PathPoints)
 		or not validateDefinitionNames(definition)
-		or definition.ActivationMode ~= "StudioControlledTest"
+		or definition.ActivationMode ~= "LiveSelectable"
 		or definition.RouteMode ~= "MonotonicZCenterline"
 		or frostRouteData == nil
 		or definition.CourseId ~= FrostTrailConfig.CourseId
@@ -5756,8 +6044,8 @@ local function validateFrostDefinition(definition: CourseDefinition): (boolean, 
 		or definition.SafetyMaximumLateralDistance ~= FrostTrailConfig.SafetyMaximumLateralDistance
 		or definition.SafetyMinimumWorldY ~= FrostTrailConfig.SafetyMinimumWorldY
 		or FrostTrailConfig.StaticFoundationOnly ~= false
-		or FrostTrailConfig.Playable ~= false
-		or FrostTrailConfig.ActivationMode ~= "StudioControlledTest"
+		or FrostTrailConfig.Playable ~= true
+		or FrostTrailConfig.ActivationMode ~= "LiveSelectable"
 	then
 		return false, "Frost definition or lifecycle metadata is invalid"
 	end
@@ -5952,8 +6240,8 @@ local function resolveCourseDefinition(definition: CourseDefinition): (ResolvedC
 			or world:GetAttribute("DisplayName") ~= FrostTrailConfig.DisplayName
 			or world:GetAttribute("WorldVersion") ~= FrostTrailConfig.WorldVersion
 			or world:GetAttribute("StaticFoundationOnly") ~= false
-			or world:GetAttribute("Playable") ~= false
-			or world:GetAttribute("ActivationMode") ~= "StudioControlledTest"
+			or world:GetAttribute("Playable") ~= true
+			or world:GetAttribute("ActivationMode") ~= "LiveSelectable"
 			or world:GetAttribute("ForwardX") ~= FrostTrailConfig.ForwardDirection.X
 			or world:GetAttribute("ForwardY") ~= FrostTrailConfig.ForwardDirection.Y
 			or world:GetAttribute("ForwardZ") ~= FrostTrailConfig.ForwardDirection.Z
@@ -6307,46 +6595,114 @@ local function onResultAction(player: Player, requestedRunId: any, requestedActi
 	acceptResultAction(session, requestedRunId, requestedAction :: ResultAction, "client")
 end
 
-function RunManager.prepareStudioCourse(player: Player, requestedCourseId: string): (boolean, string)
-	if not started or resolvedCourses == nil then
-		return false, "RunManager unavailable"
-	elseif not RunService:IsStudio() then
-		return false, "Studio only"
-	elseif typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
-		return false, "Player unavailable"
+function RunManager.getCourseSelectionState(player: Player): any?
+	if not started
+		or resolvedCourses == nil
+		or typeof(player) ~= "Instance"
+		or not player:IsA("Player")
+		or player.Parent ~= Players
+	then
+		return nil
+	end
+	local state = preparedCourses[player]
+	if state == nil then
+		return nil
 	end
 
+	local courses = resolvedCourses :: ResolvedCourseDictionary
+	local classicCourse = courses[CLASSIC_COURSE_ID]
+	local frostCourse = courses[FROST_TRAIL_COURSE_ID]
+	local classicAvailable = classicCourse ~= nil
+		and classicCourse.Definition == CourseRegistry.getDefinition(CLASSIC_COURSE_ID)
+		and select(1, validateResolvedCourseLive(classicCourse)) == true
+	local frostAvailable = frostCourse ~= nil
+		and frostCourse.Definition == CourseRegistry.getDefinition(FROST_TRAIL_COURSE_ID)
+		and select(1, validateResolvedCourseLive(frostCourse)) == true
+		and FrostSpeedGovernor.isPublicFrostReady(frostCourse)
+		and select(1, FrostSpeedGovernor.isRouteContentReady(frostCourse)) == true
+	local session = sessions[player]
+	local phase: Phase = if session ~= nil
+		then session.Phase
+		elseif pendingReplays[player] ~= nil then RunPhase.Reset
+		else RunPhase.Idle
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local root = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	local selectedAvailable = if state.CourseId == CLASSIC_COURSE_ID then classicAvailable else frostAvailable
+	local canSelect = phase == RunPhase.Idle
+		and selectedAvailable
+		and next(sessions) == nil
+		and next(pendingReplays) == nil
+		and not hasPreparedCourseRouting()
+		and state.PendingRoute == nil
+		and storeOperations[player] == nil
+		and not PlayerDataService.hasUnresolvedStoreSave(player)
+		and character ~= nil
+		and character.Parent ~= nil
+		and humanoid ~= nil
+		and humanoid.Health > 0
+		and root ~= nil
+		and root:IsA("BasePart")
+
+	local classicDescriptor = table.freeze({
+		CourseId = CLASSIC_COURSE_ID,
+		DisplayName = "CLASSIC DISTANCE",
+		Available = classicAvailable,
+	})
+	local frostDescriptor = table.freeze({
+		CourseId = FROST_TRAIL_COURSE_ID,
+		DisplayName = "FROST TRAIL",
+		Available = frostAvailable,
+	})
+	local descriptors = { classicDescriptor, frostDescriptor }
+	table.freeze(descriptors)
+	return table.freeze({
+		SelectedCourseId = state.CourseId,
+		CanSelect = canSelect,
+		RunPhase = phase,
+		Courses = descriptors,
+	})
+end
+
+function RunManager.selectCourse(player: Player, requestedCourseId: string): string
+	if not started or resolvedCourses == nil then
+		return "CourseUnavailable"
+	elseif typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+		return "CharacterUnavailable"
+	end
 	local courseId = exactCourseId(requestedCourseId)
 	if courseId == nil then
-		return false, "Unknown course"
+		return "CourseUnavailable"
 	end
 	local courses = resolvedCourses :: ResolvedCourseDictionary
 	local course = courses[courseId]
-	if course == nil or CourseRegistry.getDefinition(requestedCourseId) ~= course.Definition then
-		return false, "Course unavailable"
-	end
-	local courseValid = validateResolvedCourseLive(course)
-	if not courseValid then
-		return false, "Course invalid"
+	if course == nil
+		or course.Definition ~= CourseRegistry.getDefinition(requestedCourseId)
+		or not select(1, validateResolvedCourseLive(course))
+		or (courseId == FROST_TRAIL_COURSE_ID
+			and (not FrostSpeedGovernor.isPublicFrostReady(course)
+				or not select(1, FrostSpeedGovernor.isRouteContentReady(course))))
+	then
+		return "CourseUnavailable"
 	end
 
 	local state = preparedCourses[player]
 	if state == nil then
-		return false, "Player state unavailable"
-	elseif sessions[player] ~= nil then
-		return false, "Run active"
-	elseif pendingReplays[player] ~= nil then
-		return false, "Replay pending"
-	elseif next(sessions) ~= nil or next(pendingReplays) ~= nil then
-		return false, "Server busy"
-	elseif state.Routing then
-		return false, "Course preparation active"
-	elseif hasPreparedCourseRouting() then
-		return false, "Server busy"
-	elseif storeOperations[player] ~= nil then
-		return false, "Store operation active"
-	elseif PlayerDataService.hasUnresolvedStoreSave(player) then
-		return false, "Store save unresolved"
+		return "CharacterUnavailable"
+	elseif sessions[player] ~= nil
+		or pendingReplays[player] ~= nil
+		or next(sessions) ~= nil
+		or next(pendingReplays) ~= nil
+		or state.Routing
+		or state.RoutingDrainActive
+		or state.PendingRoute ~= nil
+		or hasPreparedCourseRouting()
+		or storeOperations[player] ~= nil
+		or PlayerDataService.hasUnresolvedStoreSave(player)
+	then
+		return "Busy"
+	elseif state.CourseId == courseId then
+		return "AlreadySelected"
 	end
 
 	local character = player.Character
@@ -6354,23 +6710,25 @@ function RunManager.prepareStudioCourse(player: Player, requestedCourseId: strin
 	local rootInstance = if character then character:FindFirstChild("HumanoidRootPart") else nil
 	if not character
 		or not character:IsA("Model")
-		or not character.Parent
+		or character.Parent == nil
 		or not humanoid
 		or humanoid.Health <= 0
 		or not rootInstance
 		or not rootInstance:IsA("BasePart")
-		or not course.PlayerSpawn.Parent
+		or course.PlayerSpawn.Parent == nil
 	then
-		return false, "Character unavailable"
+		return "CharacterUnavailable"
 	end
 
 	local previousCourseId = state.CourseId
-	state.Routing = true
-	if not setPreparedCourse(player, courseId) then
-		state.Routing = false
-		return false, "Player state unavailable"
+	if player:GetAttribute(PRESENTATION_COURSE_ATTRIBUTE) ~= previousCourseId then
+		player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, previousCourseId)
 	end
+	state.PendingRoute = nil
+	state.Generation += 1
 	local generation = state.Generation
+	state.Routing = true
+	state.RoutingTarget = courseId
 	local teleported = teleportPreparedCharacter(
 		player,
 		state,
@@ -6380,18 +6738,61 @@ function RunManager.prepareStudioCourse(player: Player, requestedCourseId: strin
 		rootInstance,
 		course
 	)
-	if preparedCourses[player] ~= state then
-		return false, "Player unavailable"
-	end
-	state.Routing = false
-	if not teleported then
-		state.CourseId = previousCourseId
-		state.Generation += 1
-		player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, previousCourseId)
-		return false, "Teleport failed"
+	if preparedCourses[player] ~= state or player.Parent ~= Players then
+		return "CharacterUnavailable"
+	elseif state.Generation ~= generation or state.RoutingTarget ~= courseId then
+		return "CharacterUnavailable"
 	end
 
-	return true, "Prepared"
+	if teleported then
+		state.CourseId = courseId
+		state.PendingRoute = nil
+		player:SetAttribute(PRESENTATION_COURSE_ATTRIBUTE, courseId)
+		state.RoutingTarget = nil
+		state.Routing = false
+		refreshStartPrompts()
+		return "Success"
+	end
+	state.RoutingTarget = nil
+	state.Routing = false
+
+	local recoveryCharacter = player.Character
+	if recoveryCharacter ~= nil and recoveryCharacter:IsA("Model") and recoveryCharacter.Parent ~= nil then
+		state.PendingRoute = {
+			Character = recoveryCharacter,
+			Generation = generation,
+			CourseId = previousCourseId,
+			Recovery = true,
+		}
+	end
+	local recoveryOutcome = RunManager._drainPreparedRoute(player, state)
+	refreshStartPrompts()
+	if recoveryOutcome == "SafetyFallback" then
+		return "SafetyFallback"
+	elseif recoveryOutcome == "Success" then
+		return "TeleportFailed"
+	end
+	return "CharacterUnavailable"
+end
+
+function RunManager.prepareStudioCourse(player: Player, requestedCourseId: string): (boolean, string)
+	if not RunService:IsStudio() then
+		return false, "Studio only"
+	end
+	local courseId = exactCourseId(requestedCourseId)
+	local definition = if courseId then CourseRegistry.getDefinition(courseId) else nil
+	if courseId == nil or definition == nil then
+		return false, "Unknown course"
+	elseif courseId == FROST_TRAIL_COURSE_ID and definition.ActivationMode ~= "LiveSelectable" then
+		return false, "Course unavailable"
+	elseif courseId == CLASSIC_COURSE_ID and definition.ActivationMode ~= "LiveDefault" then
+		return false, "Course unavailable"
+	end
+	local outcome = RunManager.selectCourse(player, requestedCourseId)
+	if outcome == "Success" or outcome == "AlreadySelected" then
+		return true, "Prepared"
+	end
+	return false, outcome
 end
 
 local function warnStudioCourseControlOnce(reason: string)
@@ -6433,7 +6834,7 @@ local function publishStudioCourseControlBridge()
 		local definition = CourseRegistry.getDefinition(requestedCourseId)
 		if courseId == nil or definition == nil or definition.CourseId ~= courseId then
 			return false, "Unknown course"
-		elseif courseId == FROST_TRAIL_COURSE_ID and definition.ActivationMode ~= "StudioControlledTest" then
+		elseif courseId == FROST_TRAIL_COURSE_ID and definition.ActivationMode ~= "LiveSelectable" then
 			return false, "Course unavailable"
 		elseif courseId == CLASSIC_COURSE_ID and definition.ActivationMode ~= "LiveDefault" then
 			return false, "Course unavailable"
@@ -6469,7 +6870,8 @@ function RunManager.canAccessStore(player: Player): boolean
 		and player.Parent == Players
 		and sessions[player] == nil
 		and pendingReplays[player] == nil
-		and (preparedState == nil or not preparedState.Routing)
+		and (preparedState == nil
+			or (not preparedState.Routing and not preparedState.RoutingDrainActive and preparedState.PendingRoute == nil))
 end
 
 function RunManager.beginStoreOperation(player: Player): (StoreOperationToken?, string?)
@@ -6481,7 +6883,11 @@ function RunManager.beginStoreOperation(player: Player): (StoreOperationToken?, 
 		return nil, "run active"
 	elseif pendingReplays[player] ~= nil then
 		return nil, "replay pending"
-	elseif preparedCourses[player] ~= nil and (preparedCourses[player] :: PreparedCourseState).Routing then
+	elseif preparedCourses[player] ~= nil
+		and ((preparedCourses[player] :: PreparedCourseState).Routing
+			or (preparedCourses[player] :: PreparedCourseState).RoutingDrainActive
+			or (preparedCourses[player] :: PreparedCourseState).PendingRoute ~= nil)
+	then
 		return nil, "course preparation active"
 	elseif storeOperations[player] ~= nil then
 		return nil, "store operation already reserved"
@@ -6500,16 +6906,23 @@ function RunManager.isStoreOperationCurrent(player: Player, token: StoreOperatio
 		and storeOperations[player] == token
 		and sessions[player] == nil
 		and pendingReplays[player] == nil
-		and (preparedCourses[player] == nil or not (preparedCourses[player] :: PreparedCourseState).Routing)
+		and (preparedCourses[player] == nil
+			or (not (preparedCourses[player] :: PreparedCourseState).Routing
+				and not (preparedCourses[player] :: PreparedCourseState).RoutingDrainActive
+				and (preparedCourses[player] :: PreparedCourseState).PendingRoute == nil))
 end
 
 function RunManager.endStoreOperation(player: Player, token: StoreOperationToken)
 	if storeOperations[player] == token then
 		storeOperations[player] = nil
+		local preparedState = preparedCourses[player]
+		if preparedState ~= nil then
+			RunManager._drainPreparedRoute(player, preparedState)
+		end
 	end
 end
 
-function RunManager.start()
+function RunManager.start(courseSelectionService: any?)
 	if started then
 		return
 	end
@@ -6537,12 +6950,6 @@ function RunManager.start()
 
 	tuckRemote.OnServerEvent:Connect(onTuckIntent)
 	resultActionRemote.OnServerEvent:Connect(onResultAction)
-	if RunService:IsStudio() and courses[FROST_TRAIL_COURSE_ID] ~= nil then
-		local steeringRemote = getOrCreateRemote(remoteFolder, STEERING_REMOTE_NAME)
-		steeringRemote.OnServerEvent:Connect(onSteeringIntent)
-		getOrCreateRemote(remoteFolder, "HopIntent").OnServerEvent:Connect(FrostSpeedGovernor.handleHopIntent)
-		FrostSpeedGovernor.bindRouteContentRemote(getOrCreateRemote(remoteFolder, "FrostTrailContentEvent"))
-	end
 	trustedReplay = function(player: Player, courseId: CourseId)
 		startRunSafely(player, courseId, true)
 	end
@@ -6561,11 +6968,15 @@ function RunManager.start()
 		startPrompts[courseId] = prompt
 		prompt.Triggered:Connect(function(player: Player)
 			local preparedState = preparedCourses[player]
-			if preparedState == nil or preparedState.Routing then
-				return
-			elseif courseId == FROST_TRAIL_COURSE_ID
-				and (not RunService:IsStudio() or preparedState.CourseId ~= FROST_TRAIL_COURSE_ID)
+			if preparedState == nil
+				or preparedState.Routing
+				or preparedState.RoutingDrainActive
+				or preparedState.CourseId ~= courseId
 			then
+				return
+			elseif courseId == FROST_TRAIL_COURSE_ID and not FrostSpeedGovernor.isPublicFrostReady(course)
+			then
+				FrostSpeedGovernor.disablePublicFrostPrompt()
 				return
 			end
 			startRunSafely(player, courseId, false)
@@ -6573,11 +6984,125 @@ function RunManager.start()
 	end
 
 	connectCoursePrompt(CLASSIC_COURSE_ID)
-	if RunService:IsStudio()
-		and courses[FROST_TRAIL_COURSE_ID] ~= nil
-		and FrostSpeedGovernor.isRouteContentReady(courses[FROST_TRAIL_COURSE_ID])
+	local frostCourse = courses[FROST_TRAIL_COURSE_ID]
+	if frostCourse ~= nil
+		and typeof(courseSelectionService) == "table"
+		and typeof(courseSelectionService.start) == "function"
+		and typeof(courseSelectionService.destroy) == "function"
 	then
-		connectCoursePrompt(FROST_TRAIL_COURSE_ID)
+		local optionalRemotes: { RemoteEvent } = {}
+		local optionalConnections: { RBXScriptConnection } = {}
+		local optionalPrompt: ProximityPrompt? = nil
+		local installed, installFailure = pcall(function()
+			if not select(1, validateResolvedCourseLive(frostCourse))
+				or not select(1, FrostSpeedGovernor.validateRouteContent(frostCourse))
+			then
+				error("public Frost validation failed", 0)
+			end
+			for _, name in { STEERING_REMOTE_NAME, "HopIntent", "FrostTrailContentEvent", "CourseSelection" } do
+				if remoteFolder:FindFirstChild(name, false) ~= nil then
+					error("optional endpoint name collision", 0)
+				end
+			end
+			if frostCourse.StartTrigger:FindFirstChild(PROMPT_NAME, false) ~= nil then
+				error("Frost prompt name collision", 0)
+			end
+
+			local steeringRemote = getOrCreateRemote(remoteFolder, STEERING_REMOTE_NAME)
+			local hopRemote = getOrCreateRemote(remoteFolder, "HopIntent")
+			local routeRemote = getOrCreateRemote(remoteFolder, "FrostTrailContentEvent")
+			local selectionRemote = getOrCreateRemote(remoteFolder, "CourseSelection")
+			table.insert(optionalRemotes, steeringRemote)
+			table.insert(optionalRemotes, hopRemote)
+			table.insert(optionalRemotes, routeRemote)
+			table.insert(optionalRemotes, selectionRemote)
+
+			local prompt = configurePrompt(frostCourse.StartTrigger)
+			optionalPrompt = prompt
+			local steeringConnection = steeringRemote.OnServerEvent:Connect(onSteeringIntent)
+			local hopConnection = hopRemote.OnServerEvent:Connect(FrostSpeedGovernor.handleHopIntent)
+			local promptConnection = prompt.Triggered:Connect(function(player: Player)
+				local preparedState = preparedCourses[player]
+				if preparedState == nil
+					or preparedState.Routing
+					or preparedState.RoutingDrainActive
+					or preparedState.CourseId ~= FROST_TRAIL_COURSE_ID
+					or not FrostSpeedGovernor.isPublicFrostReady(frostCourse)
+				then
+					FrostSpeedGovernor.disablePublicFrostPrompt()
+					return
+				end
+				startRunSafely(player, FROST_TRAIL_COURSE_ID, false)
+			end)
+			table.insert(optionalConnections, steeringConnection)
+			table.insert(optionalConnections, hopConnection)
+			table.insert(optionalConnections, promptConnection)
+
+			local selectionApi = table.freeze({
+				getCourseSelectionState = RunManager.getCourseSelectionState,
+				selectCourse = RunManager.selectCourse,
+			})
+			local selectorCallSucceeded, selectorReady, selectorReason = pcall(
+				courseSelectionService.start,
+				selectionRemote,
+				selectionApi
+			)
+			if not selectorCallSucceeded or selectorReady ~= true then
+				error(
+					if selectorCallSucceeded and typeof(selectorReason) == "string"
+						then selectorReason
+						else "course-selection service failed",
+					0
+				)
+			end
+			local routeBound, routeReason = FrostSpeedGovernor.bindRouteContentRemote(routeRemote)
+			if not routeBound then
+				error(if typeof(routeReason) == "string" then routeReason else "route-content binding failed", 0)
+			end
+
+			startPrompts[FROST_TRAIL_COURSE_ID] = prompt
+			local installRecord = {
+				Committed = true,
+				RemoteFolder = remoteFolder,
+				SteeringRemote = steeringRemote,
+				HopRemote = hopRemote,
+				RouteRemote = routeRemote,
+				SelectionRemote = selectionRemote,
+				SteeringConnection = steeringConnection,
+				HopConnection = hopConnection,
+				PromptConnection = promptConnection,
+				Prompt = prompt,
+				SelectorAdapter = courseSelectionService,
+				SelectorStart = courseSelectionService.start,
+				SelectorDestroy = courseSelectionService.destroy,
+			}
+			FrostSpeedGovernor.PublicInstall = installRecord
+		end)
+		if not installed then
+			pcall(courseSelectionService.destroy)
+			for _, connection in optionalConnections do
+				connection:Disconnect()
+			end
+			if optionalPrompt ~= nil and optionalPrompt.Parent ~= nil then
+				optionalPrompt:Destroy()
+			end
+			for _, remote in optionalRemotes do
+				if remote.Parent == remoteFolder then
+					remote:Destroy()
+				end
+			end
+			FrostSpeedGovernor.PublicInstall = nil
+			local boundedFailure = tostring(installFailure)
+			if #boundedFailure > 160 then
+				boundedFailure = string.sub(boundedFailure, 1, 160)
+			end
+			warn(
+				string.format(
+					"[Frostline][FrostTrail] Public activation unavailable reason=%s",
+					boundedFailure
+				)
+			)
+		end
 	end
 	refreshStartPrompts()
 

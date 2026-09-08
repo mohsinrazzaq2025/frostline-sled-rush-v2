@@ -8,6 +8,22 @@ local ResultController = require(script.Parent.Controllers.ResultController)
 AudioController.start()
 RunController.start()
 
+local courseSelectionStarted, courseSelectionFailure = pcall(function()
+	local CourseSelectionController = require(script.Parent.Controllers.CourseSelectionController)
+	if typeof(CourseSelectionController) ~= "table" or typeof(CourseSelectionController.start) ~= "function" then
+		error("CourseSelectionController API is invalid", 0)
+	end
+	CourseSelectionController.start()
+end)
+if not courseSelectionStarted then
+	warn(
+		string.format(
+			"[Frostline][CourseSelection] Client unavailable: %s",
+			tostring(courseSelectionFailure)
+		)
+	)
+end
+
 local routeContentStarted, routeContentFailure = pcall(function()
 	local FrostTrailRouteContentController = require(script.Parent.Controllers.FrostTrailRouteContentController)
 	FrostTrailRouteContentController.start()
