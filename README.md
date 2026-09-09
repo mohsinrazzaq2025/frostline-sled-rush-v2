@@ -18,7 +18,7 @@ Click a video thumbnail to watch gameplay.
 
 ### Mobile
 
-[![Frostline: Sled Rush V2 — mobile gameplay video thumbnail](https://i.ytimg.com/vi/cO0ttRTRV5w/hqdefault.jpg)](https://www.youtube.com/watch?v=cO0ttRTRV5w)
+[![Frostline Mobile Gameplay](https://i.ytimg.com/vi/cO0ttRTRV5w/hqdefault.jpg)](https://www.youtube.com/watch?v=cO0ttRTRV5w)
 
 [Watch mobile gameplay →](https://www.youtube.com/watch?v=cO0ttRTRV5w)
 
